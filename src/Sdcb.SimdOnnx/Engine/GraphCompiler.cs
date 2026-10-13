@@ -121,22 +121,26 @@ internal static class GraphCompiler
         {
             // fusion passes operate on the logical graph and are layout-blind;
             // physical layout is decided afterwards by LayoutPlanner
-            if (Environment.GetEnvironmentVariable("GCDRNET_NOFUSE") != "1")
+            bool fuse = Env.Flag("NOFUSE") != "1";
+            if (fuse)
             {
                 Fuse(nodes, values);
-                // NHWC-only kernels (CPU channels-last + Vulkan); the NCHW oracle plan keeps the plain ops
-                if (opt.Nhwc && Environment.GetEnvironmentVariable("GCDRNET_NOFUSE_UP") != "1")
-                    FuseUpsample(nodes, values, outputValue);
+                RunPasses(PassStage.Logical, nodes, values, outputValue, opt);
+                // NHWC-only kernels (CPU channels-last + GPU); the NCHW oracle plan keeps the plain ops
+                if (opt.Nhwc && Env.Flag("NOFUSE_UP") != "1")
+                    FuseResizeAdd(nodes, values, outputValue);
             }
             if (opt.Nhwc)
                 LayoutPlanner.Run(nodes, values, bufSize, inputValue, ref outputValue, opt.PhysicalIo);
-            if (opt.Nhwc && opt.MemFuse && CompileOptions.MemFusions
-                && Environment.GetEnvironmentVariable("GCDRNET_NOFUSE") != "1")
+            if (opt.Nhwc && opt.MemFuse && CompileOptions.MemFusions && fuse)
+            {
+                RunPasses(PassStage.Physical, nodes, values, outputValue, opt);
                 FuseMemory(nodes, values, outputValue, opt.Gpu);
+            }
 
             PlanArena(nodes, values, bufSize, inputValue, outputValue,
                 out int[] offsets, out int arenaFloats);
-            if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "2")
+            if (Env.Flag("DUMP") == "2")
             {
                 string Vs(int v) => v < 0 ? "-" : $"v{v}/b{values[v].Buf}[{string.Join('x', values[v].Shape)}]{(values[v].Layout is { } l && !Layout.IsIdentity(l) ? Layout.Str(l) : "")}";
                 for (int i = 0; i < nodes.Count; i++)
@@ -146,19 +150,17 @@ internal static class GraphCompiler
                     {
                         TransposeP t => $" perm=[{string.Join(',', t.Perm)}]",
                         ConvP c => $" k={c.Kernel[0]}x{c.Kernel[1]} s={c.Strides[0]} g={c.Group} add={Vs(c.AddValue)} act={c.Act}{(c.Pool is { } pl ? $" +maxpool{(pl.FuseRelu ? "+relu" : "")}" : "")}",
-                        UpHeadP u => $" rrelu={u.ResizeRelu} srelu={u.SkipRelu} act={u.Act}" + (u.SkipConv is { } sc ? $" skip=conv{sc.Kernel[0]}x{sc.Kernel[1]}(In[1]) sact={sc.Act}" : ""),
                         GemmP g => $" act={g.Act}",
                         ConcatP c => $" axis={c.Axis}",
-                        ShiftP s => $" axis={s.Axis}",
                         EwP e => $" {e.Op} act={e.Act}",
-                        _ => "",
+                        _ => m.Ext is { } x ? $" {x.Name} {m.P}" : "",
                     };
                     Console.Error.WriteLine($"  #{i,-3} {m.Op,-14} {string.Join(' ', m.In.Select(Vs))} -> {string.Join(' ', m.Out.Select(Vs))}{extra}");
                 }
             }
-            if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
+            if (Env.Flag("DUMP") == "1")
             {
-                var hist = nodes.GroupBy(m => m.Op).OrderByDescending(g => g.Count());
+                var hist = nodes.GroupBy(m => m.Ext?.Name ?? m.Op.ToString()).OrderByDescending(g => g.Count());
                 Console.Error.WriteLine($"[plan] {nodes.Count} nodes, arena {arenaFloats * 4.0 / 1e6:F1} MB");
                 foreach (var h in hist) Console.Error.WriteLine($"  {h.Key,-14} x{h.Count()}");
             }
@@ -176,14 +178,20 @@ internal static class GraphCompiler
             };
         }
 
+        private static void RunPasses(PassStage stage, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
+        {
+            if (opt.Extensions is not { } ext) return;
+            var ctx = new PassContext(nodes, values, outputValue, opt);
+            foreach (GraphPass p in ext.Passes)
+                if (p.Stage == stage) p.Run(ctx);
+        }
+
         /// <summary>Structural fusions over the exec node list (single consumer chains).</summary>
         private static void Fuse(List<ExecNode> nodes, List<CValue> values)
         {
             // pass 1: Pad -> Conv  (fold reflect/constant padding into the conv)
             // pass 2: Conv -> Relu (activation epilogue)
             // pass 3: Div(x,√2) Erf Add(x,1) Mul(x,0.5) Mul(x0) -> Gelu
-            // pass 4: Pad(+2) -> 5x Slice -> 10x Slice + 5x Concat -> Concat -> Slice
-            //         (shift-MLP) -> ChannelShift
             for (int i = 0; i < nodes.Count; i++)
             {
                 ExecNode n = nodes[i];
@@ -264,7 +272,6 @@ internal static class GraphCompiler
             }
             FuseGelu(nodes, values);
             FuseConvTBias(nodes, values);
-            FuseShift(nodes, values);
             CommuteActBeforeTranspose(nodes, values);
             FuseLateAct(nodes, values);
         }
@@ -369,73 +376,27 @@ internal static class GraphCompiler
         }
 
         /// <summary>
-        /// NHWC memory fusions (after layout planning) that keep full-resolution
-        /// tensors from ever being stored:
-        /// <list type="bullet">
-        /// <item>UpHead skip recompute: when the skip is a cheap direct conv of a smaller
-        ///   input (stem conv: 3/6 → 16/32 channels), UpHead reads the conv's input and
-        ///   recomputes the skip rows, so the skip need not stay live across the network.</item>
-        /// <item>Conv → MaxPool(2x2/2): the conv output's only reader is the pool, so the
-        ///   conv emits pooled rows directly (<see cref="ConvP.Pool"/>).</item>
-        /// </list>
-        /// Vulkan plans (<paramref name="gpu"/>) only get what its shaders implement: small-ic
-        /// (stem) convs with staged weights, both for the recompute and for conv+pool.
+        /// Conv -> MaxPool(2x2/2) memory fusion (after layout planning): the conv output's only
+        /// reader is the pool, so the conv emits pooled rows directly (<see cref="ConvP.Pool"/>) and
+        /// the full-resolution conv output is never stored. GPU plans only get it for small-ic stem
+        /// convs (<see cref="GpuSmallConv"/>, staged weights).
         /// </summary>
         private static void FuseMemory(List<ExecNode> nodes, List<CValue> values, int outputValue, bool gpu)
         {
-            int Producer(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
-            int Uses(int v)
-            {
-                int b = values[v].Buf;
-                if (b < 0 || v == outputValue || values[outputValue].Buf == b) return int.MaxValue;
-                int n = 0;
-                foreach (ExecNode m in nodes)
-                {
-                    foreach (int iv in m.In) if (values[iv].Buf == b) n++;
-                    int a1 = m.P switch { ConvP c => c.AddValue, _ => -1 };
-                    int a2 = m.P switch { ConvP c => c.BiasValue, GemmP g => g.BiasValue, _ => -1 };
-                    if (a1 >= 0 && values[a1].Buf == b) n++;
-                    if (a2 >= 0 && values[a2].Buf == b) n++;
-                }
-                return n;
-            }
-            bool Nhwc4(int v) => values[v].Shape.Length == 4 && values[v].Layout is [0, 2, 3, 1];
-            bool SameHw(int a, int b) => values[a].Shape[2] == values[b].Shape[2] && values[a].Shape[3] == values[b].Shape[3];
-
-            // 1) UpHead skip recompute
-            foreach (ExecNode u in nodes)
-            {
-                if (u.P is not UpHeadP up || up.SkipConv is not null) continue;
-                int s = u.In[1], ci = Producer(s);
-                if (ci < 0 || nodes[ci].P is not ConvP cp || cp.Group != 1 || cp.AddValue >= 0 || cp.Pool is not null
-                    || cp.Strides.Any(x => x != 1) || cp.Dilations.Any(x => x != 1)) continue;
-                int xin = nodes[ci].In[0];
-                CValue w = values[nodes[ci].In[1]];
-                if (w.Floats is null || w.Shape.Length != 4 || !Nhwc4(s) || !Nhwc4(xin)) continue;
-                int ic = values[xin].Shape[1], c = values[s].Shape[1];
-                // cheap to recompute, much smaller to keep; the conv itself stays scheduled
-                // for its other reader(s) (and keeps the shared ConvP packed)
-                if (ic * 2 > c || Kernels.Nhwc.WinogradEligible(cp, w.Shape, ic) || Uses(s) < 2) continue;
-                if (cp.BiasValue >= 0 && values[cp.BiasValue].Floats is null) continue;
-                if (gpu && (!GpuSmallConv(cp, w.Shape, ic) || c > 32 || !SameHw(xin, s))) continue;
-                u.In[1] = xin;
-                up.SkipConv = cp;
-                up.SkipW = nodes[ci].In[1];
-                up.SkipB = cp.BiasValue;
-            }
-
-            // 2) Conv -> MaxPool(2x2, stride 2, no pad, exact halving)
+            var ctx = new PassContext(nodes, values, outputValue, new CompileOptions(true));
             for (int pi = 0; pi < nodes.Count; pi++)
             {
                 ExecNode m = nodes[pi];
                 if (m.Op != ExecOp.MaxPool || m.P is not PoolP pp || pp.Kernel is not [2, 2] || pp.Strides is not [2, 2]
                     || pp.Pads.Any(x => x != 0) || m.In.Length != 1) continue;
-                int v = m.In[0], ci = Producer(v);
+                int v = m.In[0], ci = ctx.Producer(v);
                 if (ci < 0 || ci > pi || nodes[ci].P is not ConvP cp || cp.Group != 1 || cp.AddValue >= 0 || cp.Pool is not null
-                    || Uses(v) != 1 || !Nhwc4(v) || !Nhwc4(m.Out[0])) continue;
+                    || ctx.Uses(v) != 1 || !ctx.IsNhwc4(v) || !ctx.IsNhwc4(m.Out[0])) continue;
                 int[] cs = values[v].Shape, ps = values[m.Out[0]].Shape;
                 if (cs[2] != ps[2] * 2 || cs[3] != ps[3] * 2) continue;
-                if (gpu && (!GpuSmallConv(cp, values[nodes[ci].In[1]].Shape, values[nodes[ci].In[0]].Shape[1]) || !SameHw(nodes[ci].In[0], v))) continue;
+                int xin = nodes[ci].In[0];
+                if (gpu && (!GpuSmallConv(cp, values[nodes[ci].In[1]].Shape, values[xin].Shape[1])
+                    || values[xin].Shape[2] != cs[2] || values[xin].Shape[3] != cs[3])) continue;
                 cp.Pool = pp;
                 nodes[ci].Out = [m.Out[0]];
                 nodes.RemoveAt(pi);
@@ -444,122 +405,48 @@ internal static class GraphCompiler
         }
 
         /// <summary>
-        /// Upsample fusions (NHWC plans):
-        /// <list type="bullet">
-        /// <item>Resize → (Relu) → Add(·, [Relu](skip)) → 1x1 Conv (few outputs) → (Sigmoid|Relu)
-        ///   becomes one <see cref="ExecOp.UpHead"/> — the network tail, where every
-        ///   intermediate is a full-resolution tensor that would otherwise round-trip memory.</item>
-        /// <item>Resize → Add(·, [Relu](skip)) becomes a Resize with an addend (In[1]).</item>
-        /// </list>
-        /// Fused nodes take the position of the last node they replace, so every input is
-        /// produced before them. Uses are counted by buffer (aliases and conv/gemm param
-        /// value ids included), so an intermediate is only dropped when nothing else reads it.
+        /// Resize -> Add(., [Relu](skip)) becomes a Resize with an addend (In[1]) in NHWC plans, so
+        /// the full-resolution resize output is never stored. The fused node takes the Add's position.
         /// </summary>
-        private static void FuseUpsample(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        private static void FuseResizeAdd(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
-            int Producer(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
-            int Uses(int v)
-            {
-                int b = values[v].Buf;
-                if (b < 0 || v == outputValue || values[outputValue].Buf == b) return int.MaxValue;
-                int n = 0;
-                foreach (ExecNode m in nodes)
-                {
-                    foreach (int iv in m.In) if (values[iv].Buf == b) n++;
-                    int a1 = m.P switch { ConvP c => c.AddValue, _ => -1 };
-                    int a2 = m.P switch { ConvP c => c.BiasValue, GemmP g => g.BiasValue, _ => -1 };
-                    if (a1 >= 0 && values[a1].Buf == b) n++;
-                    if (a2 >= 0 && values[a2].Buf == b) n++;
-                }
-                return n;
-            }
-            bool Same(int a, int b) => values[a].Shape.SequenceEqual(values[b].Shape);
-
-            // resolve add(resize(x), other): (resize node, skip value, skip relu node or null)
-            (ExecNode rs, int skip, ExecNode? relu)? MatchAdd(ExecNode add)
-            {
-                if (add.Op != ExecOp.Elementwise || add.In.Length != 2 || add.P is not EwP { Op: EwOp.Add, Act: ActivationKind.None })
-                    return null;
-                for (int k = 0; k < 2; k++)
-                {
-                    int u = add.In[k], o = add.In[1 - k];
-                    int ri = Producer(u);
-                    if (ri < 0 || nodes[ri].Op != ExecOp.ResizeBilinear || nodes[ri].In.Length != 1) continue;
-                    if (Uses(u) != 1 || !Same(u, add.Out[0]) || !Same(o, add.Out[0]) || values[o].Buf < 0) continue;
-                    int pi = Producer(o);
-                    if (pi >= 0 && nodes[pi].Op == ExecOp.Relu && nodes[pi].In.Length == 1 && Uses(o) == 1
-                        && values[nodes[pi].In[0]].Buf >= 0 && Same(nodes[pi].In[0], o))
-                        return (nodes[ri], nodes[pi].In[0], nodes[pi]);
-                    return (nodes[ri], o, null);
-                }
-                return null;
-            }
-
-            // 1) tails: ... -> Add -> Conv1x1 -> (act)
-            for (int ci = 0; ci < nodes.Count; ci++)
-            {
-                ExecNode c = nodes[ci];
-                if (c.Op != ExecOp.Conv || c.P is not ConvP cp || cp.Group != 1 || cp.Act != ActivationKind.None
-                    || cp.AddValue >= 0 || cp.Kernel[0] != 1 || cp.Kernel[1] != 1 || cp.Strides.Any(s => s != 1)
-                    || cp.Pads.Any(p => p != 0) || cp.Dilations.Any(d => d != 1)) continue;
-                CValue w = values[c.In[1]];
-                if (w.Floats is null || w.Shape.Length != 4 || w.Shape[0] > 8 || w.Shape[1] > 128 || w.Shape[1] % 4 != 0) continue;   // kernel limits (oc lanes, staged weights, vec4 channels)
-                if (cp.BiasValue >= 0 && values[cp.BiasValue].Floats is null) continue;
-                int s = c.In[0];
-                int ai = Producer(s);
-                if (ai < 0 || Uses(s) != 1 || values[s].Shape.Length != 4) continue;
-                ExecNode addNode = nodes[ai];
-                if (MatchAdd(addNode) is not { } mt) continue;
-                var (rs, skip, relu) = mt;
-
-                ExecNode? act = null;
-                int y = c.Out[0];
-                if (Uses(y) == 1)
-                {
-                    act = nodes.FirstOrDefault(m => m.In.Length == 1 && m.In[0] == y
-                        && m.Op is ExecOp.Sigmoid or ExecOp.Relu && values[m.Out[0]].Buf >= 0);
-                }
-                var head = new ExecNode
-                {
-                    Op = ExecOp.UpHead,
-                    In = cp.BiasValue >= 0 ? [rs.In[0], skip, c.In[1], cp.BiasValue] : [rs.In[0], skip, c.In[1]],
-                    Out = [act?.Out[0] ?? y],
-                    P = new UpHeadP
-                    {
-                        Scales = ((ResizeP)rs.P!).Scales,
-                        ResizeRelu = ((ResizeP)rs.P!).FuseRelu,
-                        SkipRelu = relu is not null,
-                        Act = act is null ? ActivationKind.None : act.Op == ExecOp.Sigmoid ? ActivationKind.Sigmoid : ActivationKind.Relu,
-                    },
-                    SrcNode = c.SrcNode,
-                    Name = c.Name + ".uphead",
-                };
-                nodes[ci] = head;
-                nodes.Remove(rs); nodes.Remove(addNode);
-                if (relu is not null) nodes.Remove(relu);
-                if (act is not null) nodes.Remove(act);
-                ci = -1;   // indices shifted; rescan (few nodes, cheap)
-            }
-
-            // 2) Resize -> Add
+            var ctx = new PassContext(nodes, values, outputValue, new CompileOptions(true));
             for (int ai = 0; ai < nodes.Count; ai++)
             {
                 ExecNode add = nodes[ai];
-                if (MatchAdd(add) is not { } mt) continue;
-                var (rs, skip, relu) = mt;
-                int ri = nodes.IndexOf(rs);
-                var rp = (ResizeP)rs.P!;
+                if (add.Op != ExecOp.Elementwise || add.In.Length != 2 || add.P is not EwP { Op: EwOp.Add, Act: ActivationKind.None })
+                    continue;
+                ExecNode? rs = null, relu = null;
+                int skip = -1;
+                for (int k = 0; k < 2 && rs is null; k++)
+                {
+                    int u = add.In[k], o = add.In[1 - k];
+                    int ri = ctx.Producer(u);
+                    if (ri < 0 || nodes[ri].Op != ExecOp.ResizeBilinear || nodes[ri].In.Length != 1) continue;
+                    if (ctx.Uses(u) != 1 || !ctx.SameShape(u, add.Out[0]) || !ctx.SameShape(o, add.Out[0]) || values[o].Buf < 0) continue;
+                    rs = nodes[ri];
+                    skip = o;
+                    int pi = ctx.Producer(o);
+                    if (pi >= 0 && nodes[pi].Op == ExecOp.Relu && nodes[pi].In.Length == 1 && ctx.Uses(o) == 1
+                        && values[nodes[pi].In[0]].Buf >= 0 && ctx.SameShape(nodes[pi].In[0], o))
+                    {
+                        relu = nodes[pi];
+                        skip = relu.In[0];
+                    }
+                }
+                if (rs is null) continue;
+                int rIdx = nodes.IndexOf(rs);
                 rs.In = [rs.In[0], skip];
-                rp.AddRelu = relu is not null;
+                ((ResizeP)rs.P!).AddRelu = relu is not null;
                 rs.Out = [add.Out[0]];
-                nodes[ai] = rs;      // producer precedes consumer: ri < ai
-                nodes.RemoveAt(ri);
+                nodes[ai] = rs;      // producer precedes consumer: rIdx < ai
+                nodes.RemoveAt(rIdx);
                 if (relu is not null) nodes.Remove(relu);
                 ai = -1;
             }
         }
 
-        private static void Redirect(List<ExecNode> nodes, List<CValue> values, int oldValue, int newValue)
+        internal static void Redirect(List<ExecNode> nodes, List<CValue> values, int oldValue, int newValue)
         {
             foreach (ExecNode m in nodes)
                 for (int i = 0; i < m.In.Length; i++)
@@ -569,7 +456,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>True when value `v`'s only consumer is node index `useIdx`, once.</summary>
-        private static bool SoleUse(List<ExecNode> nodes, int v, int useIdx)
+        internal static bool SoleUse(List<ExecNode> nodes, int v, int useIdx)
         {
             int count = 0;
             for (int i = 0; i < nodes.Count; i++)
@@ -664,169 +551,6 @@ internal static class GraphCompiler
             }
         }
 
-        /// <summary>
-        /// Recognizes the shift-MLP subgraph: Pad(const ±p on H or W) -> channel
-        /// Split (5 groups via Slice) -> per-group roll (Slice+Slice+Concat on the
-        /// spatial axis) -> Concat(axis=1) -> Slice(unpad). Replaced by a single
-        /// ChannelShift node writing the shifted [1,C,h,w] tensor.
-        /// </summary>
-        private static void FuseShift(List<ExecNode> nodes, List<CValue> values)
-        {
-            for (int i = 0; i < nodes.Count; i++)
-            {
-                ExecNode pad = nodes[i];
-                if (pad.Op != ExecOp.Pad || pad.P is not PadP pp || pp.Mode != PadMode.Constant)
-                    continue;
-                int inId = pad.In[0], padOut = pad.Out[0];
-                int rank = values[padOut].Shape.Length;
-                if (rank != 4) continue;
-                // spatial pad amount (must be uniform ±p on exactly one spatial axis pair? ours: both H,W ±2)
-                int padH = pp.Pads[2], padW = pp.Pads[3];
-                if (pp.Pads[2 + rank] != padH || pp.Pads[3 + rank] != padW) continue;
-
-                // find all consumer slices of padOut (channel split pieces)
-                var pieces = nodes.Where(m => m.Op == ExecOp.Slice && m.In.Length == 1 && m.In[0] == padOut).ToList();
-                if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                    Console.Error.WriteLine($"[shift?] pad {pad.Name} pieces={pieces.Count}");
-                if (pieces.Count != 5) continue;
-                int[] padShape = values[padOut].Shape;
-                // SliceP.Starts/Ends are per-Axes-position arrays (len == Axes.Length).
-                // For a slice emitted from a Split over axis C, every axes entry is
-                // identity except the one at axis 1, which carries the group range.
-                bool RangeAt(SliceP s, int ax, int[] inShape, out int st, out int en)
-                {
-                    st = 0; en = inShape[ax];
-                    for (int k = 0; k < s.Axes.Length; k++)
-                        if (s.Axes[k] == ax) { st = s.Starts[k]; en = s.Ends[k]; break; }
-                    return s.Axes.Where((a, k) => a != ax).All(a =>
-                        s.Starts[Array.IndexOf(s.Axes, a)] == 0 &&
-                        s.Ends[Array.IndexOf(s.Axes, a)] >= inShape[a]);
-                }
-                var pieceInfo = pieces
-                    .Select(m => (node: m, s: (SliceP)m.P!))
-                    .Where(t => RangeAt(t.s, 1, padShape, out _, out _))
-                    .OrderBy(t => { RangeAt(t.s, 1, padShape, out int st, out _); return st; })
-                    .ToArray();
-                if (pieceInfo.Length != 5)
-                {
-                    if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                        Console.Error.WriteLine($"  pieceInfo={pieceInfo.Length} (OnlyAxis fail)");
-                    continue;
-                }
-                int[] groupEnds = pieceInfo.Select(t =>
-                {
-                    RangeAt(t.s, 1, padShape, out _, out int en); return en;
-                }).ToArray();
-
-                // for each piece find its roll: two Slice consumers + one Concat
-                int[] offsets = new int[5];
-                int shiftAxis = -1;
-                int[] pieceOutIds = pieceInfo.Select(t => t.node.Out[0]).ToArray();
-                var smallConcatOuts = new List<int>(5);
-                bool fail = false;
-                var toRemove = new List<ExecNode>(pieces);
-                for (int gI = 0; gI < 5; gI++)
-                {
-                    int pieceId = pieceOutIds[gI];
-                    var rollSlices = nodes.Where(m => m.Op == ExecOp.Slice && m.In.Length == 1 && m.In[0] == pieceId).ToList();
-                    if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                    {
-                        var allCons = nodes.Where(m => m.In.Contains(pieceId))
-                            .Select(m => m.Op.ToString());
-                        Console.Error.WriteLine($"  g{gI} piece {pieceId} consumers=[{string.Join(",", allCons)}] rollSlices={rollSlices.Count}");
-                    }
-                    if (rollSlices.Count != 2) { fail = true; break; }
-                    var concat = nodes.FirstOrDefault(m => m.Op == ExecOp.Concat && m.In.Length == 2 &&
-                        m.In.Contains(rollSlices[0].Out[0]) && m.In.Contains(rollSlices[1].Out[0]));
-                    if (concat is null) { fail = true; break; }
-                    var sp = (SliceP)rollSlices[0].P!; var sp2 = (SliceP)rollSlices[1].P!;
-                    // both roll slices must slice a single spatial axis
-                    int SliceAxis(SliceP s, int[] pieceShape)
-                    {
-                        int found = -1;
-                        for (int k = 0; k < s.Axes.Length; k++)
-                        {
-                            int d = s.Axes[k];
-                            bool sliced = s.Starts[k] != 0 || s.Ends[k] < pieceShape[d];
-                            if (sliced && found != -1) return -1;
-                            if (sliced) found = d;
-                        }
-                        return found;
-                    }
-                    int[] pieceShape = values[pieceId].Shape;
-                    int ax = SliceAxis(sp, pieceShape);
-                    int ax2 = SliceAxis(sp2, pieceShape);
-                    // allow one side to be unsliced (identity roll for the 0-offset group)
-                    if (ax < 0) ax = ax2;
-                    if (ax2 >= 0 && ax2 != ax) ax = -1;
-                    if (ax < 0 || (ax != 2 && ax != 3))
-                    {
-                        if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                            Console.Error.WriteLine($"    ax={ax} ax2={ax2} s0.Axes=[{string.Join(",", sp.Axes)}] s1.Axes=[{string.Join(",", sp2.Axes)}]");
-                        fail = true; break;
-                    }
-                    if (shiftAxis == -1) shiftAxis = ax;
-                    else if (shiftAxis != ax) { fail = true; break; }
-                    int L = pieceShape[ax];
-                    // concat order = [B, A] where A = piece[0..cut] is the "head"
-                    var sA = rollSlices[0].Out[0] == concat.In[0] ? sp2 : sp;
-                    var sB = rollSlices[0].Out[0] == concat.In[0] ? sp : sp2;
-                    RangeAt(sA, ax, pieceShape, out int saSt, out int saEn);
-                    RangeAt(sB, ax, pieceShape, out int sbSt, out int sbEn);
-                    // sanity: A is the head [0..cut], B is the tail [cut..L]
-                    if (saSt != 0 || sbSt != saEn || sbEn < L) { fail = true; break; }
-                    int cut = saEn - saSt;
-                    // effective shift on UNPADDED axis: out[y] = orig[y + s], zero-fill.
-                    // rolled[i] = padded[(i+cut) mod L]; sliced[y] = rolled[y+padAmt]
-                    //   = padded[(y+padAmt+cut) mod L]; orig coord = that - padAmt.
-                    int dim = values[pad.In[0]].Shape[shiftAxis];
-                    int padAmt = shiftAxis == 2 ? padH : padW;
-                    offsets[gI] = ((padAmt + cut) % L) - padAmt;
-                    toRemove.AddRange(rollSlices);
-                    toRemove.Add(concat);
-                    smallConcatOuts.Add(concat.Out[0]);
-                }
-                ExecNode? bigConcat = fail ? null : nodes.FirstOrDefault(m =>
-                    m.Op == ExecOp.Concat && m.In.Length == 5 &&
-                    smallConcatOuts.All(m.In.Contains));
-                if (fail || bigConcat is null)
-                {
-                    if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                    {
-                        Console.Error.WriteLine($"  fail={fail} bigConcat={(bigConcat is null ? "null" : "ok")} (gI loop)");
-                        foreach (var cc in nodes.Where(m => m.Op == ExecOp.Concat))
-                            Console.Error.WriteLine($"    concat in[{string.Join("+", cc.In.Select(v => v.ToString()))}] outs=[{string.Join("+", cc.Out.Select(v => v.ToString()))}]");
-                    }
-                    continue;
-                }
-                // unpad slice consuming bigConcat output
-                var unpad = nodes.FirstOrDefault(m => m.Op == ExecOp.Slice && m.In.Length == 1 && m.In[0] == bigConcat.Out[0]);
-                if (unpad is null)
-                {
-                    if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                        Console.Error.WriteLine($"  unpad missing for concat out {bigConcat.Out[0]}");
-                    continue;
-                }
-                toRemove.Add(bigConcat);
-                toRemove.Add(unpad);
-                toRemove.Add(pad);
-
-                var shift = new ExecNode
-                {
-                    Op = ExecOp.ChannelShift,
-                    In = [inId],
-                    Out = unpad.Out,
-                    P = new ShiftP { Axis = shiftAxis, GroupEnds = groupEnds, Offsets = offsets },
-                    SrcNode = pad.SrcNode,
-                    Name = pad.Name + ".shift",
-                };
-                if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
-                    Console.Error.WriteLine($"[shift!] {pad.Name} axis={shiftAxis} ends=[{string.Join(",", groupEnds)}] offs=[{string.Join(",", offsets)}]");
-                foreach (ExecNode m in toRemove) nodes.Remove(m);
-                nodes.Insert(Math.Min(i, nodes.Count), shift);
-            }
-        }
-
         /// <summary>Lifetime-based arena packing (def-order, free-list reuse).</summary>
         private static void PlanArena(List<ExecNode> nodes, List<CValue> values,
             List<int> bufSize, int inputValue, int outputValue,
@@ -846,28 +570,11 @@ internal static class GraphCompiler
                     int b = values[iv].Buf;
                     if (b >= 0) { use[b] = Math.Max(use[b], ni); def[b] = Math.Min(def[b], ni); }
                 }
-                // value ids carried in params (conv bias/residual, gemm bias) count as uses
-                int aux = n.P switch
+                // value ids carried in params (conv bias/residual, gemm bias, extensions) count as uses
+                foreach (int iv in n.ParamRefs())
                 {
-                    ConvP c => Math.Max(c.BiasValue, c.AddValue),
-                    GemmP g => g.BiasValue,
-                    _ => -1,
-                };
-                if (aux >= 0)
-                {
-                    // note: for ConvP, BiasValue and AddValue may differ — scan both
-                    if (n.P is ConvP cp2)
-                        foreach (int iv in new[] { cp2.BiasValue, cp2.AddValue })
-                        {
-                            if (iv < 0) continue;
-                            int b = values[iv].Buf;
-                            if (b >= 0) { use[b] = Math.Max(use[b], ni); def[b] = Math.Min(def[b], ni); }
-                        }
-                    else
-                    {
-                        int b = values[aux].Buf;
-                        if (b >= 0) { use[b] = Math.Max(use[b], ni); def[b] = Math.Min(def[b], ni); }
-                    }
+                    int b = values[iv].Buf;
+                    if (b >= 0) { use[b] = Math.Max(use[b], ni); def[b] = Math.Min(def[b], ni); }
                 }
                 foreach (int ov in n.Out)
                 {
@@ -959,7 +666,7 @@ internal static class GraphCompiler
                     arenaFloats = top;
                 }
             }
-            if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "3")
+            if (Env.Flag("DUMP") == "3")
             {
                 long peak = 0; int at = -1;
                 for (int ni = -1; ni <= nodes.Count; ni++)

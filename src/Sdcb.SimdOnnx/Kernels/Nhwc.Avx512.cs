@@ -19,7 +19,7 @@ namespace Sdcb.SimdOnnx.Kernels;
 /// </summary>
 internal static unsafe partial class Nhwc
 {
-    private const int Tile5 = 10;
+    internal const int Tile5 = 10;
 
     /// <summary>AVX-512 tier switch: <c>Avx512F.IsSupported</c>, off with GCDRNET_AVX512=0 or the
     /// .NET 8/9-style DOTNET_EnableAVX512F=0 (the .NET 10 JIT only honours DOTNET_EnableAVX512).
@@ -30,7 +30,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Tile5 rows × 32 oc: dst[r*ds + 0..15] ← block wb, dst[r*ds + 16..31] ← block wb + wStep.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Tile512x32(float** ptrs, int taps, int ic, float* wb, long wStep, float* bb, float* dst, int ds)
+    internal static void Tile512x32(float** ptrs, int taps, int ic, float* wb, long wStep, float* bb, float* dst, int ds)
     {
         F32x16 a0 = Avx512F.LoadVector512(bb), b0 = Avx512F.LoadVector512(bb + Ob);
         F32x16 a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0, a8 = a0, a9 = a0;
@@ -80,7 +80,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Tile5 rows × 16 oc (odd block count tail): dst[r*ds + 0..15].</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Tile512x16(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
+    internal static void Tile512x16(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
     {
         F32x16 a0 = Avx512F.LoadVector512(bb);
         F32x16 a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0, a6 = a0, a7 = a0, a8 = a0, a9 = a0;
@@ -118,7 +118,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Runs the 32- or 16-wide kernel for one tile into <paramref name="part"/> ([Tile5][32]).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Tile512(float** ptrs, int nblk, int taps, int ic, float* wb, long wStep, float* bb, float* part)
+    internal static void Tile512(float** ptrs, int nblk, int taps, int ic, float* wb, long wStep, float* bb, float* part)
     {
         if (nblk == 2) Tile512x32(ptrs, taps, ic, wb, wStep, bb, part, 2 * Ob);
         else Tile512x16(ptrs, taps, ic, wb, bb, part, 2 * Ob);
@@ -126,7 +126,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Epilogue of one tile: part ([Tile5][32]) → rows × (lanes0 + lanes1) outputs, + residual, act.</summary>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private static void Epilogue512(float* part, int rows, int nblk, float* outp, float* addp, int oc,
+    internal static void Epilogue512(float* part, int rows, int nblk, float* outp, float* addp, int oc,
         int lanes0, int lanes1, ActivationKind act)
     {
         bool simple = act is ActivationKind.None or ActivationKind.Relu;
@@ -151,7 +151,7 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    private static void Dense512(ReadOnlySpan<float> src, int iw, int ic, Span<float> dst,
+    internal static void Dense512(ReadOnlySpan<float> src, int iw, int ic, Span<float> dst,
         int oh, int ow, int oc, int kh, int kw, int[] rm, int[] cm, float[] padVec,
         NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
     {
@@ -174,7 +174,7 @@ internal static unsafe partial class Nhwc
     /// <summary>All oc blocks of direct-conv output row <paramref name="y"/> (the row-level entry of
     /// the fused paths: conv+pool bands, UpHead skip recompute). AVX-512 tier: block pairs through
     /// <see cref="Dense512Row"/> (needs a padVec of ic*kw + 16 floats); else <see cref="DenseRow"/>.</summary>
-    private static void ConvRow(in DenseArgs a, int y, float* orow, float* arow)
+    internal static void ConvRow(in DenseArgs a, int y, float* orow, float* arow)
     {
         if (UseAvx512)
             for (int blk = 0; blk < a.Nb; blk += 2) Dense512Row(a, y, blk, orow, arow);
@@ -184,7 +184,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Output row <paramref name="y"/>, oc blocks blk and blk+1 (if present) of a direct conv
     /// into <paramref name="orow"/> (the row's first pixel; addend row likewise).</summary>
-    private static void Dense512Row(in DenseArgs a, int y, int blk, float* orow, float* arow)
+    internal static void Dense512Row(in DenseArgs a, int y, int blk, float* orow, float* arow)
     {
         int kh = a.Kh, kw = a.Kw, taps = kh * kw, ic = a.Ic, ow = a.Ow, oc = a.Oc, nblk = Math.Min(2, a.Nb - blk);
         long wStep = (long)taps * ic * Ob;
@@ -238,7 +238,7 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    private static void Gemm512(ReadOnlySpan<float> a, int m, int k, Span<float> dst, int n,
+    internal static void Gemm512(ReadOnlySpan<float> a, int m, int k, Span<float> dst, int n,
         NhwcConvPlan kp, ActivationKind act)
     {
         const int G = 8;   // row tiles per task sharing one weight panel walk
@@ -269,7 +269,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary><see cref="ResizePixel"/> with 16-lane vectors: same per-lane ops (and IEEE Max) → same bits.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ResizePixel512(float* a, float* b, float* e, float* f, F32x16 vX, F32x16 vY,
+    internal static void ResizePixel512(float* a, float* b, float* e, float* f, F32x16 vX, F32x16 vY,
         int c, bool relu, float* add, bool addRelu, float* o)
     {
         for (int ch = 0; ch < c; ch += 16)
@@ -290,7 +290,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>MaxPool, one output pixel per step: max over the valid taps in registers, one store
     /// (the generic path copies the first tap and read-modify-writes the output per tap).</summary>
-    private static void MaxPool512(float* sp, int iw, int c, float* dp, int oh, int ow, int kh, int kw,
+    internal static void MaxPool512(float* sp, int iw, int c, float* dp, int oh, int ow, int kh, int kw,
         int[] rm, int[] cm, bool relu)
     {
         For(oh, (long)oh * ow * c * kh * kw, y =>
@@ -322,71 +322,5 @@ internal static unsafe partial class Nhwc
         });
     }
 
-    /// <summary>
-    /// <see cref="UpHead"/> for the AVX-512 tier: 16-lane resize, and the c-long oc dot runs as four
-    /// interleaved per-pixel FMA chains (one chain per pixel was FMA-latency bound). Each pixel keeps
-    /// its bias-initialized, channel-ascending chain, so outputs match the AVX2 path bit for bit.
-    /// </summary>
-    private static void UpHead512(float* sp, int iw, int c, float* kpp, bool skipConv, DenseArgs ca, float* dp, int oh, int ow,
-        int[] y0, int[] y1, int[] x0, int[] x1, float[] wy, float[] wx, bool relu, bool skipRelu,
-        float* wp, float* bp, int oc, ActivationKind act)
-    {
-        bool v512 = c % 16 == 0;
-        For(oh, (long)oh * ow * c * (oc + 4), y =>
-        {
-            float* s = stackalloc float[4 * c + 8];
-            float* acc = stackalloc float[4 * 8];
-            float* r0 = sp + (long)y0[y] * iw * c, r1 = sp + (long)y1[y] * iw * c;
-            var vY = new System.Numerics.Vector<float>(wy[y]);
-            var vY16 = Vector512.Create(wy[y]);
-            float wY = wy[y];
-            float* orow = dp + (long)y * ow * oc;
-            float* krow = kpp + (long)y * ow * c;
-            float[]? band = skipConv ? BandBuf((long)ow * c) : null;
-            fixed (float* sb = band)
-            {
-                if (skipConv)
-                {
-                    ConvRow(ca, y, sb, null);   // the skip row, recomputed by the same conv kernel
-                    krow = sb;
-                }
-                for (int x = 0; x < ow; x += 4)
-                {
-                    int n = Math.Min(4, ow - x);
-                    for (int i = 0; i < n; i++)
-                    {
-                        int xx = x + i;
-                        float* a = r0 + (long)x0[xx] * c, b = r0 + (long)x1[xx] * c, e = r1 + (long)x0[xx] * c, f = r1 + (long)x1[xx] * c;
-                        if (v512) ResizePixel512(a, b, e, f, Vector512.Create(wx[xx]), vY16, c, relu, krow + (long)xx * c, skipRelu, s + i * c);
-                        else ResizePixel(a, b, e, f, wx[xx], wY, new System.Numerics.Vector<float>(wx[xx]), vY, c, relu, krow + (long)xx * c, skipRelu, s + i * c);
-                    }
-                    UpHeadDot4(s, c, wp, bp, acc, n);
-                    for (int i = 0; i < n; i++)
-                    {
-                        float* o = orow + (long)(x + i) * oc;
-                        for (int l = 0; l < oc; l++) o[l] = acc[i * 8 + l];
-                    }
-                }
-                if (act != ActivationKind.None) ActRow(orow, ow * oc, act, true);
-            }
-        });
-    }
 
-    /// <summary>acc[i*8 + l] = bias[l] + Σ_ch s_i[ch]·w[ch][l] for 4 pixels (s_i = s + i*c), chains interleaved.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void UpHeadDot4(float* s, int c, float* wp, float* bp, float* acc, int n)
-    {
-        float* s0 = s, s1 = n > 1 ? s + c : s, s2 = n > 2 ? s + 2 * c : s, s3 = n > 3 ? s + 3 * c : s;
-        F32x8 a0 = Avx.LoadVector256(bp), a1 = a0, a2 = a0, a3 = a0;
-        float* w = wp;
-        for (int ch = 0; ch < c; ch++, w += 8)
-        {
-            F32x8 wv = Avx.LoadVector256(w);
-            a0 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(s0 + ch), wv, a0);
-            a1 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(s1 + ch), wv, a1);
-            a2 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(s2 + ch), wv, a2);
-            a3 = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(s3 + ch), wv, a3);
-        }
-        Avx.Store(acc, a0); Avx.Store(acc + 8, a1); Avx.Store(acc + 16, a2); Avx.Store(acc + 24, a3);
-    }
 }

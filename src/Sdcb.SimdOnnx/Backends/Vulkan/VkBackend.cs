@@ -12,7 +12,7 @@ internal sealed unsafe class VkBackend : IDisposable
 {
     internal readonly VkDevice Dev;
     // (model, c, h, w) -> compiled graph (weights upload + dispatch list)
-    private readonly ConcurrentDictionary<(OnnxModel m, int c, int h, int w, bool physIo), VkGraphModel> _graphs = new();
+    private readonly ConcurrentDictionary<(OnnxModel m, int c, int h, int w, bool physIo, EngineExtensions? ext), VkGraphModel> _graphs = new();
 
     private static readonly Lazy<VkBackend> s_default = new(() => new VkBackend());
     internal static VkBackend Default => s_default.Value;
@@ -22,8 +22,8 @@ internal sealed unsafe class VkBackend : IDisposable
     /// Standalone sessions keep logical NCHW I/O (boundary relayouts in the plan);
     /// the fused pipeline keeps I/O physical and its glue shaders speak NHWC.
     /// </summary>
-    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Gpu: true);
-    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Gpu: true);
+    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Vulkan);
+    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Vulkan);
 
     /// <summary>fp16 activation/weight storage (needs storageBuffer16BitAccess; GCDRNET_VK_F16=0 forces fp32).</summary>
     internal bool F16 => Dev.StorageBuffer16 && Environment.GetEnvironmentVariable("GCDRNET_VK_F16") != "0";
@@ -34,22 +34,24 @@ internal sealed unsafe class VkBackend : IDisposable
     }
 
     /// <summary>Standalone session for one model at [1,c,h,w] (test path).</summary>
-    public VkInferenceSession NewSession(OnnxModel m, int[] shape)
+    public VkInferenceSession NewSession(OnnxModel m, int[] shape) => NewSession(m, shape, null);
+
+    internal VkInferenceSession NewSession(OnnxModel m, int[] shape, EngineExtensions? ext)
     {
-        VkGraphModel g = AcquireGraph(m, shape, physIo: false);   // caller ref: later evictions can't free it under us
+        VkGraphModel g = AcquireGraph(m, shape, physIo: false, ext);   // caller ref: later evictions can't free it under us
         try { return new VkInferenceSession(Dev, g.Plan, g); }
         finally { g.Release(); }
     }
 
     /// <summary>Compiled GPU graph for a model+shape (cached, bounded).</summary>
-    internal VkGraphModel GraphFor(OnnxModel m, int[] shape, bool physIo = false)
+    internal VkGraphModel GraphFor(OnnxModel m, int[] shape, bool physIo = false, EngineExtensions? ext = null)
     {
-        var key = (m, shape[1], shape[2], shape[3], physIo);
+        var key = (m, shape[1], shape[2], shape[3], physIo, ext);
         if (_graphs.TryGetValue(key, out var g)) return g;
         // weights live in a per-model const store shared across sizes, so a graph is
         // just a plan + dispatch list (no per-size device memory)
         g = new VkGraphModel(Dev, GraphCompiler.Compile(m, [1, shape[1], shape[2], shape[3]],
-            physIo ? PipeOptions : PlanOptions), F16, constKey: m);
+            (physIo ? PipeOptions : PlanOptions) with { Extensions = ext }), F16, constKey: m);
         if (!_graphs.TryAdd(key, g)) { g.Dispose(); return _graphs[key]; }
         // bound the cache: evict an arbitrary other graph beyond the cap
         while (_graphs.Count > MaxGraphs)
@@ -67,11 +69,11 @@ internal sealed unsafe class VkBackend : IDisposable
 
     /// <summary><see cref="GraphFor"/> plus a caller reference. Retries when a concurrent
     /// eviction freed the cached graph between lookup and acquire (never resurrects it).</summary>
-    internal VkGraphModel AcquireGraph(OnnxModel m, int[] shape, bool physIo)
+    internal VkGraphModel AcquireGraph(OnnxModel m, int[] shape, bool physIo, EngineExtensions? ext = null)
     {
         while (true)
         {
-            VkGraphModel g = GraphFor(m, shape, physIo);
+            VkGraphModel g = GraphFor(m, shape, physIo, ext);
             if (g.TryAcquire()) return g;
         }
     }

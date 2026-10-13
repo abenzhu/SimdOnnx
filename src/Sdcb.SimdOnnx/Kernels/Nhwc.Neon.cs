@@ -20,13 +20,13 @@ internal static unsafe partial class Nhwc
     internal static bool UseNeon = AdvSimd.Arm64.IsSupported;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 Ld4(float* p) => AdvSimd.LoadVector128(p);
+    internal static V4 Ld4(float* p) => AdvSimd.LoadVector128(p);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 Fma4(V4 acc, V4 a, V4 b) => AdvSimd.FusedMultiplyAdd(acc, a, b);
+    internal static V4 Fma4(V4 acc, V4 a, V4 b) => AdvSimd.FusedMultiplyAdd(acc, a, b);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 Act4(V4 v, ActivationKind act) => act switch
+    internal static V4 Act4(V4 v, ActivationKind act) => act switch
     {
         ActivationKind.Relu => AdvSimd.Max(v, V4.Zero),
         ActivationKind.Sigmoid => SimdMath.SigmoidCore(v),
@@ -36,7 +36,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>6 × 16 tile: <see cref="TileNeonK"/> into a scratch tile, then the residual /
     /// activation epilogue per row.</summary>
-    private static void TileNeon(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
+    internal static void TileNeon(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
         float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         float* part = stackalloc float[Tile * Ob];
@@ -46,7 +46,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Residual / activation epilogue of a finished 6 × 16 scratch tile.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void TileNeonStore(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
+    internal static void TileNeonStore(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         for (int r = 0; r < rows; r++, part += Ob)
         {
@@ -69,7 +69,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>6 × 16 k loop over all ic channels of every tap (weights [tap][ic][16]), bias-initialized.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void TileNeonK(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds) =>
+    internal static void TileNeonK(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds) =>
         TileNeonK(ptrs, taps, 0, ic, (long)ic * Ob, wb, bb, dst, ds);
 
     /// <summary>
@@ -81,7 +81,7 @@ internal static unsafe partial class Nhwc
     /// out, so the 24 accumulators stay in registers.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void TileNeonK(float** ptrs, int taps, int coff, int ic, long wTap, float* wb, float* bb, float* dst, int ds,
+    internal static void TileNeonK(float** ptrs, int taps, int coff, int ic, long wTap, float* wb, float* bb, float* dst, int ds,
         bool relu = false)
     {
         V4 a0, a1, a2, a3, a4, a5, b0, b1, b2, b3, b4, b5, c0, c1, c2, c3, c4, c5, d0, d1, d2, d3, d4, d5;
@@ -263,54 +263,15 @@ internal static unsafe partial class Nhwc
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void StoreRow(float* d, V4 a, V4 b, V4 c, V4 e)
+    internal static void StoreRow(float* d, V4 a, V4 b, V4 c, V4 e)
     {
         AdvSimd.Store(d, a); AdvSimd.Store(d + 4, b); AdvSimd.Store(d + 8, c); AdvSimd.Store(d + 12, e);
     }
 
-    [ThreadStatic] private static float[]? t_runs;
-
-    /// <summary>
-    /// One <see cref="UpHead"/> output row for oc &lt;= 4, c % 4 == 0: per 4 channels the bilinear
-    /// lerps (fma), [relu], + [relu](skip), then fmla by element into one 4-lane accumulator against
-    /// the packed [c][8] weights — the resized pixel never leaves registers.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void UpHeadRowNeon(float* r0, float* r1, int* x0, int* x1, float* wx, float wy, float* krow,
-        int c, int ow, float* wp, float* bp, float* orow, int oc, bool relu, bool skipRelu, ActivationKind act)
-    {
-        V4 vY = Vector128.Create(wy), bias = Ld4(bp);
-        for (int x = 0; x < ow; x++)
-        {
-            float* a = r0 + (long)x0[x] * c, b = r0 + (long)x1[x] * c, e = r1 + (long)x0[x] * c, f = r1 + (long)x1[x] * c;
-            float* k = krow + (long)x * c;
-            V4 vX = Vector128.Create(wx[x]), acc = bias;
-            float* w = wp;
-            for (int ch = 0; ch < c; ch += 4, w += 32)
-            {
-                V4 va = Ld4(a + ch), ve = Ld4(e + ch);
-                V4 top = Fma4(va, AdvSimd.Subtract(Ld4(b + ch), va), vX);
-                V4 bot = Fma4(ve, AdvSimd.Subtract(Ld4(f + ch), ve), vX);
-                V4 v = Fma4(top, AdvSimd.Subtract(bot, top), vY);
-                if (relu) v = AdvSimd.Max(v, V4.Zero);
-                V4 s = Ld4(k + ch);
-                v = AdvSimd.Add(v, skipRelu ? AdvSimd.Max(s, V4.Zero) : s);
-                acc = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(acc, Ld4(w), v, 0);
-                acc = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(acc, Ld4(w + 8), v, 1);
-                acc = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(acc, Ld4(w + 16), v, 2);
-                acc = AdvSimd.Arm64.FusedMultiplyAddBySelectedScalar(acc, Ld4(w + 24), v, 3);
-            }
-            acc = Act4(acc, act);
-            float* o = orow + (long)x * oc;
-            o[0] = acc.ToScalar();
-            if (oc > 1) o[1] = acc.GetElement(1);
-            if (oc > 2) o[2] = acc.GetElement(2);
-            if (oc > 3) o[3] = acc.GetElement(3);
-        }
-    }
+    [ThreadStatic] internal static float[]? t_runs;
 
     /// <summary>Thread-local pinned scratch (the pointer outlives any fixed scope).</summary>
-    private static T* Pinned<T>(ref T[]? slot, int n) where T : unmanaged
+    internal static T* Pinned<T>(ref T[]? slot, int n) where T : unmanaged
     {
         if (slot is not { } b || b.Length < n) slot = b = GC.AllocateUninitializedArray<T>(n, pinned: true);
         return (T*)Unsafe.AsPointer(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(b));
@@ -323,7 +284,7 @@ internal static unsafe partial class Nhwc
     /// crosses a padded / reflected border are gathered into a thread-local buffer, constant-pad
     /// rows read <see cref="DenseArgs.PadVec"/>.
     /// </summary>
-    private static void DenseRowNeon(in DenseArgs a, int y, int blk, float* orow, float* arow)
+    internal static void DenseRowNeon(in DenseArgs a, int y, int blk, float* orow, float* arow)
     {
         int kh = a.Kh, kw = a.Kw, ic = a.Ic, ow = a.Ow, oc = a.Oc, run = kw * ic;
         float** ptrs = stackalloc float*[Tile * kh];

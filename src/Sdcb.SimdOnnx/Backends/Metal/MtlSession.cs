@@ -185,10 +185,10 @@ public sealed unsafe class MtlInferenceSession : IDisposable
     internal ExecPlan DebugPlan => _plan;
 
     /// <summary>Debug/test: const offset (ulong.MaxValue when not packed).</summary>
-    internal ulong DebugConstOff(int valueId, int kind) => _graph.DebugConst(valueId, kind).off;
+    internal ulong DebugConstOff(int valueId, Engine.ConstKind kind) => _graph.DebugConst(valueId, kind).off;
 
-    /// <summary>Debug/test: const storage of a value (kind 0 raw,1 f32,2 convw,3 dww,4 convwt,5 gemmnk).</summary>
-    internal float[] DebugConst(int valueId, int kind, int len)
+    /// <summary>Debug/test: const storage of a value in the given packing.</summary>
+    internal float[] DebugConst(int valueId, Engine.ConstKind kind, int len)
     {
         var (buf, off, half) = _graph.DebugConst(valueId, kind);
         var dst = new float[len];

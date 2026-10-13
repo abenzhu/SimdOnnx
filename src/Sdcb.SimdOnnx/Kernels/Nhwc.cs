@@ -22,14 +22,6 @@ internal sealed class NhwcConvPlan
     public float[]? WinoU;  // Winograd F(4x4,3x3) weights [36][oc/16][ic][16], null = direct conv
 }
 
-/// <summary>Packed <see cref="ExecOp.UpHead"/> weights: [c][8] oc lanes (zero-padded) + bias[8].</summary>
-internal sealed class UpHeadPlan
-{
-    public required float[] W;
-    public required float[] Bias;
-    public int Oc, C;
-}
-
 /// <summary>
 /// Channels-last (NHWC, N==1) kernels. Shapes are passed in storage order
 /// ([h,w,c]). Every pad mode goes through precomputed source row/col maps
@@ -42,18 +34,18 @@ internal sealed class UpHeadPlan
 /// </summary>
 internal static unsafe partial class Nhwc
 {
-    private const int Ob = 16, Tile = 6;
-    private static readonly ParallelOptions PO = new() { MaxDegreeOfParallelism = Avx2Kernels.Threads };
-    private static bool UseAvx => Avx2.IsSupported && Fma.IsSupported;
+    internal const int Ob = 16, Tile = 6;
+    internal static readonly ParallelOptions PO = new() { MaxDegreeOfParallelism = Avx2Kernels.Threads };
+    internal static bool UseAvx => Avx2.IsSupported && Fma.IsSupported;
 
-    private static void For(int n, long work, Action<int> body)
+    internal static void For(int n, long work, Action<int> body)
     {
         if (work < 32768 || n == 1) { for (int i = 0; i < n; i++) body(i); return; }
         Parallel.For(0, n, PO, body);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int Reflect(int i, int dim)
+    internal static int Reflect(int i, int dim)
     {
         if (dim <= 1) return 0;
         while (i < 0 || i >= dim) i = i < 0 ? -i : 2 * dim - 2 - i;
@@ -61,7 +53,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>map[o*k+kk] = source index of output o, tap kk, or -1 for constant pad.</summary>
-    private static int[] Map(int outLen, int k, int stride, int pad, int inLen, PadMode mode)
+    internal static int[] Map(int outLen, int k, int stride, int pad, int inLen, PadMode mode)
     {
         int[] m = new int[outLen * k];
         for (int o = 0; o < outLen; o++)
@@ -74,13 +66,13 @@ internal static unsafe partial class Nhwc
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float ActS(float v, ActivationKind act) =>
+    internal static float ActS(float v, ActivationKind act) =>
         act == ActivationKind.Relu ? MathF.Max(v, 0f) :
         act == ActivationKind.Sigmoid ? 1f / (1f + MathF.Exp(-v)) :
         act == ActivationKind.Gelu ? 0.5f * v * (1f + SimdMath.ErfScalar(v * 0.70710678f)) : v;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static F32x8 Act8(F32x8 v, ActivationKind act) => act switch
+    internal static F32x8 Act8(F32x8 v, ActivationKind act) => act switch
     {
         ActivationKind.Relu => V256.Max(v, F32x8.Zero),
         ActivationKind.Sigmoid => SimdMath.SigmoidCore(v),
@@ -181,7 +173,7 @@ internal static unsafe partial class Nhwc
             Dense(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
     }
 
-    private static void Dense(ReadOnlySpan<float> src, int iw, int ic, Span<float> dst,
+    internal static void Dense(ReadOnlySpan<float> src, int iw, int ic, Span<float> dst,
         int oh, int ow, int oc, int kh, int kw, int[] rm, int[] cm, float[] padVec,
         NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
     {
@@ -202,7 +194,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>Per-call direct-conv constants (pointers into pinned/fixed storage).</summary>
-    private readonly unsafe struct DenseArgs(float* src, float* w, float* bias, float* padVec, int* rm, int* cm,
+    internal readonly unsafe struct DenseArgs(float* src, float* w, float* bias, float* padVec, int* rm, int* cm,
         int iw, int ic, int ow, int oc, int kh, int kw, int nb, ActivationKind act, bool avx)
     {
         public readonly float* Src = src, W = w, Bias = bias, PadVec = padVec;
@@ -214,7 +206,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Output row <paramref name="y"/>, oc block <paramref name="blk"/> of a direct conv
     /// into <paramref name="orow"/> (the row's first pixel; addend row likewise).</summary>
-    private static void DenseRow(in DenseArgs a, int y, int blk, float* orow, float* arow)
+    internal static void DenseRow(in DenseArgs a, int y, int blk, float* orow, float* arow)
     {
         if (UseNeon)
         {
@@ -253,7 +245,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>6 × 16 tile: <see cref="TileAvxK"/> into a scratch tile, then the
     /// residual / activation epilogue (<see cref="Store16"/>) per row.</summary>
-    private static void TileAvx(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
+    internal static void TileAvx(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
         float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         float* part = stackalloc float[Tile * Ob];
@@ -269,7 +261,7 @@ internal static unsafe partial class Nhwc
     /// RyuJIT keep all twelve on the stack, a load + store around every FMA.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void TileAvxK(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
+    internal static void TileAvxK(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
     {
         F32x8 a0 = Avx.LoadVector256(bb), b0 = Avx.LoadVector256(bb + 8);
         F32x8 a1 = a0, a2 = a0, a3 = a0, a4 = a0, a5 = a0;
@@ -302,7 +294,7 @@ internal static unsafe partial class Nhwc
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Store16(float* o, float* add, F32x8 a, F32x8 b, int lanes, ActivationKind act)
+    internal static void Store16(float* o, float* add, F32x8 a, F32x8 b, int lanes, ActivationKind act)
     {
         if (lanes == Ob)
         {
@@ -317,7 +309,7 @@ internal static unsafe partial class Nhwc
             o[l] = ActS(add != null ? t[l] + add[l] : t[l], act);
     }
 
-    private static void TileVec(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
+    internal static void TileVec(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
         float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         if (UseNeon)
@@ -367,7 +359,7 @@ internal static unsafe partial class Nhwc
     /// memory on every multiply-add. Same per-lane op order (acc + w·x) as the generic loop.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void TileVec4(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
+    internal static void TileVec4(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
         float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         float* tmp = stackalloc float[2 * Ob];
@@ -406,7 +398,7 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    private static void Depthwise(ReadOnlySpan<float> src, int iw, int c, Span<float> dst,
+    internal static void Depthwise(ReadOnlySpan<float> src, int iw, int c, Span<float> dst,
         int oh, int ow, int kh, int kw, int[] rm, int[] cm, float[] padVec,
         NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
     {
@@ -482,16 +474,16 @@ internal static unsafe partial class Nhwc
 
     // ======================== pixel-vector helpers ========================
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Copy(float* s, float* d, int n) =>
+    internal static void Copy(float* s, float* d, int n) =>
         Buffer.MemoryCopy(s, d, (long)n * 4, (long)n * 4);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Fill(float* d, int n, float v) => new Span<float>(d, n).Fill(v);
+    internal static void Fill(float* d, int n, float v) => new Span<float>(d, n).Fill(v);
 
     // ======================== conv + 2x2 max pool ========================
-    [ThreadStatic] private static float[]? t_band;
+    [ThreadStatic] internal static float[]? t_band;
 
-    private static float[] BandBuf(long floats) =>
+    internal static float[] BandBuf(long floats) =>
         t_band is { } b && b.Length >= floats ? b : (t_band = new float[checked((int)floats)]);
 
     /// <summary>
@@ -539,7 +531,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>2x2/2 max over conv row pairs of a band; same op order as <see cref="MaxPool"/>.</summary>
-    private static void PoolBand(float* sb, int prows, int ow, int c, float* drow, int pw, bool relu)
+    internal static void PoolBand(float* sb, int prows, int ow, int c, float* drow, int pw, bool relu)
     {
         int VL = Vector<float>.Count;
         for (int r = 0; r < prows; r++)
@@ -608,7 +600,7 @@ internal static unsafe partial class Nhwc
     }
 
     // ======================== bilinear resize (half-pixel) ========================
-    private static void ResizeAxis(int outLen, int inLen, float scale, int[] i0, int[] i1, float[] wt)
+    internal static void ResizeAxis(int outLen, int inLen, float scale, int[] i0, int[] i1, float[] wt)
     {
         for (int o = 0; o < outLen; o++)
         {
@@ -623,7 +615,7 @@ internal static unsafe partial class Nhwc
     /// <summary>One output pixel of the bilinear resize into <paramref name="o"/> (c channels):
     /// v = [relu](lerp) + [relu](add) — the same per-element ops as separate Resize/Relu/Add nodes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ResizePixel(float* a, float* b, float* e, float* f, float wX, float wY,
+    internal static void ResizePixel(float* a, float* b, float* e, float* f, float wX, float wY,
         Vector<float> vX, Vector<float> vY, int c, bool relu, float* add, bool addRelu, float* o)
     {
         int VL = Vector<float>.Count, ch = 0;
@@ -693,140 +685,7 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    // ======================== fused upsample tail ========================
-    /// <summary>Packs UpHead weights [oc, c, 1, 1] as [c][8] (oc lanes, zero-padded) + bias[8].</summary>
-    public static UpHeadPlan PackUpHead(ReadOnlySpan<float> w, int oc, int c, ReadOnlySpan<float> bias)
-    {
-        if (oc > 8) throw new NotSupportedException($"UpHead supports oc <= 8 (got {oc}).");
-        float[] pw = new float[c * 8], pb = new float[8];
-        for (int o = 0; o < oc; o++)
-            for (int ch = 0; ch < c; ch++) pw[ch * 8 + o] = w[o * c + ch];
-        if (!bias.IsEmpty) bias.CopyTo(pb);
-        return new UpHeadPlan { W = pw, Bias = pb, Oc = oc, C = c };
-    }
-
-    /// <summary>
-    /// out[y,x,o] = act(bias[o] + Σ_c w[o,c]·s[c]), s = [relu](resize(src)) + [relu](skip): the
-    /// full-resolution resize/add tensors live only in a per-pixel stack buffer. Per-element
-    /// math follows the unfused nodes (bias-initialized, channel-ascending accumulation).
-    /// </summary>
-    public static void UpHead(ReadOnlySpan<float> src, int ih, int iw, int c, ReadOnlySpan<float> skip,
-        Span<float> dst, int oh, int ow, float sy, float sx, UpHeadP p, UpHeadPlan kp,
-        int skipH = 0, int skipW = 0, int skipC = 0)
-    {
-        // SkipConv: `skip` is the conv's input [skipH, skipW, skipC]; each task recomputes
-        // its skip row (same direct-conv kernel → same values) instead of reading a stored one
-        ConvP? sc = p.SkipConv;
-        var skp = sc?.KernelPlan as NhwcConvPlan;
-        if (kp.C != c || dst.Length != (long)oh * ow * kp.Oc
-            || (sc is null ? skip.Length != (long)oh * ow * c
-                : skp is null || skp.Depthwise || skp.WinoU is not null || sc.AddValue >= 0 || skip.Length != (long)skipH * skipW * skipC))
-            throw new NotSupportedException("UpHead shape mismatch.");
-        int[] y0 = new int[oh], y1 = new int[oh], x0 = new int[ow], x1 = new int[ow];
-        float[] wy = new float[oh], wx = new float[ow];
-        ResizeAxis(oh, ih, sy, y0, y1, wy);
-        ResizeAxis(ow, iw, sx, x0, x1, wx);
-        bool relu = p.ResizeRelu, skipRelu = p.SkipRelu, avx = UseAvx;
-        int oc = kp.Oc;
-        bool neonUp = UseNeon && c % 4 == 0 && oc <= 4;
-        bool pkUp = UsePacked && c % 4 == 0 && oc <= 4;
-        ActivationKind act = p.Act;
-        int[] rm = [], cm = [];
-        float[] padVec = [];
-        if (sc is not null)
-        {
-            rm = Map(oh, sc.Kernel[0], sc.Strides[0], sc.Pads[0], skipH, sc.PadMode);
-            cm = Map(ow, sc.Kernel[1], sc.Strides[1], sc.Pads[1], skipW, sc.PadMode);
-            padVec = new float[skipC * sc.Kernel[1] + Ob];   // one constant-pad kernel row (Dense512Row)
-            Array.Fill(padVec, sc.PadValue);
-        }
-        fixed (float* sp0 = src, dp0 = dst, kp0 = skip, wp0 = kp.W, bp0 = kp.Bias)
-        fixed (float* cw = skp?.W, cb = skp?.Bias, pv = padVec)
-        fixed (int* rmp = rm, cmp = cm)
-        {
-            float* sp = sp0, dp = dp0, kpp = kp0, wp = wp0, bp = bp0;
-            var ca = sc is null ? default
-                : new DenseArgs(kp0, cw, cb, pv, rmp, cmp, skipW, skipC, ow, c, sc.Kernel[0], sc.Kernel[1], skp!.Blocks, sc.Act, avx);
-            if (UseAvx512)
-            {
-                UpHead512(sp, iw, c, kpp, sc is not null, ca, dp, oh, ow, y0, y1, x0, x1, wy, wx, relu, skipRelu, wp, bp, oc, act);
-                return;
-            }
-            For(oh, (long)oh * ow * c * (oc + 4), y =>
-            {
-                float* s = stackalloc float[c + 8];
-                float* acc = stackalloc float[8];
-                float* r0 = sp + (long)y0[y] * iw * c, r1 = sp + (long)y1[y] * iw * c;
-                var vY = new Vector<float>(wy[y]);
-                float wY = wy[y];
-                float* orow = dp + (long)y * ow * oc;
-                float[]? band = sc is null ? null : BandBuf((long)ow * c);
-                fixed (float* sb = band)
-                {
-                    float* krow = kpp + (long)y * ow * c;
-                    if (sc is not null)
-                    {
-                        ConvRow(ca, y, sb, null);
-                        krow = sb;
-                    }
-                    if (neonUp)
-                    {
-                        fixed (int* xa = x0, xb = x1)
-                        fixed (float* wxp = wx)
-                            UpHeadRowNeon(r0, r1, xa, xb, wxp, wY, krow, c, ow, wp, bp, orow, oc, relu, skipRelu, act);
-                        return;
-                    }
-                    if (pkUp)
-                    {
-                        fixed (int* xa = x0, xb = x1)
-                        fixed (float* wxp = wx)
-                            UpHeadRowPk(r0, r1, xa, xb, wxp, wY, krow, c, ow, wp, bp, orow, oc, relu, skipRelu, act);
-                        return;
-                    }
-                    for (int x = 0; x < ow; x++)
-                    {
-                        ResizePixel(r0 + (long)x0[x] * c, r0 + (long)x1[x] * c, r1 + (long)x0[x] * c, r1 + (long)x1[x] * c,
-                            wx[x], wY, new Vector<float>(wx[x]), vY, c, relu, krow + (long)x * c, skipRelu, s);
-                        float* o = orow + (long)x * oc;
-                        if (avx)
-                        {
-                            F32x8 a = Avx.LoadVector256(bp);
-                            float* w = wp;
-                            for (int ch = 0; ch < c; ch++, w += 8)
-                                a = Fma.MultiplyAdd(Avx.BroadcastScalarToVector256(s + ch), Avx.LoadVector256(w), a);
-                            Avx.Store(acc, a);
-                        }
-                        else if (UseNeon)
-                        {
-                            V128 a = AdvSimd.LoadVector128(bp), b = AdvSimd.LoadVector128(bp + 4);
-                            float* w = wp;
-                            for (int ch = 0; ch < c; ch++, w += 8)
-                            {
-                                V128 v = AdvSimd.LoadAndReplicateToVector128(s + ch);
-                                a = AdvSimd.FusedMultiplyAdd(a, AdvSimd.LoadVector128(w), v);
-                                b = AdvSimd.FusedMultiplyAdd(b, AdvSimd.LoadVector128(w + 4), v);
-                            }
-                            AdvSimd.Store(acc, a); AdvSimd.Store(acc + 4, b);
-                        }
-                        else
-                        {
-                            for (int l = 0; l < 8; l++) acc[l] = bp[l];
-                            float* w = wp;
-                            for (int ch = 0; ch < c; ch++, w += 8)
-                            {
-                                float v = s[ch];
-                                for (int l = 0; l < oc; l++) acc[l] += v * w[l];
-                            }
-                        }
-                        for (int l = 0; l < oc; l++) o[l] = acc[l];
-                    }
-                    if (act != ActivationKind.None) ActRow(orow, ow * oc, act, avx);
-                }
-            });
-        }
-    }
-
-    private static void ActRow(float* p, int n, ActivationKind act, bool avx)
+    internal static void ActRow(float* p, int n, ActivationKind act, bool avx)
     {
         int i = 0;
         if (avx)
@@ -870,35 +729,5 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    // ======================== channel shift ========================
-    // out[y,x,c] = in[y+off_g, x, c] (logical axis 2) or in[y, x+off_g, c] (axis 3), zero-fill
-    public static void ChannelShift(ReadOnlySpan<float> src, int h, int w, int c,
-        Span<float> dst, ShiftP p)
-    {
-        int[] ends = p.GroupEnds, offs = p.Offsets;
-        bool alongH = p.Axis == 2;
-        fixed (float* sp0 = src, dp0 = dst)
-        {
-            float* sp = sp0, dp = dp0;
-            For(h, (long)h * w * c, y =>
-            {
-                for (int x = 0; x < w; x++)
-                {
-                    float* o = dp + ((long)y * w + x) * c;
-                    int g0 = 0;
-                    for (int g = 0; g < offs.Length; g++)
-                    {
-                        int g1 = ends[g];
-                        int sy = alongH ? y + offs[g] : y, sx = alongH ? x : x + offs[g];
-                        if ((uint)sy < (uint)h && (uint)sx < (uint)w)
-                            Copy(sp + ((long)sy * w + sx) * c + g0, o + g0, g1 - g0);
-                        else
-                            Fill(o + g0, g1 - g0, 0f);
-                        g0 = g1;
-                    }
-                    if (g0 < c) Copy(sp + ((long)y * w + x) * c + g0, o + g0, c - g0);
-                }
-            });
-        }
-    }
+
 }

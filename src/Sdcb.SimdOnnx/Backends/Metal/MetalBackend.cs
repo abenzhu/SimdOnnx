@@ -11,14 +11,14 @@ namespace Sdcb.SimdOnnx.Backends.Metal;
 internal sealed class MetalBackend : IDisposable
 {
     internal readonly MtlDevice Dev;
-    private readonly Dictionary<(OnnxModel m, string shape, bool physIo), MtlGraphModel> _graphs = new();
+    private readonly Dictionary<(OnnxModel m, string shape, bool physIo, EngineExtensions? ext), MtlGraphModel> _graphs = new();
     private readonly object _gate = new();
 
     private static readonly Lazy<MetalBackend> s_default = new(() => new MetalBackend());
     internal static MetalBackend Default => s_default.Value;
 
-    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Gpu: true);
-    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Gpu: true);
+    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Metal);
+    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Metal);
 
     internal MetalBackend()
     {
@@ -28,17 +28,19 @@ internal sealed class MetalBackend : IDisposable
     }
 
     /// <summary>New inference session for a model and input shape (non-physical I/O plan).</summary>
-    public MtlInferenceSession NewSession(OnnxModel m, int[] shape)
+    public MtlInferenceSession NewSession(OnnxModel m, int[] shape) => NewSession(m, shape, null);
+
+    internal MtlInferenceSession NewSession(OnnxModel m, int[] shape, EngineExtensions? ext)
     {
-        MtlGraphModel g = AcquireGraph(m, shape, physIo: false);   // caller ref: later evictions can't free it under us
+        MtlGraphModel g = AcquireGraph(m, shape, physIo: false, ext);   // caller ref: later evictions can't free it under us
         try { return new MtlInferenceSession(Dev, g.Plan, g); }
         finally { g.Release(); }
     }
 
     /// <summary>The cached graph for (model, shape); acquires a reference for the caller.</summary>
-    internal MtlGraphModel GraphFor(OnnxModel m, int[] shape, bool physIo = false)
+    internal MtlGraphModel GraphFor(OnnxModel m, int[] shape, bool physIo = false, EngineExtensions? ext = null)
     {
-        var key = (m, string.Join('x', shape), physIo);
+        var key = (m, string.Join('x', shape), physIo, ext);
         lock (_gate)
         {
             if (_graphs.TryGetValue(key, out var gg))
@@ -47,7 +49,7 @@ internal sealed class MetalBackend : IDisposable
                 return gg;
             }
         }
-        ExecPlan plan = GraphCompiler.Compile(m, shape, physIo ? PipeOptions : PlanOptions);
+        ExecPlan plan = GraphCompiler.Compile(m, shape, (physIo ? PipeOptions : PlanOptions) with { Extensions = ext });
         var g = new MtlGraphModel(Dev, plan, constKey: m);
         lock (_gate)
         {
@@ -68,8 +70,8 @@ internal sealed class MetalBackend : IDisposable
     private const int MaxGraphs = 32;
 
     /// <summary>Alias: acquires the graph for the caller (caller must Release).</summary>
-    internal MtlGraphModel AcquireGraph(OnnxModel m, int[] shape, bool physIo)
-        => GraphFor(m, shape, physIo);
+    internal MtlGraphModel AcquireGraph(OnnxModel m, int[] shape, bool physIo, EngineExtensions? ext = null)
+        => GraphFor(m, shape, physIo, ext);
 
     public void Dispose() => Dev.Dispose();
 }

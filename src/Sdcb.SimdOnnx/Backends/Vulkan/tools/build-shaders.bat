@@ -49,7 +49,6 @@ set "CD=%DIR%\conv_dot.comp"
 "%GLSLC%" %O% -DSW=2u -DTM=2 -DTN=1 "%CD%" -o "%DIR%\conv_dot_s2_2x1_h.spv" || exit /b 1
 "%GLSLC%" %O% "%DIR%\gemm_dot.comp" -o "%DIR%\gemm_dot_h.spv" || exit /b 1
 "%GLSLC%" %O% -DF16 -DPIXELS_INNER "%DIR%\convpool.comp" -o "%DIR%\convpool_pi_h.spv" || exit /b 1
-"%GLSLC%" %O% -DF16 -DNP=2u "%DIR%\uphead_sc.comp" -o "%DIR%\uphead_sc2_h.spv" || exit /b 1
 rem subgroup-size probe for pinned (requiredSubgroupSize = 32 / 16) pipelines
 "%GLSLC%" %O% "%DIR%\sgprobe.comp" -o "%DIR%\sgprobe.spv" || exit /b 1
 exit /b 0

@@ -51,6 +51,7 @@ public sealed unsafe class InferenceSession : IDisposable
     }
     /// <summary>Input tensor shape (e.g. [1,3,H,W]).</summary>
     public int[] InputShape => _plan.Values[_inputValue].Shape;
+    internal ExecPlan Plan => _plan;
     public int[] OutputShape => _plan.Values[_outputValue].Shape;
 
     /// <summary>The writable input window inside the arena (NCHW float).</summary>
@@ -58,7 +59,7 @@ public sealed unsafe class InferenceSession : IDisposable
     /// <summary>The output tensor after <see cref="Run"/>.</summary>
     public ReadOnlySpan<float> Output => GetSpan(_outputValue);
 
-    private Span<float> GetSpan(int valueId)
+    internal Span<float> GetSpan(int valueId)
     {
         CValue v = _plan.Values[valueId];
         if (v.Buf >= 0)
@@ -67,7 +68,7 @@ public sealed unsafe class InferenceSession : IDisposable
         throw new InvalidOperationException($"Value '{v.Name}' has no float storage.");
     }
 
-    private ReadOnlySpan<float> GetIn(int valueId)
+    internal ReadOnlySpan<float> GetIn(int valueId)
     {
         if (valueId < 0) return ReadOnlySpan<float>.Empty;
         return GetSpan(valueId);
@@ -219,15 +220,11 @@ public sealed unsafe class InferenceSession : IDisposable
                 Ops.Concat(ins, shapes, GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, p.Axis);
                 break;
             }
-            case ExecOp.ChannelShift:
-            {
-                var p = (ShiftP)n.P!;
-                Ops.ChannelShift(GetIn(n.In[0]), values[n.In[0]].PhysShape,
-                    GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, p);
-                break;
-            }
             case ExecOp.Copy:
                 GetIn(n.In[0]).CopyTo(GetSpan(n.Out[0]));
+                break;
+            case ExecOp.Ext:
+                n.Ext!.RunCpu(this, n);
                 break;
             case ExecOp.HardSigmoid:
             {
@@ -276,14 +273,6 @@ public sealed unsafe class InferenceSession : IDisposable
                     n.In.Length > 1 ? GetIn(n.In[1]) : default, p.AddRelu);
                 return true;
             }
-            case ExecOp.UpHead:
-            {
-                var p = (UpHeadP)n.P!;
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape, k = values[n.In[1]].PhysShape;
-                Nhwc.UpHead(GetIn(n.In[0]), i[1], i[2], i[3], GetIn(n.In[1]), GetSpan(n.Out[0]), o[1], o[2],
-                    p.Scales[2], p.Scales[3], p, (UpHeadPlan)p.KernelPlan!, k[1], k[2], k[3]);
-                return true;
-            }
             case ExecOp.Pad:
             {
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
@@ -296,12 +285,6 @@ public sealed unsafe class InferenceSession : IDisposable
                 int[] a = values[n.In[0]].PhysShape;
                 int k = a[^1], m = (int)(values[n.In[0]].ElementCount / k);
                 Nhwc.Gemm(GetIn(n.In[0]), m, k, GetSpan(n.Out[0]), values[n.Out[0]].Shape[^1], gk, p.Act);
-                return true;
-            }
-            case ExecOp.ChannelShift:
-            {
-                int[] i = values[n.In[0]].PhysShape;
-                Nhwc.ChannelShift(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), (ShiftP)n.P!);
                 return true;
             }
             case ExecOp.GlobalAvgPool:

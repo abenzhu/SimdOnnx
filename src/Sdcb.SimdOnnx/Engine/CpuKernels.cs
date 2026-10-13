@@ -35,6 +35,8 @@ internal static class CpuKernels
         if (!plan.Nhwc) return;
         CValue[] V = plan.Values;
         foreach (ExecNode n in plan.Nodes)
+        {
+            n.Ext?.PackCpu(plan, n, cache);
             switch (n.P)
             {
                 case GemmP gp when gp.KernelPlan is null && V[n.In[1]].Floats is { } bw:
@@ -60,14 +62,6 @@ internal static class CpuKernels
                     Interlocked.CompareExchange(ref cp.KernelPlan, kp, null);
                     break;
                 }
-                case UpHeadP up when up.KernelPlan is null:
-                {
-                    CValue w = V[n.In[2]];
-                    float[]? b = n.In.Length > 3 ? V[n.In[3]].Floats : null;
-                    object kp = Get(cache, n, w.Floats!, b, () => Nhwc.PackUpHead(w.Floats!, w.Shape[0], w.Shape[1], b));
-                    Interlocked.CompareExchange(ref up.KernelPlan, kp, null);
-                    break;
-                }
                 case ConvTP tp when tp.KernelPlan is null:
                 {
                     CValue w = V[n.In[1]];
@@ -77,8 +71,9 @@ internal static class CpuKernels
                     break;
                 }
             }
+        }
     }
 
-    private static object Get(Cache? cache, ExecNode n, float[] w, float[]? b, Func<object> pack) =>
+    internal static object Get(Cache? cache, ExecNode n, float[] w, float[]? b, Func<object> pack) =>
         cache is null ? pack() : cache.GetOrPack(n, w, b, pack);
 }

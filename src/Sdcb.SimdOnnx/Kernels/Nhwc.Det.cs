@@ -20,7 +20,7 @@ internal sealed class ConvTPlan
 /// </summary>
 internal static unsafe partial class Nhwc
 {
-    private static bool V128 => Vector128.IsHardwareAccelerated;
+    internal static bool V128 => Vector128.IsHardwareAccelerated;
 
     /// <summary>W [ic, oc, kh, kw] → per tap a [oc/16][ic][16] panel (bias folded into every tap).</summary>
     public static ConvTPlan PackConvT(ReadOnlySpan<float> w, int[] ws, ReadOnlySpan<float> bias)
@@ -93,7 +93,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>oc ≤ 4 transposed conv (the 1-channel prob head): one dot product over ic per output element.</summary>
-    private static void ConvTDot(ReadOnlySpan<float> src, int ih, int iw, int ic,
+    internal static void ConvTDot(ReadOnlySpan<float> src, int ih, int iw, int ic,
         Span<float> dst, int oc, int kh, int kw, ConvTPlan kp, ActivationKind act)
     {
         int taps = kh * kw, ow = iw * kw;

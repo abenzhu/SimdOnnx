@@ -22,18 +22,18 @@ internal static unsafe partial class Nhwc
     /// Settable only for in-process tier comparisons (WasmBench <c>--tiers</c> / <c>--vector</c>).</summary>
     internal static bool UsePacked = PackedSimd.IsSupported;
 
-    private const int PkTile = 4;
+    internal const int PkTile = 4;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 LdP(float* p) => PackedSimd.LoadVector128(p);
+    internal static V4 LdP(float* p) => PackedSimd.LoadVector128(p);
 
     /// <summary>acc + a·b, rounded twice (no FMA): the Vector&lt;float&gt; tier's <c>acc += a * b</c>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 MadP(V4 acc, V4 a, V4 b) => PackedSimd.Add(acc, PackedSimd.Multiply(a, b));
+    internal static V4 MadP(V4 acc, V4 a, V4 b) => PackedSimd.Add(acc, PackedSimd.Multiply(a, b));
 
     // pmax(0, v): one maxps in V8 (f32x4.max needs a NaN / -0 fix-up); equals Max(v, 0) for finite v
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static V4 ActP(V4 v, ActivationKind act) => act switch
+    internal static V4 ActP(V4 v, ActivationKind act) => act switch
     {
         ActivationKind.Relu => PackedSimd.PseudoMax(V4.Zero, v),
         ActivationKind.Sigmoid => SimdMath.SigmoidPk(v),
@@ -47,7 +47,7 @@ internal static unsafe partial class Nhwc
     /// never calls out, so the accumulators stay in registers.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void TilePkK(float** ptrs, int ps, int taps, int ic, long wTap, float* wb, float* bb, float* dst, int ds)
+    internal static void TilePkK(float** ptrs, int ps, int taps, int ic, long wTap, float* wb, float* bb, float* dst, int ds)
     {
         for (int h = 0; h < Ob; h += 8)
         {
@@ -81,7 +81,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Residual / activation epilogue of a finished [rows][16] scratch tile.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void StorePk(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
+    internal static void StorePk(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         for (int r = 0; r < rows; r++, part += Ob)
         {
@@ -104,7 +104,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary><see cref="DenseRow"/> on PackedSimd: kh taps over NHWC kernel-row runs (kw·ic contiguous
     /// floats, see <see cref="DenseRowNeon"/>); border-crossing runs are gathered, constant-pad rows read PadVec.</summary>
-    private static void DenseRowPk(in DenseArgs a, int y, int blk, float* orow, float* arow)
+    internal static void DenseRowPk(in DenseArgs a, int y, int blk, float* orow, float* arow)
     {
         int kh = a.Kh, kw = a.Kw, ic = a.Ic, ow = a.Ow, oc = a.Oc, run = kw * ic;
         float** ptrs = stackalloc float*[PkTile * kh];
@@ -146,7 +146,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary><see cref="Gemm"/> on PackedSimd: <see cref="PkTile"/>-row tiles, 12 per task sharing one weight panel walk.</summary>
-    private static void GemmPk(ReadOnlySpan<float> a, int m, int k, Span<float> dst, int n, NhwcConvPlan kp, ActivationKind act)
+    internal static void GemmPk(ReadOnlySpan<float> a, int m, int k, Span<float> dst, int n, NhwcConvPlan kp, ActivationKind act)
     {
         const int G = 12;
         int nb = kp.Blocks, tiles = (m + PkTile - 1) / PkTile, groups = (tiles + G - 1) / G;
@@ -176,7 +176,7 @@ internal static unsafe partial class Nhwc
     /// ascending, + residual, activation. Returns the first channel left for the scalar tail.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static int DepthwisePixelPk(float** ptrs, int taps, int c, float* wp, float* bp, float* ad, float* o, ActivationKind act)
+    internal static int DepthwisePixelPk(float** ptrs, int taps, int c, float* wp, float* bp, float* ad, float* o, ActivationKind act)
     {
         int ch = 0;
         for (; ch + 16 <= c; ch += 16)
@@ -210,42 +210,5 @@ internal static unsafe partial class Nhwc
         return ch;
     }
 
-    /// <summary>
-    /// One <see cref="UpHead"/> output row for oc &lt;= 4, c % 4 == 0 (see <see cref="UpHeadRowNeon"/>):
-    /// per 4 channels the bilinear lerps, [relu], + [relu](skip), then each channel is splatted back
-    /// from a 16-byte spill (WASM SIMD has no by-element multiply) into one 4-lane accumulator.
-    /// Same per-element ops as the unfused Vector&lt;float&gt; path.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void UpHeadRowPk(float* r0, float* r1, int* x0, int* x1, float* wx, float wy, float* krow,
-        int c, int ow, float* wp, float* bp, float* orow, int oc, bool relu, bool skipRelu, ActivationKind act)
-    {
-        V4 vY = PackedSimd.Splat(wy), bias = LdP(bp);
-        float* s = stackalloc float[4];
-        for (int x = 0; x < ow; x++)
-        {
-            float* a = r0 + (long)x0[x] * c, b = r0 + (long)x1[x] * c, e = r1 + (long)x0[x] * c, f = r1 + (long)x1[x] * c;
-            float* k = krow + (long)x * c;
-            V4 vX = PackedSimd.Splat(wx[x]), acc = bias;
-            float* w = wp;
-            for (int ch = 0; ch < c; ch += 4, w += 32)
-            {
-                V4 va = LdP(a + ch), ve = LdP(e + ch);
-                V4 top = MadP(va, PackedSimd.Subtract(LdP(b + ch), va), vX);
-                V4 bot = MadP(ve, PackedSimd.Subtract(LdP(f + ch), ve), vX);
-                V4 v = MadP(top, PackedSimd.Subtract(bot, top), vY);
-                if (relu) v = PackedSimd.PseudoMax(V4.Zero, v);
-                V4 sk = LdP(k + ch);
-                v = PackedSimd.Add(v, skipRelu ? PackedSimd.PseudoMax(V4.Zero, sk) : sk);
-                PackedSimd.Store(s, v);
-                acc = MadP(acc, PackedSimd.LoadScalarAndSplatVector128(s), LdP(w));
-                acc = MadP(acc, PackedSimd.LoadScalarAndSplatVector128(s + 1), LdP(w + 8));
-                acc = MadP(acc, PackedSimd.LoadScalarAndSplatVector128(s + 2), LdP(w + 16));
-                acc = MadP(acc, PackedSimd.LoadScalarAndSplatVector128(s + 3), LdP(w + 24));
-            }
-            PackedSimd.Store(s, ActP(acc, act));
-            float* o = orow + (long)x * oc;
-            for (int l = 0; l < oc; l++) o[l] = s[l];
-        }
-    }
+
 }

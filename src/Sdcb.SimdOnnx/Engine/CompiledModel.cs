@@ -11,10 +11,13 @@ public sealed class CompiledModel
 {
     internal ExecPlan Plan { get; }
 
-    private CompiledModel(ExecPlan plan) => Plan = plan;
+    internal CompiledModel(ExecPlan plan) => Plan = plan;
 
     public static CompiledModel Compile(OnnxModel model, ReadOnlySpan<int> inputShape) =>
         new(GraphCompiler.Compile(model, inputShape));
+
+    internal static CompiledModel Compile(OnnxModel model, ReadOnlySpan<int> inputShape, CompileOptions options) =>
+        new(GraphCompiler.Compile(model, inputShape, options));
 
     public InferenceSession CreateSession() => new(Plan);
 

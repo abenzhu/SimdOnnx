@@ -20,9 +20,9 @@ namespace Sdcb.SimdOnnx.Kernels;
 /// </summary>
 internal static unsafe partial class Nhwc
 {
-    private static readonly bool s_winograd = Environment.GetEnvironmentVariable("GCDRNET_WINOGRAD") != "0";
+    internal static readonly bool s_winograd = Environment.GetEnvironmentVariable("GCDRNET_WINOGRAD") != "0";
 
-    [ThreadStatic] private static float[]? t_wino;
+    [ThreadStatic] internal static float[]? t_wino;
 
     /// <summary>Dense 3x3 s1 convs with enough channels for the transforms to amortize.</summary>
     internal static bool WinogradEligible(ConvP p, int[] wShape, int ic) =>
@@ -32,7 +32,7 @@ internal static unsafe partial class Nhwc
         && ic >= 16 && ic % Vector<float>.Count == 0 && ic % 8 == 0;
 
     // G (6x3) of F(4,3): U = G g G^T
-    private static readonly double[,] s_g =
+    internal static readonly double[,] s_g =
     {
         { 1.0 / 4, 0, 0 },
         { -1.0 / 6, -1.0 / 6, -1.0 / 6 },
@@ -68,7 +68,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>Per-call Winograd constants shared by every tile block.</summary>
-    private readonly unsafe struct WinoArgs
+    internal readonly unsafe struct WinoArgs
     {
         public readonly float* Src, U, Bias, PadVec;
         public readonly int Ih, Iw, Ic, Oh, Ow, Oc, Tw, T, Nb, PadT, PadL;
@@ -94,7 +94,7 @@ internal static unsafe partial class Nhwc
         }
     }
 
-    private static void WinogradConv(ReadOnlySpan<float> src, int ih, int iw, int ic,
+    internal static void WinogradConv(ReadOnlySpan<float> src, int ih, int iw, int ic,
         Span<float> dst, int oh, int ow, int oc, ConvP p, NhwcConvPlan kp, ReadOnlySpan<float> add)
     {
         float[] padVec = new float[ic];
@@ -123,7 +123,7 @@ internal static unsafe partial class Nhwc
     /// <paramref name="dp"/> whose row 0 is output row <paramref name="rowBase"/> (rows past
     /// Oh are skipped). Every tile's math is independent of how tiles are grouped.
     /// </summary>
-    private static void WinoTiles(in WinoArgs a, int t0, int tn, float* dp, float* ap, int rowBase)
+    internal static void WinoTiles(in WinoArgs a, int t0, int tn, float* dp, float* ap, int rowBase)
     {
         int ic = a.Ic, T = a.T, tw = a.Tw, nb = a.Nb, oc = a.Oc, ow = a.Ow, oh = a.Oh;
         bool avx = a.Avx, avx512 = a.Avx512, pk = a.Pk;
@@ -186,7 +186,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Output transform + bias/residual/activation epilogue of one 16-oc block for tn tiles;
     /// tile t's 36 products are m[xi*mStride + t*mRow + 0..15].</summary>
-    private static void WinoOutput(float* m, long mStride, int mRow, int tn, int t0, int tw, int oh, int ow, int oc,
+    internal static void WinoOutput(float* m, long mStride, int mRow, int tn, int t0, int tw, int oh, int ow, int oc,
         int ocOff, float* bb, float* dp, float* ap, int rowBase, ActivationKind act, float* tmp, bool avx, bool avx512)
     {
         int lanes = Math.Min(Ob, oc - ocOff);
@@ -246,12 +246,12 @@ internal static unsafe partial class Nhwc
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static int SrcIdx(int i, int n, bool reflect) =>
+    internal static int SrcIdx(int i, int n, bool reflect) =>
         (uint)i < (uint)n ? i : reflect ? Reflect(i, n) : -1;
 
     /// <summary>V[xi] = (B^T d B)[xi] for one tile, all channels; V row stride per xi = vStride.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void InputTransform(float** d, int ic, float* v, long vStride)
+    internal static void InputTransform(float** d, int ic, float* v, long vStride)
     {
         int VL = Vector<float>.Count;
         var t = stackalloc Vector<float>[36];
@@ -292,7 +292,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary>tmp[(py*4+px)*16 + l] = (A^T m A)[py,px] for one tile's 16 oc lanes; m row stride per xi = mStride.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void OutputTransform(float* m, long mStride, float* tmp)
+    internal static void OutputTransform(float* m, long mStride, float* tmp)
     {
         int VL = Vector<float>.Count;
         var s = stackalloc Vector<float>[24];
@@ -330,7 +330,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary><see cref="InputTransform"/> with 16 lanes (AVX-512; ic % 16 == 0). Same per-lane ops → same bits.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void InputTransform512(float** d, int ic, float* v, long vStride)
+    internal static void InputTransform512(float** d, int ic, float* v, long vStride)
     {
         var t = stackalloc Vector512<float>[36];
         var four = Vector512.Create(4f);
@@ -367,7 +367,7 @@ internal static unsafe partial class Nhwc
 
     /// <summary><see cref="OutputTransform"/> with one 16-lane vector per element (AVX-512).</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void OutputTransform512(float* m, long mStride, float* tmp)
+    internal static void OutputTransform512(float* m, long mStride, float* tmp)
     {
         var s = stackalloc Vector512<float>[24];
         var two = Vector512.Create(2f);

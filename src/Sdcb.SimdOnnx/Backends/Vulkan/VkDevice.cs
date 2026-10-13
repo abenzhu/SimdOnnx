@@ -78,18 +78,20 @@ internal unsafe sealed class VkDevice : IDisposable
     public readonly object Sync = new();
     /// <summary>vkQueueSubmit on the single compute queue is externally synchronized.</summary>
     public readonly object QueueLock = new();
-    private readonly Dictionary<(string name, int bindings, int pcBytes, uint sg), VkPipeline> _pipes = new();
+    private readonly Dictionary<(string name, int bindings, int pcBytes, uint sg, System.Reflection.Assembly? owner), VkPipeline> _pipes = new();
 
     /// <summary>Process-wide pipeline cache: every graph/session shares one
     /// VkPipeline per (shader, binding-count, push-const-size). Set layouts carry
-    /// PUSH_DESCRIPTOR_BIT when the extension is available.</summary>
-    public VkPipeline GetPipeline(string name, int bindings, int pcBytes, uint requiredSubgroupSize = 0)
+    /// PUSH_DESCRIPTOR_BIT when the extension is available. <paramref name="owner"/> is the
+    /// assembly embedding the SPIR-V (null = the core).</summary>
+    public VkPipeline GetPipeline(string name, int bindings, int pcBytes, uint requiredSubgroupSize = 0,
+        System.Reflection.Assembly? owner = null)
     {
-        var key = (name, bindings, pcBytes, requiredSubgroupSize);
+        var key = (name, bindings, pcBytes, requiredSubgroupSize, owner);
         lock (_pipes)
         {
             if (_pipes.TryGetValue(key, out VkPipeline? p)) return p;
-            p = NewPipeline(NewShaderModule(VkShaders.Load(name)), bindings, pcBytes, PushDescriptors, requiredSubgroupSize);
+            p = NewPipeline(NewShaderModule(VkShaders.Load(name, owner)), bindings, pcBytes, PushDescriptors, requiredSubgroupSize);
             p.Name = name;
             p.Bindings = bindings;
             _pipes[key] = p;

@@ -12,11 +12,11 @@ namespace Sdcb.SimdOnnx.Kernels;
 internal static unsafe partial class Nhwc
 {
     /// <summary>U sizes (floats) above this take <see cref="WinogradGrouped"/> on NEON (512 KB).</summary>
-    private const long NeonWinoUFloats = 128 * 1024;
+    internal const long NeonWinoUFloats = 128 * 1024;
 
-    [ThreadStatic] private static float[]? t_wgV, t_wgM;
+    [ThreadStatic] internal static float[]? t_wgV, t_wgM;
 
-    private static void WinogradGrouped(in WinoArgs a, float* dp, float* ap)
+    internal static void WinogradGrouped(in WinoArgs a, float* dp, float* ap)
     {
         int ic = a.Ic, nb = a.Nb, tw = a.Tw, oh = a.Oh, ow = a.Ow, oc = a.Oc;
         int nt = (oh + 3) / 4 * tw;

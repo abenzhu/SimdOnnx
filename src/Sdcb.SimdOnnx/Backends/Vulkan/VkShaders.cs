@@ -2,18 +2,16 @@ using System.Reflection;
 
 namespace Sdcb.SimdOnnx.Backends.Vulkan;
 
-/// <summary>Loads SPIR-V blobs embedded next to their .comp sources.</summary>
+/// <summary>Loads SPIR-V blobs embedded next to their .comp sources (core or an extension assembly).</summary>
 internal static class VkShaders
 {
-    private static readonly Assembly s_asm = typeof(VkShaders).Assembly;
-    private const string Prefix = "Sdcb.SimdOnnx.Backends.Vulkan.Shaders.";
+    private static readonly Assembly s_core = typeof(VkShaders).Assembly;
 
-    public static byte[] Load(string name)
+    public static byte[] Load(string name, Assembly? owner = null)
     {
-        using Stream? s = s_asm.GetManifestResourceStream(Prefix + name + ".spv");
-        if (s == null)
-            throw new InvalidOperationException(
-                $"Embedded shader '{name}' not found. Available: {string.Join(", ", s_asm.GetManifestResourceNames().Where(n => n.StartsWith(Prefix)))}");
+        Assembly asm = owner ?? s_core;
+        using Stream? s = Engine.ShaderResources.Open(asm, name + ".spv")
+            ?? throw new InvalidOperationException($"Embedded shader '{name}.spv' not found in {asm.GetName().Name}.");
         byte[] b = new byte[s.Length];
         s.ReadExactly(b);
         return b;

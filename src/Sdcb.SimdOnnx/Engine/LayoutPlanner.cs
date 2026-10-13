@@ -72,7 +72,7 @@ internal sealed class LayoutPlanner
     }
 
     /// <summary>Resolves (and caches) the layout of value <paramref name="v"/>, following aliases.</summary>
-    private int[] L(int v)
+    internal int[] L(int v)
     {
         CValue cv = _values[v];
         if (cv.Layout is not null) return cv.Layout;
@@ -123,10 +123,12 @@ internal sealed class LayoutPlanner
         return id;
     }
 
-    private int Need(int v, int[] target) =>
+    internal int Need(int v, int[] target) =>
         Layout.Equivalent(_values[v].Shape, L(v), target) ? v : Relayout(v, target);
 
-    private void Need(ExecNode n, int k, int[] target) => n.In[k] = Need(n.In[k], target);
+    internal void Need(ExecNode n, int k, int[] target) => n.In[k] = Need(n.In[k], target);
+
+    internal List<CValue> Values => _values;
 
     private static bool LastInnermost(int[] shape, int[] l)
     {
@@ -156,7 +158,7 @@ internal sealed class LayoutPlanner
                 _dissolved++;
                 break;
             }
-            case ExecOp.Conv or ExecOp.MaxPool or ExecOp.ResizeBilinear or ExecOp.Pad or ExecOp.ChannelShift
+            case ExecOp.Conv or ExecOp.MaxPool or ExecOp.ResizeBilinear or ExecOp.Pad
                 or ExecOp.GlobalAvgPool or ExecOp.ConvTranspose or ExecOp.ResizeNearest:
             {
                 if (_values[n.In[0]].Shape.Length != 4 || _values[n.Out[0]].Shape.Length != 4)
@@ -179,16 +181,9 @@ internal sealed class LayoutPlanner
                 SetOut(n, Layout.Nhwc);
                 break;
             }
-            case ExecOp.UpHead:
-            {
-                // In = [x, skip, w, bias?]: activations channels-last, weights stay logical
-                if (_values[n.In[0]].Shape.Length != 4 || _values[n.In[1]].Shape.Length != 4)
-                    throw new NotSupportedException($"layout: UpHead '{n.Name}' is not rank-4.");
-                Need(n, 0, Layout.Nhwc);
-                Need(n, 1, Layout.Nhwc);
-                SetOut(n, Layout.Nhwc);
+            case ExecOp.Ext:
+                n.Ext!.PlanLayout(this, n);
                 break;
-            }
             case ExecOp.LayerNorm or ExecOp.Gemm:
             {
                 int x = n.In[0];

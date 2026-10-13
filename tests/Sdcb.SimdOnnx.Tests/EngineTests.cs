@@ -12,19 +12,6 @@ public class EngineTests
     internal static string DrPath => Path.Combine(Golden.ModelDir, "gcdrnet_drnet_sim.onnx");
 
     [Fact]
-    public void Fusion_ChannelShift_And_ResidualAdd()
-    {
-        // fused plan must contain the ChannelShift nodes and fused conv residual adds —
-        // if a model export change breaks the FuseShift pattern, this fails loudly
-        ExecPlan dr = GraphCompiler.Compile(OnnxModel.Load(DrPath), [1, 6, 96, 128]);
-        Assert.Equal(8, dr.Nodes.Count(n => n.Op == ExecOp.ChannelShift));
-
-        ExecPlan gc = GraphCompiler.Compile(OnnxModel.Load(GcPath), [1, 3, 96, 128]);
-        Assert.True(gc.Nodes.Count(n => n.Op == ExecOp.ChannelShift) >= 4,
-            "gc plan lost its ChannelShift fusion");
-    }
-
-    [Fact]
     public void Fusion_Conv_Gelu_ThroughAlias()
     {
         // the gelu decomposition commutes before its producer transpose, then
@@ -75,49 +62,6 @@ public class EngineTests
     }
 
     [Fact]
-    public void MemFusions_BitIdentical_AndShrinkArena()
-    {
-        // conv+maxpool and UpHead skip recompute must be present in CPU NHWC plans, must
-        // not change a single bit of the output, and must shrink the arena
-        foreach (var (path, c) in new[] { (GcPath, 3), (DrPath, 6) })
-        {
-            OnnxModel m = OnnxModel.Load(path);
-            int[] shape = [1, c, 96, 128];
-            var rnd = new Random(7);
-            float[] input = Enumerable.Range(0, c * 96 * 128).Select(_ => (float)rnd.NextDouble()).ToArray();
-            (float[] y, ExecPlan p) Run(bool fuse)
-            {
-                ExecPlan p = GraphCompiler.Compile(m, shape, new CompileOptions(Nhwc: true, PhysicalIo: true, MemFuse: fuse));
-                using var s = new InferenceSession(p);
-                input.CopyTo(s.Input); s.Run();
-                return (s.Output.ToArray(), p);
-            }
-            var (fy, fp) = Run(true);
-            var (uy, up) = Run(false);
-            string name = Path.GetFileName(path);
-            Assert.Equal(3, fp.Nodes.Count(n => n.P is ConvP { Pool: not null }));
-            Assert.DoesNotContain(fp.Nodes, n => n.Op == ExecOp.MaxPool);
-            Assert.Contains(fp.Nodes, n => n.P is UpHeadP { SkipConv: not null });
-            Assert.True(fp.ArenaFloats * 2 < up.ArenaFloats, $"{name}: arena {fp.ArenaFloats} vs unfused {up.ArenaFloats}");
-            Assert.True(fy.AsSpan().SequenceEqual(uy), $"{name}: fused output differs");
-        }
-    }
-
-    [Fact]
-    public void MemFusions_GpuPlans_StemOnly()
-    {
-        // Vulkan plans get the stem conv+pool and the UpHead recompute (small-ic shaders) only
-        foreach (var (path, c) in new[] { (GcPath, 3), (DrPath, 6) })
-        {
-            ExecPlan p = GraphCompiler.Compile(OnnxModel.Load(path), [1, c, 96, 128],
-                new CompileOptions(Nhwc: true, PhysicalIo: true, Gpu: true));
-            Assert.Single(p.Nodes, n => n.P is ConvP { Pool: not null });
-            Assert.Equal(2, p.Nodes.Count(n => n.Op == ExecOp.MaxPool));
-            Assert.Contains(p.Nodes, n => n.P is UpHeadP { SkipConv: not null, SkipW: >= 0 });
-        }
-    }
-
-    [Fact]
     public void NoFuse_MatchesFused()
     {
         float[] input = Golden.F32("small", "input");
@@ -164,17 +108,6 @@ public class EngineTests
                         Assert.Equal(
                             src[((i0 * d1 + i1) * d2 + i2) * d3 + i3],
                             got[((i1 * d0 + i0) * d3 + i3) * d2 + i2]);
-    }
-
-    [Fact]
-    public void ChannelShift_OffsetBeyondWidth_Zeros()
-    {
-        // |off| >= w must produce a fully zeroed group, not a negative Slice
-        float[] src = Enumerable.Repeat(1f, 2 * 4 * 5).ToArray();   // c=2,h=4,w=5
-        float[] dst = Enumerable.Repeat(-1f, src.Length).ToArray();
-        var p = new ShiftP { Axis = 3, Offsets = [5], GroupEnds = [2] };
-        Ops.ChannelShift(src, [1, 2, 4, 5], dst, [1, 2, 4, 5], p);
-        Assert.All(dst, v => Assert.Equal(0f, v));
     }
 
     [Fact]

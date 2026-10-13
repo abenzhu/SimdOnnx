@@ -76,15 +76,16 @@ internal sealed class MtlDevice : IDisposable
         return h == 0 ? null : new MtlDevice(h);
     }
 
-    /// <summary>Pipeline for a kernel in the embedded shader library,
-    /// compiled once and cached per device.</summary>
-    internal MtlPipeline Pipe(string name)
+    /// <summary>Pipeline for a kernel in the embedded shader library of <paramref name="owner"/>
+    /// (null = the core), compiled once and cached per device.</summary>
+    internal MtlPipeline Pipe(string name, System.Reflection.Assembly? owner = null)
     {
+        string key = owner is null ? name : owner.GetName().Name + "/" + name;
         lock (_pipes)
         {
-            if (!_pipes.TryGetValue(name, out MtlPipeline? p))
+            if (!_pipes.TryGetValue(key, out MtlPipeline? p))
             {
-                p = NewPipeline(ShaderLibrary(), name);
+                p = NewPipeline(owner is null ? ShaderLibrary() : ExtensionLibrary(owner), name);
                 // every kernel is dispatched at 256 threads/threadgroup
                 if (p.MaxTotalThreadsPerThreadgroup < 256)
                 {
@@ -92,22 +93,20 @@ internal sealed class MtlDevice : IDisposable
                     throw new NotSupportedException(
                         $"Metal: {name} pso supports {p.MaxTotalThreadsPerThreadgroup} threads/group");
                 }
-                _pipes[name] = p;
+                _pipes[key] = p;
             }
             return p;
         }
     }
 
-    private MtlLibrary ShaderLibrary()
+    private readonly Dictionary<System.Reflection.Assembly, MtlLibrary> _extLibs = new();
+
+    private static string EmbeddedMsl(System.Reflection.Assembly asm, Func<string, bool>? filter = null)
     {
-        if (_lib is not null) return _lib;
-        var asm = typeof(MtlDevice).Assembly;
         var names = asm.GetManifestResourceNames()
-            .Where(n => n.StartsWith("Sdcb.SimdOnnx.Backends.Metal.Shaders.")
-                        && n.EndsWith(".metal"))
-            .OrderBy(n => n).ToArray();
-        if (names.Length == 0)
-            throw new FileNotFoundException("Metal: no embedded .metal shaders");
+            .Where(n => n.Contains(".Shaders.", StringComparison.Ordinal) && n.EndsWith(".metal", StringComparison.Ordinal)
+                        && (filter is null || filter(n)))
+            .OrderBy(n => n, StringComparer.Ordinal).ToArray();
         var sb = new System.Text.StringBuilder();
         foreach (var n in names)
         {
@@ -115,7 +114,26 @@ internal sealed class MtlDevice : IDisposable
             using var r = new StreamReader(s);
             sb.AppendLine(r.ReadToEnd());
         }
-        return _lib = NewLibrary(sb.ToString());
+        return sb.ToString();
+    }
+
+    /// <summary>An extension's MSL compiled on top of the core's common.metal helpers.</summary>
+    private MtlLibrary ExtensionLibrary(System.Reflection.Assembly owner)
+    {
+        if (_extLibs.TryGetValue(owner, out MtlLibrary? lib)) return lib;
+        string common = EmbeddedMsl(typeof(MtlDevice).Assembly, n => n.EndsWith(".common.metal", StringComparison.Ordinal));
+        string src = EmbeddedMsl(owner);
+        if (src.Length == 0) throw new FileNotFoundException($"Metal: no embedded .metal shaders in {owner.GetName().Name}");
+        return _extLibs[owner] = NewLibrary(common + src);
+    }
+
+    private MtlLibrary ShaderLibrary()
+    {
+        if (_lib is not null) return _lib;
+        string src = EmbeddedMsl(typeof(MtlDevice).Assembly);
+        if (src.Length == 0)
+            throw new FileNotFoundException("Metal: no embedded .metal shaders");
+        return _lib = NewLibrary(src);
     }
 
     public MtlBuffer NewBuffer(nuint bytes)
@@ -233,6 +251,7 @@ internal sealed class MtlDevice : IDisposable
             _pipes.Clear();
         }
         _lib?.Dispose();
+        foreach (MtlLibrary l in _extLibs.Values) l.Dispose();
         ObjC.Release(_queue);
         ObjC.Release(H);
     }

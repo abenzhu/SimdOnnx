@@ -17,13 +17,12 @@ internal enum ExecOp
     Transpose,       // arbitrary permute (physical perm in layout-planned plans)
     Slice,           // strided subrange copy
     Concat,          // axis join
-    ChannelShift,    // fused shift-MLP: per channel group, shift along H or W (zero-fill)
     Copy,            // plain copy (for Squeeze/Unsqueeze/identity leftovers)
-    UpHead,          // fused NHWC tail: act(W·(resize(x) + [relu](skip)) + b), pointwise W with few outputs
     HardSigmoid,     // clamp(alpha·x + beta, 0, 1)
     GlobalAvgPool,   // mean over H,W (GlobalAveragePool / ReduceMean axes=[2,3] keepdims)
     ConvTranspose,   // stride == kernel, no pad (non-overlapping taps), optional bias + act
     ResizeNearest,   // nearest, asymmetric, floor
+    Ext,             // consumer-registered operator (ExecNode.Ext)
 }
 
 internal enum ActivationKind { None, Relu, Sigmoid, Gelu }
@@ -86,25 +85,6 @@ internal sealed class ResizeP
     public bool AddRelu;            // relu on the addend
 }
 
-/// <summary>
-/// Fused NHWC network tail (In = [x, skip, w, bias?]):
-/// out[o] = act(bias[o] + Σ_c w[o,c]·s[c]) with s = [relu](resize(x)) + [relu](skip).
-/// Replaces Resize → (Relu) → Add → 1x1 Conv → (act) so the full-resolution
-/// intermediates are never stored.
-/// </summary>
-internal sealed class UpHeadP
-{
-    public required float[] Scales;
-    public bool ResizeRelu;
-    public bool SkipRelu;
-    public ActivationKind Act;
-    public object? KernelPlan;      // backend-private packed weights
-    // NHWC plans: In[1] is the input of this (still scheduled) conv and the skip is
-    // recomputed, so the full-resolution skip tensor need not stay live
-    public ConvP? SkipConv;
-    public int SkipW = -1, SkipB = -1;   // the skip conv's weight / bias value ids
-}
-
 internal sealed class HardSigmoidP
 {
     public float Alpha, Beta;
@@ -148,13 +128,6 @@ internal sealed class ConcatP
     public int Axis;
 }
 
-internal sealed class ShiftP
-{
-    public int Axis;                 // logical spatial axis index (2 = H, 3 = W)
-    public required int[] GroupEnds; // cumulative channel-group end indices (len 5)
-    public required int[] Offsets;   // per-group shift (len 5)
-}
-
 /// <summary>A resolved tensor value: compile-time constant or activation.</summary>
 internal sealed class CValue
 {
@@ -195,8 +168,22 @@ internal sealed class ExecNode
     public required int[] In;    // value ids
     public required int[] Out;
     public object? P;
+    public ExtOp? Ext;           // set when Op == ExecOp.Ext
     public int SrcNode = -1;     // onnx node index (diagnostics)
     public string Name = "";
+
+    /// <summary>Value ids read through op params rather than <see cref="In"/> (bias / residual operands).</summary>
+    public IEnumerable<int> ParamRefs()
+    {
+        switch (P)
+        {
+            case ConvP c: if (c.BiasValue >= 0) yield return c.BiasValue; if (c.AddValue >= 0) yield return c.AddValue; break;
+            case GemmP g: if (g.BiasValue >= 0) yield return g.BiasValue; break;
+            case ConvTP t: if (t.BiasValue >= 0) yield return t.BiasValue; break;
+        }
+        if (Ext is not null)
+            foreach (int v in Ext.ParamRefs(this)) yield return v;
+    }
 }
 
 /// <summary>Compiled graph ready for a session: exec nodes + buffer plan.</summary>
@@ -215,14 +202,27 @@ internal sealed class ExecPlan
     public bool PhysicalIo;
 }
 
+/// <summary>Backend a plan is compiled for (fusions are restricted to what it implements).</summary>
+internal enum PlanTarget { Cpu, Vulkan, Metal }
+
 /// <summary>Plan compilation options.</summary>
-/// <param name="MemFuse">memory fusions (conv+pool, UpHead skip recompute; NHWC only).</param>
-/// <param name="Gpu">plan for the Vulkan backend (restricts fusions to what its shaders implement).</param>
-internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true, bool Gpu = false)
+/// <param name="MemFuse">memory fusions (conv+pool and extension memory passes; NHWC only).</param>
+/// <param name="Target">backend the plan runs on.</param>
+/// <param name="Extensions">consumer-registered operators and graph passes.</param>
+internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
+    PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null)
 {
-    /// <summary>GCDRNET_NHWC=0 forces the legacy all-NCHW plan (A/B oracle).</summary>
-    public static bool DefaultNhwc { get; } = Environment.GetEnvironmentVariable("GCDRNET_NHWC") != "0";
+    public bool Gpu => Target != PlanTarget.Cpu;
+    /// <summary>SIMDONNX_NHWC=0 (or legacy GCDRNET_NHWC=0) forces the all-NCHW plan (A/B oracle).</summary>
+    public static bool DefaultNhwc { get; } = Env.Flag("NHWC") != "0";
     public static CompileOptions Default => new(DefaultNhwc);
-    /// <summary>GCDRNET_NOFUSE_MEM=1 disables the CPU memory fusions (conv+pool, skip recompute).</summary>
-    public static bool MemFusions { get; } = Environment.GetEnvironmentVariable("GCDRNET_NOFUSE_MEM") != "1";
+    /// <summary>SIMDONNX_NOFUSE_MEM=1 disables the CPU memory fusions.</summary>
+    public static bool MemFusions { get; } = Env.Flag("NOFUSE_MEM") != "1";
+}
+
+/// <summary>Engine environment switches: SIMDONNX_X, falling back to the legacy GCDRNET_X.</summary>
+internal static class Env
+{
+    public static string? Flag(string name) =>
+        Environment.GetEnvironmentVariable("SIMDONNX_" + name) ?? Environment.GetEnvironmentVariable("GCDRNET_" + name);
 }
