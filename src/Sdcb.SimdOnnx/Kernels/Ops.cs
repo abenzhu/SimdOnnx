@@ -11,7 +11,7 @@ namespace Sdcb.SimdOnnx.Kernels;
 /// (the reference). Runtime knobs: DOTNET_EnableAVX2 / DOTNET_EnableAVX /
 /// DOTNET_EnableHWIntrinsic.
 /// </summary>
-internal static unsafe class Ops
+internal static unsafe partial class Ops
 {
     // ======================== Conv ========================
     // src [1,IC,H,W]; w [OC,IC/g,kh,kw]; dst [1,OC,OH,OW]. N==1 assumed.

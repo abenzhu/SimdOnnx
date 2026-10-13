@@ -150,11 +150,32 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.Elementwise:
             {
                 var p = (EwP)n.P!;
-                Ops.Elementwise(GetIn(n.In[0]), values[n.In[0]].PhysShape,
-                    GetIn(n.In[1]), values[n.In[1]].PhysShape,
+                Ops.Elementwise(GetIn(n.In[0]), PhysAligned(n.In[0], n.Out[0]),
+                    GetIn(n.In[1]), PhysAligned(n.In[1], n.Out[0]),
                     GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, p.Op, p.Act);
                 break;
             }
+            case ExecOp.Sqrt: Ops.Sqrt(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
+            case ExecOp.Softmax:
+            {
+                int[] s = values[n.In[0]].Shape;
+                Ops.Softmax(GetIn(n.In[0]), GetSpan(n.Out[0]), s[^1]);
+                break;
+            }
+            case ExecOp.ReduceMean:
+            {
+                int[] s = values[n.In[0]].Shape;
+                Ops.ReduceMeanLast(GetIn(n.In[0]), GetSpan(n.Out[0]), s[^1]);
+                break;
+            }
+            case ExecOp.MatMul:
+                Ops.MatMul(GetIn(n.In[0]), values[n.In[0]].Shape, GetIn(n.In[1]), values[n.In[1]].Shape,
+                    GetSpan(n.Out[0]), values[n.Out[0]].Shape);
+                break;
+            case ExecOp.AvgPool:
+                Ops.AvgPool(GetIn(n.In[0]), values[n.In[0]].PhysShape,
+                    GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, (PoolP)n.P!);
+                break;
             case ExecOp.Relu: Ops.Relu(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
             case ExecOp.Sigmoid: Ops.Sigmoid(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
             case ExecOp.Erf: Ops.Erf(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
@@ -237,7 +258,8 @@ public sealed unsafe class InferenceSession : IDisposable
         }
     }
 
-    /// <summary>Channels-last kernels for the layout-sensitive ops; false = generic (storage-shape) path.</summary>
+    /// <summary>Channels-last kernels for the layout-sensitive ops; false = generic (storage-shape) path.
+    /// Spatial kernels address one image; N &gt; 1 loops over the batch.</summary>
     private bool ExecNhwc(ExecNode n)
     {
         CValue[] values = _plan.Values;
@@ -247,36 +269,59 @@ public sealed unsafe class InferenceSession : IDisposable
             {
                 var p = (ConvP)n.P!;
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int nb = i[0];
                 if (p.Pool is not null)
                 {
-                    Nhwc.ConvPool(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], o[3],
-                        p, (NhwcConvPlan)p.KernelPlan!);
+                    for (int b = 0; b < nb; b++)
+                        Nhwc.ConvPool(Img(n.In[0], b, nb), i[1], i[2], i[3], ImgOut(n.Out[0], b, nb), o[1], o[2], o[3],
+                            p, (NhwcConvPlan)p.KernelPlan!);
                     return true;
                 }
-                ReadOnlySpan<float> add = p.AddValue >= 0 ? GetIn(p.AddValue) : ReadOnlySpan<float>.Empty;
-                Nhwc.Conv(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], o[3],
-                    p, (NhwcConvPlan)p.KernelPlan!, add);
+                if (nb > 1 && p.Kernel is [1, 1] && p.Strides is [1, 1] && p.Pads.All(x => x == 0))
+                {
+                    // pointwise: the batch folds into the row dimension
+                    ReadOnlySpan<float> addAll = p.AddValue >= 0 ? GetIn(p.AddValue) : ReadOnlySpan<float>.Empty;
+                    Nhwc.Conv(GetIn(n.In[0]), nb * i[1], i[2], i[3], GetSpan(n.Out[0]), nb * o[1], o[2], o[3],
+                        p, (NhwcConvPlan)p.KernelPlan!, addAll);
+                    return true;
+                }
+                for (int b = 0; b < nb; b++)
+                {
+                    ReadOnlySpan<float> add = p.AddValue >= 0 ? Img(p.AddValue, b, nb) : ReadOnlySpan<float>.Empty;
+                    Nhwc.Conv(Img(n.In[0], b, nb), i[1], i[2], i[3], ImgOut(n.Out[0], b, nb), o[1], o[2], o[3],
+                        p, (NhwcConvPlan)p.KernelPlan!, add);
+                }
                 return true;
             }
             case ExecOp.MaxPool:
             {
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
-                Nhwc.MaxPool(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], (PoolP)n.P!);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.MaxPool(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PoolP)n.P!);
+                return true;
+            }
+            case ExecOp.AvgPool:
+            {
+                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.AvgPool(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PoolP)n.P!);
                 return true;
             }
             case ExecOp.ResizeBilinear:
             {
                 var p = (ResizeP)n.P!;
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
-                Nhwc.ResizeBilinear(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2],
-                    p.Scales[2], p.Scales[3], p.FuseRelu ? ActivationKind.Relu : ActivationKind.None,
-                    n.In.Length > 1 ? GetIn(n.In[1]) : default, p.AddRelu);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.ResizeBilinear(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2],
+                        p.Scales[2], p.Scales[3], p.FuseRelu ? ActivationKind.Relu : ActivationKind.None,
+                        n.In.Length > 1 ? Img(n.In[1], b, i[0]) : default, p.AddRelu);
                 return true;
             }
             case ExecOp.Pad:
             {
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
-                Nhwc.Pad(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], (PadP)n.P!);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.Pad(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PadP)n.P!);
                 return true;
             }
             case ExecOp.Gemm when ((GemmP)n.P!).KernelPlan is NhwcConvPlan gk:
@@ -290,27 +335,62 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.GlobalAvgPool:
             {
                 int[] i = values[n.In[0]].PhysShape;
-                Nhwc.GlobalAvgPool(GetIn(n.In[0]), i[1] * i[2], i[3], GetSpan(n.Out[0]));
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.GlobalAvgPool(Img(n.In[0], b, i[0]), i[1] * i[2], i[3], ImgOut(n.Out[0], b, i[0]));
                 return true;
             }
             case ExecOp.ConvTranspose:
             {
                 var p = (ConvTP)n.P!;
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
-                Nhwc.ConvTranspose(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[3],
-                    p.Kernel[0], p.Kernel[1], (ConvTPlan)p.KernelPlan!, p.Act);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.ConvTranspose(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[3],
+                        p.Kernel[0], p.Kernel[1], (ConvTPlan)p.KernelPlan!, p.Act);
                 return true;
             }
             case ExecOp.ResizeNearest:
             {
                 var p = (ResizeNearestP)n.P!;
                 int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
-                Nhwc.ResizeNearest(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], p.Scales[2], p.Scales[3]);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.ResizeNearest(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.Scales[2], p.Scales[3]);
                 return true;
             }
             default:
                 return false;
         }
+    }
+
+    /// <summary>Image <paramref name="b"/> of an <paramref name="nb"/>-image batch tensor.</summary>
+    private ReadOnlySpan<float> Img(int v, int b, int nb)
+    {
+        ReadOnlySpan<float> s = GetIn(v);
+        if (nb == 1) return s;
+        int per = s.Length / nb;
+        return s.Slice(b * per, per);
+    }
+
+    private Span<float> ImgOut(int v, int b, int nb)
+    {
+        Span<float> s = GetSpan(v);
+        if (nb == 1) return s;
+        int per = s.Length / nb;
+        return s.Slice(b * per, per);
+    }
+
+    /// <summary>
+    /// Broadcast operand shape in the output's physical axis order. The layout pass stores an operand
+    /// in the output layout restricted to its own dims, so its data can be addressed with this shape
+    /// (a [C,1,1] const against an NHWC output becomes [1,1,1,C]).
+    /// </summary>
+    private int[] PhysAligned(int v, int outV)
+    {
+        CValue a = _plan.Values[v], o = _plan.Values[outV];
+        if (o.Layout is not { } lo || Layout.IsIdentity(lo) || a.Shape.SequenceEqual(o.Shape)) return a.PhysShape;
+        int off = lo.Length - a.Shape.Length;
+        int[] p = new int[lo.Length];
+        for (int i = 0; i < lo.Length; i++) p[i] = lo[i] - off >= 0 ? a.Shape[lo[i] - off] : 1;
+        return p;
     }
 
     private float* Arena => _arena != 0 ? (float*)_arena : throw new ObjectDisposedException(nameof(InferenceSession));

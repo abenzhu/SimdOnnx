@@ -213,6 +213,8 @@ internal static class GraphCompiler
                 }
             }
             // Relu/Sigmoid/elementwise-tail fusions
+            FuseBiasAdd(nodes, values);
+            FuseLayerNorm(nodes, values);
             for (int i = 0; i + 1 < nodes.Count; i++)
             {
                 ExecNode a = nodes[i], b = nodes[i + 1];
@@ -531,6 +533,109 @@ internal static class GraphCompiler
             return cv.Floats is { Length: 1 } f && MathF.Abs(f[0] - expected) < 1e-6f;
         }
 
+        /// <summary>Conv/Gemm -> Add(per-channel const) folds into the producer's bias (the producer then
+        /// writes the Add's output value directly).</summary>
+        private static void FuseBiasAdd(List<ExecNode> nodes, List<CValue> values)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode b = nodes[i];
+                if (b.Op != ExecOp.Elementwise || b.P is not EwP { Op: EwOp.Add } ep || b.In.Length != 2) continue;
+                for (int k = 0; k < 2; k++)
+                {
+                    int pv = b.In[k], cv = b.In[1 - k];
+                    if (values[cv].Floats is not { } cf || values[pv].Buf < 0) continue;
+                    int pi = nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == pv);
+                    if (pi < 0 || pi > i || !SoleUse(nodes, pv, i) || values.Any(v => v.AliasOf == pv)) continue;
+                    if (!values[b.Out[0]].Shape.SequenceEqual(values[pv].Shape)) continue;
+                    ExecNode a = nodes[pi];
+                    int[] os = values[pv].Shape, s = values[cv].Shape;
+                    int ch, existing;
+                    if (a.P is ConvP { Act: ActivationKind.None, AddValue: < 0 } cp && os.Length == 4)
+                    {
+                        ch = os[1];
+                        // const right-aligned against [N,C,H,W]: only the channel dim may differ from 1
+                        bool ok = s.Length >= 3 && s[^3] == ch && cf.Length == ch;
+                        if (!ok) continue;
+                        existing = cp.BiasValue;
+                    }
+                    else if (a.P is GemmP { Act: ActivationKind.None } gp)
+                    {
+                        ch = os[^1];
+                        if (s.Length < 1 || s[^1] != ch || cf.Length != ch) continue;
+                        existing = gp.BiasValue;
+                    }
+                    else continue;
+                    float[] bias = (float[])cf.Clone();
+                    if (existing >= 0)
+                    {
+                        float[] e = values[existing].Floats!;
+                        for (int c = 0; c < ch; c++) bias[c] += e[c];
+                    }
+                    int bv = values.Count;
+                    values.Add(new CValue { Name = values[cv].Name + "__bias", Shape = [ch], DType = 1, Floats = bias });
+                    if (a.P is ConvP c2) { c2.BiasValue = bv; c2.Act = ep.Act; }
+                    else if (a.P is GemmP g2) { g2.BiasValue = bv; g2.Act = ep.Act; }
+                    a.Out = [b.Out[0]];
+                    nodes.RemoveAt(i);
+                    i--;
+                    break;
+                }
+            }
+        }
+
+        /// <summary>paddle2onnx's decomposed layer norm over the last axis:
+        /// m = mean(x); d = x - m; y = d / sqrt(mean(d·d) + eps) · gamma + beta.</summary>
+        private static void FuseLayerNorm(List<ExecNode> nodes, List<CValue> values)
+        {
+            int Prod(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
+            int Uses(int v) => nodes.Sum(m => m.In.Count(x => x == v)) + values.Count(x => x.AliasOf == v);
+            bool Ew(ExecNode m, EwOp op) => m.Op == ExecOp.Elementwise && m.P is EwP { Act: ActivationKind.None } e && e.Op == op && m.In.Length == 2;
+            bool Const(int v) => values[v].Floats is not null;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode add = nodes[i];
+                if (!Ew(add, EwOp.Add)) continue;
+                int mulV = add.In[0], beta = add.In[1];
+                if (!Const(beta)) (mulV, beta) = (beta, mulV);
+                int mi = Prod(mulV);
+                if (!Const(beta) || mi < 0 || !Ew(nodes[mi], EwOp.Mul) || Uses(mulV) != 1) continue;
+                ExecNode mul = nodes[mi];
+                int divV = mul.In[0], gamma = mul.In[1];
+                if (!Const(gamma)) (divV, gamma) = (gamma, divV);
+                int di = Prod(divV);
+                if (!Const(gamma) || di < 0 || !Ew(nodes[di], EwOp.Div) || Uses(divV) != 1) continue;
+                ExecNode div = nodes[di];
+                int subV = div.In[0], sqrtV = div.In[1];
+                int qi = Prod(sqrtV), si = Prod(subV);
+                if (qi < 0 || si < 0 || nodes[qi].Op != ExecOp.Sqrt || Uses(sqrtV) != 1 || !Ew(nodes[si], EwOp.Sub)) continue;
+                int epsV = nodes[qi].In[0], ei = Prod(epsV);
+                if (ei < 0 || !Ew(nodes[ei], EwOp.Add) || Uses(epsV) != 1) continue;
+                ExecNode epsAdd = nodes[ei];
+                int varV = epsAdd.In[0], epsC = epsAdd.In[1];
+                if (!Const(epsC)) (varV, epsC) = (epsC, varV);
+                int vi = Prod(varV);
+                if (values[epsC].Floats is not { Length: 1 } ef || vi < 0 || nodes[vi].Op != ExecOp.ReduceMean || Uses(varV) != 1) continue;
+                int powV = nodes[vi].In[0], pi = Prod(powV);
+                if (pi < 0 || !Ew(nodes[pi], EwOp.Mul) || nodes[pi].In[0] != subV || nodes[pi].In[1] != subV || Uses(powV) != 1) continue;
+                ExecNode sub = nodes[si];
+                int x = sub.In[0], meanV = sub.In[1], ri = Prod(meanV);
+                if (ri < 0 || nodes[ri].Op != ExecOp.ReduceMean || nodes[ri].In[0] != x || Uses(meanV) != 1 || Uses(subV) != 3) continue;
+                int c = values[x].Shape[^1];
+                bool PerLast(int v) => values[v].Floats!.Length == c && values[v].Shape.Length >= 1 && values[v].Shape[^1] == c;
+                if (!PerLast(gamma) || !PerLast(beta)) continue;
+                var ln = new ExecNode
+                {
+                    Op = ExecOp.LayerNorm, In = [x, gamma, beta], Out = add.Out,
+                    P = new LnP { Eps = ef[0] }, SrcNode = add.SrcNode, Name = add.Name,
+                };
+                ExecNode[] dead = [nodes[ri], sub, nodes[pi], nodes[vi], epsAdd, nodes[qi], div, mul];
+                nodes[i] = ln;
+                foreach (ExecNode d in dead) nodes.Remove(d);
+                i = nodes.IndexOf(ln);
+            }
+        }
+
         /// <summary>ConvTranspose -> Add(const [1,oc,1,1]) folds into the transposed conv's bias.</summary>
         private static void FuseConvTBias(List<ExecNode> nodes, List<CValue> values)
         {
@@ -773,8 +878,14 @@ internal static class GraphCompiler
                         new HardSigmoidP { Alpha = n.FloatAttr("alpha", 0.2f), Beta = n.FloatAttr("beta", 0.5f) }, n);
                     break;
                 case "GlobalAveragePool": EmitGlobalAvg(n); break;
-                case "ReduceMean": EmitGlobalAvg(n); break;
+                case "ReduceMean": EmitReduceMean(n); break;
                 case "ConvTranspose": EmitConvTranspose(n); break;
+                case "AveragePool": EmitPool(n, avg: true); break;
+                case "BatchNormalization": EmitBatchNorm(n); break;
+                case "MatMul": EmitMatMul(n); break;
+                case "Softmax": EmitSoftmax(n); break;
+                case "Sqrt": EmitUnary(n, ExecOp.Sqrt); break;
+                case "Pow": EmitPow(n); break;
                 default:
                     throw new NotSupportedException($"Op '{op}' not supported (node '{n.Name}').");
             }
@@ -971,9 +1082,11 @@ internal static class GraphCompiler
                 }, n);
         }
 
-        private void EmitPool(OnnxNodeData n)
+        private void EmitPool(OnnxNodeData n, bool avg = false)
         {
             CValue x = V(Input(0, n));
+            if (x.Shape.Length != 4) throw new NotSupportedException($"{n.OpType} '{n.Name}': rank-4 only.");
+            if (n.IntAttr("ceil_mode", 0) != 0) throw new NotSupportedException($"{n.OpType} '{n.Name}': ceil_mode.");
             int[] kernel = n.IntsAttr("kernel_shape").Select(v => (int)v).ToArray();
             int[] strides = n.IntsAttr("strides").Select(v => (int)v).ToArray();
             if (strides.Length == 0) strides = (int[])kernel.Clone();
@@ -984,8 +1097,8 @@ internal static class GraphCompiler
             int[] outShape = (int[])x.Shape.Clone();
             for (int d = 0; d < kernel.Length; d++)
                 outShape[2 + d] = (x.Shape[2 + d] + pads[d] + pads[d + kernel.Length] - kernel[d]) / strides[d] + 1;
-            Emit(ExecOp.MaxPool, [Input(0, n)], ActivationValue(n.Outputs[0], outShape),
-                new PoolP { Kernel = kernel, Strides = strides, Pads = pads }, n);
+            Emit(avg ? ExecOp.AvgPool : ExecOp.MaxPool, [Input(0, n)], ActivationValue(n.Outputs[0], outShape),
+                new PoolP { Kernel = kernel, Strides = strides, Pads = pads, CountIncludePad = avg && n.IntAttr("count_include_pad", 0) != 0 }, n);
         }
 
         private static int[] SameUpperPads(int[] inSp, int[] k, int[] s, int[] d)
@@ -1015,6 +1128,87 @@ internal static class GraphCompiler
                     throw new NotSupportedException($"ReduceMean '{n.Name}': only axes=[2,3] keepdims=1.");
             }
             Emit(ExecOp.GlobalAvgPool, [Input(0, n)], ActivationValue(n.Outputs[0], [x.Shape[0], x.Shape[1], 1, 1]), null, n);
+        }
+
+        private void EmitReduceMean(OnnxNodeData n)
+        {
+            CValue x = V(Input(0, n));
+            long[] axes = n.IntsAttr("axes");
+            if (axes.Length == 0 && n.Inputs.Count > 1 && n.Inputs[1].Length > 0) axes = V(Input(1, n)).Ints!;
+            int rank = x.Shape.Length;
+            long[] norm = axes.Select(a => a < 0 ? a + rank : a).OrderBy(a => a).ToArray();
+            bool keep = n.IntAttr("keepdims", 1) == 1;
+            if (rank == 4 && norm.SequenceEqual([2L, 3L]) && keep) { EmitGlobalAvg(n); return; }
+            if (norm.Length != 1 || norm[0] != rank - 1)
+                throw new NotSupportedException($"ReduceMean '{n.Name}': axes [{string.Join(',', axes)}] (rank {rank}).");
+            int[] shape = (int[])x.Shape.Clone();
+            shape[^1] = 1;
+            if (!keep) shape = shape[..^1];
+            Emit(ExecOp.ReduceMean, [Input(0, n)], ActivationValue(n.Outputs[0], shape), null, n);
+        }
+
+        /// <summary>Inference BatchNormalization (not folded into a conv) as a per-channel affine: x·s + t.</summary>
+        private void EmitBatchNorm(OnnxNodeData n)
+        {
+            CValue x = V(Input(0, n));
+            float[] gamma = V(Input(1, n)).Floats!, beta = V(Input(2, n)).Floats!;
+            float[] mean = V(Input(3, n)).Floats!, variance = V(Input(4, n)).Floats!;
+            float eps = n.FloatAttr("epsilon", 1e-5f);
+            int c = gamma.Length, rank = x.Shape.Length;
+            if (rank < 2 || x.Shape[1] != c) throw new NotSupportedException($"BatchNormalization '{n.Name}': channel mismatch.");
+            float[] s = new float[c], t = new float[c];
+            for (int i = 0; i < c; i++)
+            {
+                s[i] = gamma[i] / MathF.Sqrt(variance[i] + eps);
+                t[i] = beta[i] - mean[i] * s[i];
+            }
+            // [C, 1, ..] broadcasts over the spatial dims of [N, C, ..]
+            int[] cs = new int[rank - 1];
+            Array.Fill(cs, 1);
+            cs[0] = c;
+            int sv = AddValue(new CValue { Name = n.Name + "__bn_scale", Shape = cs, DType = 1, Floats = s });
+            int tv = AddValue(new CValue { Name = n.Name + "__bn_shift", Shape = cs, DType = 1, Floats = t });
+            int scaled = Emit(ExecOp.Elementwise, [Input(0, n), sv], ActivationValue(n.Outputs[0] + "__bn_scaled", x.Shape), new EwP { Op = EwOp.Mul }, n);
+            Emit(ExecOp.Elementwise, [scaled, tv], ActivationValue(n.Outputs[0], x.Shape), new EwP { Op = EwOp.Add }, n);
+        }
+
+        /// <summary>MatMul: a constant 2-D B lowers to <see cref="ExecOp.Gemm"/>, activation × activation to <see cref="ExecOp.MatMul"/>.</summary>
+        private void EmitMatMul(OnnxNodeData n)
+        {
+            CValue a = V(Input(0, n)), b = V(Input(1, n));
+            if (a.Shape.Length < 2 || b.Shape.Length < 2) throw new NotSupportedException($"MatMul '{n.Name}': rank < 2.");
+            int k = a.Shape[^1];
+            if (b.Shape[^2] != k) throw new InvalidDataException($"MatMul '{n.Name}': K mismatch.");
+            if (b.Floats is not null && b.Shape.Length == 2)
+            {
+                int[] gs = (int[])a.Shape.Clone();
+                gs[^1] = b.Shape[1];
+                Emit(ExecOp.Gemm, [Input(0, n), Input(1, n)], ActivationValue(n.Outputs[0], gs), new GemmP(), n);
+                return;
+            }
+            int[] ab = a.Shape[..^2], bb = b.Shape[..^2];
+            int[] batch = BroadcastShape(ab, bb);
+            int[] shape = [.. batch, a.Shape[^2], b.Shape[^1]];
+            Emit(ExecOp.MatMul, [Input(0, n), Input(1, n)], ActivationValue(n.Outputs[0], shape), null, n);
+        }
+
+        private void EmitSoftmax(OnnxNodeData n)
+        {
+            CValue x = V(Input(0, n));
+            int rank = x.Shape.Length;
+            int axis = (int)n.IntAttr("axis", -1);
+            if (axis < 0) axis += rank;
+            if (axis != rank - 1) throw new NotSupportedException($"Softmax '{n.Name}': axis {axis} is not the last.");
+            Emit(ExecOp.Softmax, [Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), null, n);
+        }
+
+        private void EmitPow(OnnxNodeData n)
+        {
+            CValue e = V(Input(1, n));
+            if (e.Floats is not { Length: 1 } f || f[0] != 2f)
+                throw new NotSupportedException($"Pow '{n.Name}': only a constant exponent of 2.");
+            CValue x = V(Input(0, n));
+            Emit(ExecOp.Elementwise, [Input(0, n), Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), new EwP { Op = EwOp.Mul }, n);
         }
 
         private void EmitConvTranspose(OnnxNodeData n)

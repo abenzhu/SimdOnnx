@@ -159,7 +159,7 @@ internal sealed class LayoutPlanner
                 break;
             }
             case ExecOp.Conv or ExecOp.MaxPool or ExecOp.ResizeBilinear or ExecOp.Pad
-                or ExecOp.GlobalAvgPool or ExecOp.ConvTranspose or ExecOp.ResizeNearest:
+                or ExecOp.GlobalAvgPool or ExecOp.ConvTranspose or ExecOp.ResizeNearest or ExecOp.AvgPool:
             {
                 if (_values[n.In[0]].Shape.Length != 4 || _values[n.Out[0]].Shape.Length != 4)
                     throw new NotSupportedException($"layout: {n.Op} '{n.Name}' is not rank-4.");
@@ -184,12 +184,20 @@ internal sealed class LayoutPlanner
             case ExecOp.Ext:
                 n.Ext!.PlanLayout(this, n);
                 break;
-            case ExecOp.LayerNorm or ExecOp.Gemm:
+            case ExecOp.LayerNorm or ExecOp.Gemm or ExecOp.Softmax or ExecOp.ReduceMean:
             {
                 int x = n.In[0];
-                if (!LastInnermost(_values[x].Shape, L(x)))
+                if (!LastInnermost(_values[x].Shape, L(x)) || _values[x].Shape.Length != _values[n.Out[0]].Shape.Length)
                     Need(n, 0, Layout.Identity(_values[x].Shape.Length));
-                SetOut(n, L(n.In[0]));
+                SetOut(n, _values[x].Shape.Length == _values[n.Out[0]].Shape.Length
+                    ? L(n.In[0]) : Layout.Identity(_values[n.Out[0]].Shape.Length));
+                break;
+            }
+            case ExecOp.MatMul:
+            {
+                Need(n, 0, Layout.Identity(_values[n.In[0]].Shape.Length));
+                Need(n, 1, Layout.Identity(_values[n.In[1]].Shape.Length));
+                SetOut(n, Layout.Identity(_values[n.Out[0]].Shape.Length));
                 break;
             }
             case ExecOp.Elementwise:
@@ -210,7 +218,7 @@ internal sealed class LayoutPlanner
                 SetOut(n, lo);
                 break;
             }
-            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.Copy or ExecOp.HardSigmoid:
+            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.Copy or ExecOp.HardSigmoid or ExecOp.Sqrt:
                 SetOut(n, L(n.In[0]));
                 break;
             case ExecOp.Slice:

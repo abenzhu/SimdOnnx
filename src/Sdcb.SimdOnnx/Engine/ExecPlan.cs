@@ -22,6 +22,11 @@ internal enum ExecOp
     GlobalAvgPool,   // mean over H,W (GlobalAveragePool / ReduceMean axes=[2,3] keepdims)
     ConvTranspose,   // stride == kernel, no pad (non-overlapping taps), optional bias + act
     ResizeNearest,   // nearest, asymmetric, floor
+    MatMul,          // batched [.., M, K] x [.., K, N], both activations (const B lowers to Gemm)
+    Softmax,         // over the last axis
+    ReduceMean,      // mean over the last axis, keepdims
+    Sqrt,
+    AvgPool,         // NCHW average pooling (PoolP; count_include_pad = 0)
     Ext,             // consumer-registered operator (ExecNode.Ext)
 }
 
@@ -56,6 +61,7 @@ internal sealed class PoolP
     public required int[] Strides;
     public required int[] Pads;
     public bool FuseRelu;
+    public bool CountIncludePad;     // AvgPool only
 }
 
 internal sealed class EwP

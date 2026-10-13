@@ -41,6 +41,12 @@ public sealed class OnnxModel
             static x => x.Domain.Length == 0 || x.Domain == "ai.onnx")?.Version ?? 0));
         Dictionary<string, OnnxTensorData> init = new(g.Initializers.Count);
         foreach (OnnxTensorData t in g.Initializers) init[t.Name] = t;
+        OnnxRewrites.Apply(g, init);
+        // rewrites add folded weights; drop the initializers no node reads any more
+        HashSet<string> used = new(g.Nodes.SelectMany(n => n.Inputs), StringComparer.Ordinal);
+        g.Initializers.Clear();
+        g.Initializers.AddRange(init.Values.Where(t => used.Contains(t.Name)));
+        init = g.Initializers.ToDictionary(t => t.Name, StringComparer.Ordinal);
         return new OnnxModel(opset, g, init);
     }
 }
