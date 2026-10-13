@@ -176,6 +176,9 @@ public sealed unsafe class InferenceSession : IDisposable
                 Ops.AvgPool(GetIn(n.In[0]), values[n.In[0]].PhysShape,
                     GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, (PoolP)n.P!);
                 break;
+            case ExecOp.GlobalAvgPool:
+                Ops.GlobalAvgPool(GetIn(n.In[0]), values[n.In[0]].PhysShape, GetSpan(n.Out[0]));
+                break;
             case ExecOp.Relu: Ops.Relu(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
             case ExecOp.Sigmoid: Ops.Sigmoid(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
             case ExecOp.Erf: Ops.Erf(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
@@ -268,7 +271,7 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.Conv:
             {
                 var p = (ConvP)n.P!;
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 int nb = i[0];
                 if (p.Pool is not null)
                 {
@@ -295,14 +298,14 @@ public sealed unsafe class InferenceSession : IDisposable
             }
             case ExecOp.MaxPool:
             {
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.MaxPool(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PoolP)n.P!);
                 return true;
             }
             case ExecOp.AvgPool:
             {
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.AvgPool(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PoolP)n.P!);
                 return true;
@@ -310,7 +313,7 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.ResizeBilinear:
             {
                 var p = (ResizeP)n.P!;
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.ResizeBilinear(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2],
                         p.Scales[2], p.Scales[3], p.FuseRelu ? ActivationKind.Relu : ActivationKind.None,
@@ -319,7 +322,7 @@ public sealed unsafe class InferenceSession : IDisposable
             }
             case ExecOp.Pad:
             {
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.Pad(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], (PadP)n.P!);
                 return true;
@@ -327,14 +330,13 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.Gemm when ((GemmP)n.P!).KernelPlan is NhwcConvPlan gk:
             {
                 var p = (GemmP)n.P!;
-                int[] a = values[n.In[0]].PhysShape;
-                int k = a[^1], m = (int)(values[n.In[0]].ElementCount / k);
+                int k = values[n.In[0]].Shape[^1], m = (int)(values[n.In[0]].ElementCount / k);
                 Nhwc.Gemm(GetIn(n.In[0]), m, k, GetSpan(n.Out[0]), values[n.Out[0]].Shape[^1], gk, p.Act);
                 return true;
             }
             case ExecOp.GlobalAvgPool:
             {
-                int[] i = values[n.In[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.GlobalAvgPool(Img(n.In[0], b, i[0]), i[1] * i[2], i[3], ImgOut(n.Out[0], b, i[0]));
                 return true;
@@ -342,7 +344,7 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.ConvTranspose:
             {
                 var p = (ConvTP)n.P!;
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.ConvTranspose(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[3],
                         p.Kernel[0], p.Kernel[1], (ConvTPlan)p.KernelPlan!, p.Act);
@@ -351,7 +353,7 @@ public sealed unsafe class InferenceSession : IDisposable
             case ExecOp.ResizeNearest:
             {
                 var p = (ResizeNearestP)n.P!;
-                int[] i = values[n.In[0]].PhysShape, o = values[n.Out[0]].PhysShape;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.ResizeNearest(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.Scales[2], p.Scales[3]);
                 return true;
@@ -360,6 +362,10 @@ public sealed unsafe class InferenceSession : IDisposable
                 return false;
         }
     }
+
+    /// <summary>[N, H, W, C] of a rank-4 logical NCHW value. The layout pass guarantees NHWC-equivalent
+    /// storage for NHWC kernels, but an equivalent layout (size-1 dims) keeps its own PhysShape order.</summary>
+    private static int[] Nhwc4(CValue v) => v.Shape is [var nn, var c, var h, var w] ? [nn, h, w, c] : v.PhysShape;
 
     /// <summary>Image <paramref name="b"/> of an <paramref name="nb"/>-image batch tensor.</summary>
     private ReadOnlySpan<float> Img(int v, int b, int nb)

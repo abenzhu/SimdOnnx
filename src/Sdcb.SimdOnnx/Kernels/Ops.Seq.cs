@@ -124,6 +124,18 @@ internal static unsafe partial class Ops
         return s;
     }
 
+    /// <summary>NCHW global average pool (reference path).</summary>
+    public static void GlobalAvgPool(ReadOnlySpan<float> src, int[] inShape, Span<float> dst)
+    {
+        int nc = inShape[0] * inShape[1], hw = inShape[2] * inShape[3];
+        for (int c = 0; c < nc; c++)
+        {
+            float s = 0;
+            foreach (float v in src.Slice(c * hw, hw)) s += v;
+            dst[c] = s / hw;
+        }
+    }
+
     /// <summary>NCHW average pool (reference path for non-NHWC plans).</summary>
     public static void AvgPool(ReadOnlySpan<float> src, int[] inShape, Span<float> dst, int[] outShape, PoolP p)
     {

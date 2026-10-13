@@ -438,8 +438,9 @@ internal static unsafe partial class Ops
             }
             if (inner > 8 && n % inner == 0)
             {
+                // EwInner walks the outer dims [0, rank) (its loop bound is rank - 1 of the argument)
                 Avx2Kernels.EwInner(a, b, bStr, outShape, outStr,
-                    outShape.Length, inner, dst, n, oi, act);
+                    rank + 1, inner, dst, n, oi, act);
                 return;
             }
         }
@@ -838,26 +839,28 @@ internal static unsafe partial class Ops
         }
         if (rank == 4 && perm[0] == 0 && perm[1] == 3 && perm[2] == 1 && perm[3] == 2)
         {
-            // [1,h,w,c] -> [1,c,h,w] == 2D transpose of [hw,c]->[c,hw]
-            int hw = inShape[1] * inShape[2], cc = inShape[3];
-            if (Avx2.IsSupported && Fma.IsSupported && hw * cc >= 8192)
+            // [n,h,w,c] -> [n,c,h,w] == per image 2D transpose of [hw,c]->[c,hw]
+            int hw = inShape[1] * inShape[2], cc = inShape[3], per = hw * cc;
+            for (int b = 0; b < inShape[0]; b++)
             {
-                Avx2Kernels.Transpose2D(src, hw, cc, dst);
-                return;
+                if (Avx2.IsSupported && Fma.IsSupported && per >= 8192)
+                    Avx2Kernels.Transpose2D(src.Slice(b * per, per), hw, cc, dst.Slice(b * per, per));
+                else
+                    Transpose2D(src.Slice(b * per, per), dst.Slice(b * per, per), hw, cc);
             }
-            Transpose2D(src, dst, hw, cc);
             return;
         }
         if (rank == 4 && perm[0] == 0 && perm[1] == 2 && perm[2] == 3 && perm[3] == 1)
         {
-            // [1,c,h,w] -> [1,h,w,c] == 2D transpose of [c,hw]->[hw,c]
-            int cc = inShape[1], hw = inShape[2] * inShape[3];
-            if (Avx2.IsSupported && Fma.IsSupported && hw * cc >= 8192)
+            // [n,c,h,w] -> [n,h,w,c] == per image 2D transpose of [c,hw]->[hw,c]
+            int cc = inShape[1], hw = inShape[2] * inShape[3], per = hw * cc;
+            for (int b = 0; b < inShape[0]; b++)
             {
-                Avx2Kernels.Transpose2D(src, cc, hw, dst);
-                return;
+                if (Avx2.IsSupported && Fma.IsSupported && per >= 8192)
+                    Avx2Kernels.Transpose2D(src.Slice(b * per, per), cc, hw, dst.Slice(b * per, per));
+                else
+                    Transpose2D(src.Slice(b * per, per), dst.Slice(b * per, per), cc, hw);
             }
-            Transpose2D(src, dst, cc, hw);
             return;
         }
         // generic permute

@@ -10,6 +10,7 @@ internal static class OnnxRewrites
     public static void Apply(OnnxGraphData g, Dictionary<string, OnnxTensorData> init)
     {
         ConstantsToInitializers(g, init);
+        if (Engine.Env.Flag("NOREWRITE") == "1") return;
         HashSet<string> outputs = new(g.Outputs.Select(o => o.Name), StringComparer.Ordinal);
         FoldConvBatchNorm(g.Nodes, init, outputs);
         MergeParallelConvBranches(g.Nodes, init, outputs);

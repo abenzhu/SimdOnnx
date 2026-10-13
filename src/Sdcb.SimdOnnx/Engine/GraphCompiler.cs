@@ -71,6 +71,14 @@ internal static class GraphCompiler
             return ids;
         }
 
+        /// <summary>Int list given as input <paramref name="i"/> (newer opsets) or as attribute <paramref name="attr"/> (older); null if neither.</summary>
+        private long[]? IntsArg(OnnxNodeData n, int i, string attr)
+        {
+            if (n.Inputs.Count > i && n.Inputs[i].Length > 0) return V(Input(i, n)).Ints;
+            long[] a = n.IntsAttr(attr);
+            return a.Length > 0 || n.Attr(attr) is not null ? a : null;
+        }
+
         private int _curNi;   // onnx node index currently being emitted (for SrcNode)
 
         private int Emit(ExecOp op, int[] ins, CValue output, object? p, OnnxNodeData n)
@@ -121,10 +129,11 @@ internal static class GraphCompiler
         {
             // fusion passes operate on the logical graph and are layout-blind;
             // physical layout is decided afterwards by LayoutPlanner
+            Prune(nodes, values, outputValue);
             bool fuse = Env.Flag("NOFUSE") != "1";
             if (fuse)
             {
-                Fuse(nodes, values);
+                Fuse(nodes, values, outputValue);
                 RunPasses(PassStage.Logical, nodes, values, outputValue, opt);
                 // NHWC-only kernels (CPU channels-last + GPU); the NCHW oracle plan keeps the plain ops
                 if (opt.Nhwc && Env.Flag("NOFUSE_UP") != "1")
@@ -178,6 +187,21 @@ internal static class GraphCompiler
             };
         }
 
+        /// <summary>Drops nodes that do not contribute to the output (heads cut at an inner tensor).</summary>
+        private static void Prune(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        {
+            var live = new HashSet<int>();
+            void Mark(int v) { while (v >= 0 && live.Add(v)) v = values[v].AliasOf; }
+            Mark(outputValue);
+            for (int i = nodes.Count - 1; i >= 0; i--)
+            {
+                ExecNode n = nodes[i];
+                if (!n.Out.Any(live.Contains)) { nodes.RemoveAt(i); continue; }
+                foreach (int v in n.In) Mark(v);
+                foreach (int v in n.ParamRefs()) Mark(v);
+            }
+        }
+
         private static void RunPasses(PassStage stage, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
         {
             if (opt.Extensions is not { } ext) return;
@@ -187,7 +211,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Structural fusions over the exec node list (single consumer chains).</summary>
-        private static void Fuse(List<ExecNode> nodes, List<CValue> values)
+        private static void Fuse(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             // pass 1: Pad -> Conv  (fold reflect/constant padding into the conv)
             // pass 2: Conv -> Relu (activation epilogue)
@@ -213,7 +237,7 @@ internal static class GraphCompiler
                 }
             }
             // Relu/Sigmoid/elementwise-tail fusions
-            FuseBiasAdd(nodes, values);
+            FuseBiasAdd(nodes, values, outputValue);
             FuseLayerNorm(nodes, values);
             for (int i = 0; i + 1 < nodes.Count; i++)
             {
@@ -535,7 +559,7 @@ internal static class GraphCompiler
 
         /// <summary>Conv/Gemm -> Add(per-channel const) folds into the producer's bias (the producer then
         /// writes the Add's output value directly).</summary>
-        private static void FuseBiasAdd(List<ExecNode> nodes, List<CValue> values)
+        private static void FuseBiasAdd(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             for (int i = 0; i < nodes.Count; i++)
             {
@@ -544,7 +568,7 @@ internal static class GraphCompiler
                 for (int k = 0; k < 2; k++)
                 {
                     int pv = b.In[k], cv = b.In[1 - k];
-                    if (values[cv].Floats is not { } cf || values[pv].Buf < 0) continue;
+                    if (values[cv].Floats is not { } cf || values[pv].Buf < 0 || pv == outputValue) continue;
                     int pi = nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == pv);
                     if (pi < 0 || pi > i || !SoleUse(nodes, pv, i) || values.Any(v => v.AliasOf == pv)) continue;
                     if (!values[b.Out[0]].Shape.SequenceEqual(values[pv].Shape)) continue;
@@ -907,7 +931,7 @@ internal static class GraphCompiler
                 case "Squeeze":
                 {
                     CValue x = In(0);
-                    long[]? axes = n.Inputs.Count > 1 && n.Inputs[1].Length > 0 ? In(1).Ints : null;
+                    long[]? axes = IntsArg(n, 1, "axes");
                     int[] shape;
                     if (axes is null)
                         shape = x.Shape.Where(d => d != 1).ToArray();
@@ -928,7 +952,7 @@ internal static class GraphCompiler
                 case "Unsqueeze":
                 {
                     CValue x = In(0);
-                    long[] axes = In(1).Ints!;
+                    long[] axes = IntsArg(n, 1, "axes")!;
                     var dims = x.Shape.ToList();
                     foreach (long a in axes.OrderBy(v => v))
                     {
@@ -962,10 +986,10 @@ internal static class GraphCompiler
                 case "Slice":
                 {
                     CValue x = In(0);
-                    long[] starts = In(1).Ints!;
-                    long[] ends = n.Inputs.Count > 2 && n.Inputs[2].Length > 0 ? In(2).Ints! : x.Shape.Select(d => (long)d).ToArray();
-                    long[] axes = n.Inputs.Count > 3 && n.Inputs[3].Length > 0 ? In(3).Ints! : Enumerable.Range(0, starts.Length).Select(i => (long)i).ToArray();
-                    long[] steps = n.Inputs.Count > 4 && n.Inputs[4].Length > 0 ? In(4).Ints! : starts.Select(_ => 1L).ToArray();
+                    long[] starts = IntsArg(n, 1, "starts")!;
+                    long[] ends = IntsArg(n, 2, "ends") ?? x.Shape.Select(d => (long)d).ToArray();
+                    long[] axes = IntsArg(n, 3, "axes") ?? Enumerable.Range(0, starts.Length).Select(i => (long)i).ToArray();
+                    long[] steps = IntsArg(n, 4, "steps") ?? starts.Select(_ => 1L).ToArray();
                     SliceBounds(x.Shape, starts, ends, axes, steps,
                         out int[] outShape, out int[] st, out int[] en, out int[] stepI);
                     long[] data = IntSlice(x.Ints!, x.Shape,
@@ -1313,12 +1337,10 @@ internal static class GraphCompiler
         private void EmitSlice(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
-            long[] starts = V(Input(1, n)).Ints!;
-            long[] ends = V(Input(2, n)).Ints!;
-            long[] axes = n.Inputs.Count > 3 && n.Inputs[3].Length > 0
-                ? V(Input(3, n)).Ints! : Enumerable.Range(0, starts.Length).Select(i => (long)i).ToArray();
-            long[] steps = n.Inputs.Count > 4 && n.Inputs[4].Length > 0
-                ? V(Input(4, n)).Ints! : starts.Select(_ => 1L).ToArray();
+            long[] starts = IntsArg(n, 1, "starts")!;
+            long[] ends = IntsArg(n, 2, "ends")!;
+            long[] axes = IntsArg(n, 3, "axes") ?? Enumerable.Range(0, starts.Length).Select(i => (long)i).ToArray();
+            long[] steps = IntsArg(n, 4, "steps") ?? starts.Select(_ => 1L).ToArray();
             SliceBounds(x.Shape, starts, ends, axes, steps,
                 out int[] outShape, out int[] st, out int[] en, out int[] stepI);
             Emit(ExecOp.Slice, [Input(0, n)], ActivationValue(n.Outputs[0], outShape),
@@ -1385,7 +1407,7 @@ internal static class GraphCompiler
         private void EmitSqueeze(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
-            long[]? axes = n.Inputs.Count > 1 && n.Inputs[1].Length > 0 ? V(Input(1, n)).Ints : null;
+            long[]? axes = IntsArg(n, 1, "axes");
             int[] shape;
             if (axes is null) shape = x.Shape.Where(d => d != 1).ToArray();
             else
@@ -1400,7 +1422,7 @@ internal static class GraphCompiler
         private void EmitUnsqueeze(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
-            long[] axes = V(Input(1, n)).Ints!;
+            long[] axes = IntsArg(n, 1, "axes")!;
             var dims = x.Shape.ToList();
             foreach (long a in axes.OrderBy(v => v)) dims.Insert((int)(a < 0 ? a + dims.Count + 1 : a), 1);
             AddValue(new CValue { Name = n.Outputs[0], Shape = dims.ToArray(), DType = 1, Buf = x.Buf, Floats = x.Floats, AliasOf = x.Buf >= 0 ? Input(0, n) : -1 });

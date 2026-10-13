@@ -14,22 +14,36 @@ bool prof = Environment.GetEnvironmentVariable("GCDRNET_PROF") == "1";
 // must be set before the GcdrNet kernels' static init
 Environment.SetEnvironmentVariable("GCDRNET_THREADS", threads.ToString());
 
-string[] hw = Path.GetFileNameWithoutExtension(inputPath).Split('_')[^1].Split('x');
-int[] shape = [1, 3, int.Parse(hw[0]), int.Parse(hw[1])];
-float[] input = new float[3 * shape[2] * shape[3]];
-using (FileStream fs = File.OpenRead(inputPath))
+string[] hw = Path.GetFileNameWithoutExtension(inputPath).Split('_')[^1].Split(':')[^1].Split('x');
+int[] shape = hw.Length == 4 ? hw.Select(int.Parse).ToArray() : [1, 3, int.Parse(hw[0]), int.Parse(hw[1])];
+float[] input = new float[shape.Aggregate(1, (a, b) => a * b)];
+if (inputPath.StartsWith("rand:"))
+{
+    // deterministic smooth pseudo-image in [-1, 1] (rec/cls inputs are normalized that way)
+    var rng = new Random(42);
+    for (int i = 0; i < input.Length; i++) input[i] = MathF.Sin(i * 0.013f) * 0.6f + (float)(rng.NextDouble() - 0.5) * 0.8f;
+}
+else
+{
+    using FileStream fs = File.OpenRead(inputPath);
     fs.ReadExactly(System.Runtime.InteropServices.MemoryMarshal.AsBytes(input.AsSpan()));
+}
 byte[] modelBytes = File.ReadAllBytes(modelPath);
+if (Environment.GetEnvironmentVariable("BENCH_SAVE_INPUT") is { Length: > 0 } saveIn)
+    File.WriteAllBytes(saveIn, System.Runtime.InteropServices.MemoryMarshal.AsBytes(input.AsSpan()).ToArray());
 
 long ws0 = Process.GetCurrentProcess().WorkingSet64;
-Console.WriteLine($"model={Path.GetFileName(modelPath)} input={shape[2]}x{shape[3]} threads={threads} iters={iters}");
+Console.WriteLine($"model={Path.GetFileName(modelPath)} input={string.Join('x', shape)} threads={threads} iters={iters}");
 
 float[]? reference = null;
+int[]? outShape = null;
 foreach (string e in engines)
 {
     float[] o = e switch
     {
+        _ when e.StartsWith("file:") => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(File.ReadAllBytes(e[5..])).ToArray(),
         "gcdr" => RunGcdr(),
+        "gcdr-ref" => RunGcdr(new G.Engine.CompileOptions(false)),
         "paddle" => RunPaddle(),
         "gcdr-vk" => RunGcdrVk(),
         "paddle-vk" => RunPaddleGpu("Vulkan", "GpuBackend", "GpuSession"),
@@ -38,6 +52,7 @@ foreach (string e in engines)
         _ => throw new ArgumentException(e),
     };
     if (reference is null) { reference = o; continue; }
+    if (o.Length != reference.Length) { Console.WriteLine($"  vs {engines[0]}: LENGTH {o.Length} != {reference.Length}"); continue; }
     double maxAbs = 0, sumAbs = 0; int flips = 0;
     for (int i = 0; i < o.Length; i++)
     {
@@ -45,14 +60,30 @@ foreach (string e in engines)
         maxAbs = Math.Max(maxAbs, d); sumAbs += d;
         if (o[i] > 0.3f != reference[i] > 0.3f) flips++;
     }
-    Console.WriteLine($"  vs {engines[0]}: max|d|={maxAbs:E2} mean|d|={sumAbs / o.Length:E2} mask@0.3 flips={flips} / {o.Length}");
+    string argmax = "";
+    if (outShape is { Length: >= 2 } os && os[^1] > 1)
+    {
+        int c = os[^1], rows = o.Length / c, diff = 0;
+        for (int r = 0; r < rows; r++)
+        {
+            int ia = 0, ib = 0;
+            for (int k = 1; k < c; k++)
+            {
+                if (o[r * c + k] > o[r * c + ia]) ia = k;
+                if (reference[r * c + k] > reference[r * c + ib]) ib = k;
+            }
+            if (ia != ib) diff++;
+        }
+        argmax = $" argmax-diff={diff}/{rows}";
+    }
+    Console.WriteLine($"  vs {engines[0]}: max|d|={maxAbs:E2} mean|d|={sumAbs / o.Length:E2} mask@0.3 flips={flips} / {o.Length}{argmax}");
 }
 
-float[] RunGcdr()
+float[] RunGcdr(G.Engine.CompileOptions? opt = null)
 {
     var sw = Stopwatch.StartNew();
     G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
-    G.Engine.CompiledModel cm = G.Engine.CompiledModel.Compile(m, shape);
+    G.Engine.CompiledModel cm = opt is null ? G.Engine.CompiledModel.Compile(m, shape) : G.Engine.CompiledModel.Compile(m, shape, opt);
     using var s = cm.CreateSession();
     double compileMs = sw.Elapsed.TotalMilliseconds;
     input.CopyTo(s.Input);
@@ -60,6 +91,7 @@ float[] RunGcdr()
     s.ResetProfile();
     var times = Enumerable.Range(0, iters).Select(_ => { input.CopyTo(s.Input); return Time(() => s.Run()); }).ToArray();
     Report("gcdr", compileMs, first, times, $"nodes={cm.NodeCount} arena={cm.ArenaFloats * 4.0 / 1048576:F1}MB");
+    outShape = s.OutputShape;
     if (prof)
     {
         foreach (var (op, t) in s.Profile().OrderByDescending(kv => kv.Value))
