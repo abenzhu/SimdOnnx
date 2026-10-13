@@ -161,7 +161,7 @@ public class Avx512KernelTests
     {
         // whole net: memory-fused plan on the AVX-512 tier vs unfused plan on the AVX2 tier, bit for bit
         Skip.IfNot(s_tier && Avx2.IsSupported && Fma.IsSupported, "AVX-512 tier not active");
-        var m = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(Path.Combine(AppContext.BaseDirectory, "testdata", "models",
+        var m = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(Path.Combine(Golden.ModelDir,
             net == "gc" ? "gcdrnet_gcnet_sim.onnx" : "gcdrnet_drnet_sim.onnx"));
         int[] shape = [1, cin, 96, 128];
         var rnd = new Random(7);

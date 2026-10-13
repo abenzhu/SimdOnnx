@@ -161,7 +161,7 @@ public class NeonKernelTests
     {
         // whole net on the NEON tier: memory-fused plan vs unfused plan, bit for bit
         SkipUnlessNeon();
-        var m = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(Path.Combine(AppContext.BaseDirectory, "testdata", "models",
+        var m = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(Path.Combine(Golden.ModelDir,
             net == "gc" ? "gcdrnet_gcnet_sim.onnx" : "gcdrnet_drnet_sim.onnx"));
         int[] shape = [1, cin, 96, 128];
         var rnd = new Random(7);
