@@ -1,0 +1,61 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-24.04 }
+          - { name: linux-arm64, os: ubuntu-24.04-arm }
+          - { name: win-x64,     os: windows-2025 }
+          - { name: win-arm64,   os: windows-11-arm }
+          - { name: osx-arm64,   os: macos-26 }
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: Sdcb.SimdOnnx }
+      # test fixtures and models live in the consumer repos, checked out next to this one
+      - uses: actions/checkout@v5
+        with: { repository: sdcb/SimdGcdrNet, path: Sdcb.GcdrNet }
+      - uses: actions/checkout@v5
+        with: { repository: sdcb/SimdPaddleOCR, path: SimdPaddleOCR }
+      - uses: actions/setup-dotnet@v5
+        with: { dotnet-version: 10.0.x }
+      - name: Test (net10.0)
+        working-directory: Sdcb.SimdOnnx
+        run: dotnet test tests/Sdcb.SimdOnnx.Tests -c Release --nologo --logger "console;verbosity=normal"
+
+  isa-x64:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        isa:
+          - DOTNET_EnableAVX512=0
+          - DOTNET_EnableAVX2=0
+          - DOTNET_EnableHWIntrinsic=0
+    steps:
+      - uses: actions/checkout@v5
+        with: { path: Sdcb.SimdOnnx }
+      - uses: actions/checkout@v5
+        with: { repository: sdcb/SimdGcdrNet, path: Sdcb.GcdrNet }
+      - uses: actions/checkout@v5
+        with: { repository: sdcb/SimdPaddleOCR, path: SimdPaddleOCR }
+      - uses: actions/setup-dotnet@v5
+        with: { dotnet-version: 10.0.x }
+      - name: Test (${{ matrix.isa }})
+        working-directory: Sdcb.SimdOnnx
+        shell: pwsh
+        run: |
+          $k, $v = '${{ matrix.isa }}'.Split('=')
+          [Environment]::SetEnvironmentVariable($k, $v)
+          dotnet test tests/Sdcb.SimdOnnx.Tests -c Release --nologo

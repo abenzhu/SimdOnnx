@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC nearest resize, asymmetric coordinates, floor rounding: src = floor(dst / scale).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint c, ih, iw, oh, ow; float sy, sx; } p;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= p.oh * p.ow * p.c) return;
+    uint ch = id % p.c, px = id / p.c;
+    uint ox = px % p.ow, oy = px / p.ow;
+    uint iy = min(uint(floor(float(oy) / p.sy)), p.ih - 1u);
+    uint ix = min(uint(floor(float(ox) / p.sx)), p.iw - 1u);
+    o[id] = x[(iy * p.iw + ix) * p.c + ch];
+}

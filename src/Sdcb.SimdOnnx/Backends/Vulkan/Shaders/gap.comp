@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC global average pool: o[ch] = mean over hw pixels of x[px*c + ch].
+// 64 consecutive channels (coalesced) x 16 pixel lanes per workgroup.
+layout(local_size_x = 64, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint c, hw; float inv; } p;
+
+shared float part[16][64];
+
+void main()
+{
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint ch = gl_WorkGroupID.x * 64u + lx;
+    float s = 0.0;
+    if (ch < p.c)
+        for (uint px = ly; px < p.hw; px += 16u) s += float(x[px * p.c + ch]);
+    part[ly][lx] = s;
+    barrier();
+    if (ly == 0u && ch < p.c)
+    {
+        float t = 0.0;
+        for (uint k = 0u; k < 16u; k++) t += part[k][lx];
+        o[ch] = ET(t * p.inv);
+    }
+}

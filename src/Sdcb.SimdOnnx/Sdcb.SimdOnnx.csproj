@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Sdcb.SimdOnnx</AssemblyName>
+    <RootNamespace>Sdcb.SimdOnnx</RootNamespace>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- SPIR-V binaries are committed next to the .comp sources; regenerate with
+         Backends/Vulkan/tools/build-shaders.bat (glslc, dev-time only). -->
+    <EmbeddedResource Include="Backends\Vulkan\Shaders\*.spv" />
+    <EmbeddedResource Include="Backends\Metal\Shaders\*.metal" />
+    <None Remove="Backends\Vulkan\Shaders\*.comp" />
+    <None Remove="Backends\Vulkan\Shaders\*.spv" />
+  </ItemGroup>
+</Project>

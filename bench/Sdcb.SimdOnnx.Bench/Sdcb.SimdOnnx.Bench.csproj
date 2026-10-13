@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Sdcb.SimdOnnx.Bench</AssemblyName>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Sdcb.SimdOnnx\Sdcb.SimdOnnx.csproj" />
+    <!-- A/B reference engine while porting; removed once SimdPaddleOCR runs on SimdOnnx. -->
+    <ProjectReference Include="..\..\..\SimdPaddleOCR\src\Sdcb.SimdPaddleOCR\Sdcb.SimdPaddleOCR.csproj" />
+  </ItemGroup>
+</Project>

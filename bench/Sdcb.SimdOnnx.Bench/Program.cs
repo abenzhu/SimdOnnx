@@ -1,0 +1,177 @@
+using System.Diagnostics;
+using System.Reflection;
+using G = Sdcb.SimdOnnx;
+using P = Sdcb.SimdPaddleOCR.OnnxSharp;
+
+// SimdCore spike: run a PP-OCR det model through the GcdrNet engine and SimdPaddleOCR,
+// on CPU and Vulkan; compare outputs (against the first engine listed), latency and memory.
+// usage: <model.onnx> <input_HxW.f32> <engines: gcdr,paddle,gcdr-vk,paddle-vk,gcdr-mtl,paddle-mtl> [threads] [iters]
+string modelPath = args[0], inputPath = args[1];
+string[] engines = args[2].Split(',');
+int threads = args.Length > 3 ? int.Parse(args[3]) : Environment.ProcessorCount;
+int iters = args.Length > 4 ? int.Parse(args[4]) : 20;
+bool prof = Environment.GetEnvironmentVariable("GCDRNET_PROF") == "1";
+// must be set before the GcdrNet kernels' static init
+Environment.SetEnvironmentVariable("GCDRNET_THREADS", threads.ToString());
+
+string[] hw = Path.GetFileNameWithoutExtension(inputPath).Split('_')[^1].Split('x');
+int[] shape = [1, 3, int.Parse(hw[0]), int.Parse(hw[1])];
+float[] input = new float[3 * shape[2] * shape[3]];
+using (FileStream fs = File.OpenRead(inputPath))
+    fs.ReadExactly(System.Runtime.InteropServices.MemoryMarshal.AsBytes(input.AsSpan()));
+byte[] modelBytes = File.ReadAllBytes(modelPath);
+
+long ws0 = Process.GetCurrentProcess().WorkingSet64;
+Console.WriteLine($"model={Path.GetFileName(modelPath)} input={shape[2]}x{shape[3]} threads={threads} iters={iters}");
+
+float[]? reference = null;
+foreach (string e in engines)
+{
+    float[] o = e switch
+    {
+        "gcdr" => RunGcdr(),
+        "paddle" => RunPaddle(),
+        "gcdr-vk" => RunGcdrVk(),
+        "paddle-vk" => RunPaddleGpu("Vulkan", "GpuBackend", "GpuSession"),
+        "gcdr-mtl" => RunGcdrMtl(),
+        "paddle-mtl" => RunPaddleGpu("Metal", "MetalBackend", "MetalSession"),
+        _ => throw new ArgumentException(e),
+    };
+    if (reference is null) { reference = o; continue; }
+    double maxAbs = 0, sumAbs = 0; int flips = 0;
+    for (int i = 0; i < o.Length; i++)
+    {
+        double d = Math.Abs(o[i] - reference[i]);
+        maxAbs = Math.Max(maxAbs, d); sumAbs += d;
+        if (o[i] > 0.3f != reference[i] > 0.3f) flips++;
+    }
+    Console.WriteLine($"  vs {engines[0]}: max|d|={maxAbs:E2} mean|d|={sumAbs / o.Length:E2} mask@0.3 flips={flips} / {o.Length}");
+}
+
+float[] RunGcdr()
+{
+    var sw = Stopwatch.StartNew();
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    G.Engine.CompiledModel cm = G.Engine.CompiledModel.Compile(m, shape);
+    using var s = cm.CreateSession();
+    double compileMs = sw.Elapsed.TotalMilliseconds;
+    input.CopyTo(s.Input);
+    double first = Time(() => s.Run());
+    s.ResetProfile();
+    var times = Enumerable.Range(0, iters).Select(_ => { input.CopyTo(s.Input); return Time(() => s.Run()); }).ToArray();
+    Report("gcdr", compileMs, first, times, $"nodes={cm.NodeCount} arena={cm.ArenaFloats * 4.0 / 1048576:F1}MB");
+    if (prof)
+    {
+        foreach (var (op, t) in s.Profile().OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"    {op,-14} {t.TotalMilliseconds / iters,7:F2}ms");
+        string Cls(G.Engine.ExecNode n) => n.P is G.Engine.ConvP c
+            ? $"{(c.Group > 1 ? "dw" : "dense")}{c.Kernel[0]}x{c.Kernel[1]}s{c.Strides[0]}"
+            : n.Op.ToString();
+        foreach (var g in s.NodeProfile().Where(x => x.n.Op == G.Engine.ExecOp.Conv).GroupBy(x => Cls(x.n)).OrderByDescending(g => g.Sum(x => x.t.Ticks)))
+            Console.WriteLine($"    conv {g.Key,-14} x{g.Count(),-3} {g.Sum(x => x.t.TotalMilliseconds) / iters,7:F2}ms");
+    }
+    return s.Output.ToArray();
+}
+
+float[] RunGcdrVk()
+{
+    var sw = Stopwatch.StartNew();
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    var be = G.Backends.Vulkan.VkBackend.Default;
+    using var s = be.NewSession(m, shape);
+    double compileMs = sw.Elapsed.TotalMilliseconds;
+    input.CopyTo(s.Input);
+    double first = Time(() => s.Run());
+    var times = Enumerable.Range(0, iters).Select(_ => { input.CopyTo(s.Input); return Time(() => s.Run()); }).ToArray();
+    Report("gcdr-vk", compileMs, first, times, $"f16={s.F16} gpu-arena={s.Arena.Size / 1048576.0:F1}MB");
+    float[] o = s.Output.ToArray();
+    if (prof)
+        foreach (var (name, ms) in s.DebugProfile().OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"    {name,-16} {ms,7:F3}ms");
+    return o;
+}
+
+float[] RunGcdrMtl()
+{
+    var sw = Stopwatch.StartNew();
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    var be = G.Backends.Metal.MetalBackend.Default;
+    using var s = be.NewSession(m, shape);
+    double compileMs = sw.Elapsed.TotalMilliseconds;
+    input.CopyTo(s.Input);
+    double first = Time(() => s.Run());
+    var times = Enumerable.Range(0, iters).Select(_ => { input.CopyTo(s.Input); return Time(() => s.Run()); }).ToArray();
+    Report("gcdr-mtl", compileMs, first, times, $"gpu-arena={s.DebugPlan.ArenaFloats * 2.0 / 1048576:F1}MB");
+    float[] o = s.Output.ToArray();
+    if (prof)
+        foreach (var (name, ms) in s.DebugProfile().OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"    {name,-16} {ms,7:F3}ms");
+    return o;
+}
+
+float[] RunPaddle()
+{
+    var sw = Stopwatch.StartNew();
+    P.Model m = P.Model.Load(modelBytes);
+    using var s = new P.InferenceSession(m, shape, Math.Min(threads, 16));
+    double compileMs = sw.Elapsed.TotalMilliseconds;
+    float[] o = [];
+    double first = Time(() => o = s.Run(input));
+    var ist = typeof(P.InferenceSession);
+    const BindingFlags NP = BindingFlags.NonPublic | BindingFlags.Static;
+    if (prof) ist.GetMethod("EnableProfiling", NP)!.Invoke(null, [true]);
+    var times = Enumerable.Range(0, iters).Select(_ => Time(() => o = s.Run(input))).ToArray();
+    Report("paddle", compileMs, first, times, "");
+    if (prof)
+    {
+        var snap = ((long Ticks, long Calls)[])ist.GetMethod("ProfileSnapshot", NP)!.Invoke(null, null)!;
+        for (int i = 0; i < snap.Length; i++)
+            if (snap[i].Ticks > 0)
+                Console.WriteLine($"    {(P.OperatorId)i,-14} {snap[i].Ticks * 1000.0 / Stopwatch.Frequency / iters,7:F2}ms");
+        ist.GetMethod("EnableProfiling", NP)!.Invoke(null, [false]);
+    }
+    return o;
+}
+
+float[] RunPaddleGpu(string backend, string factory, string sessionType)
+{
+    var sw = Stopwatch.StartNew();
+    P.Model m = P.Model.Load(modelBytes);
+    using var cpu = new P.InferenceSession(m, shape, 1);
+    Assembly asm = typeof(P.Model).Assembly;
+    object sess = asm.GetType($"Sdcb.SimdPaddleOCR.Backends.{backend}.{factory}")!
+        .GetMethod("CreateSession", BindingFlags.NonPublic | BindingFlags.Static)!
+        .Invoke(null, [cpu.CompiledModel, Enum.Parse<Sdcb.SimdPaddleOCR.OcrBackend>(backend)])!;
+    if (sess.GetType().Name != sessionType) throw new InvalidOperationException($"paddle {backend}: got {sess.GetType().Name}");
+    Type ios = asm.GetType("Sdcb.SimdPaddleOCR.OnnxSharp.IOcrSession")!;
+    var reshape = (ReshapeFn)Delegate.CreateDelegate(typeof(ReshapeFn), sess, ios.GetMethod("Reshape")!);
+    var run = (RunFn)Delegate.CreateDelegate(typeof(RunFn), sess, ios.GetMethod("RunInternal")!);
+    reshape(shape);
+    double compileMs = sw.Elapsed.TotalMilliseconds;
+    float[] o = [];
+    double first = Time(() => o = run(input).ToArray());
+    var times = Enumerable.Range(0, iters).Select(_ => Time(() => o = run(input).ToArray())).ToArray();
+    bool alive = (bool)ios.GetProperty("GpuAlive")!.GetValue(sess)!;
+    Report($"paddle-{(backend == "Metal" ? "mtl" : "vk")}", compileMs, first, times, $"gpuAlive={alive}");
+    ((IDisposable)sess).Dispose();
+    return o;
+}
+
+static double Time(Action a)
+{
+    long t0 = Stopwatch.GetTimestamp();
+    a();
+    return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+}
+
+void Report(string name, double compileMs, double first, double[] t, string extra)
+{
+    Array.Sort(t);
+    var p = Process.GetCurrentProcess();
+    p.Refresh();
+    Console.WriteLine($"{name,-9} load+compile={compileMs,7:F1}ms first={first,7:F1}ms median={t[t.Length / 2],7:F2}ms min={t[0],7:F2}ms " +
+        $"peakWS={(p.PeakWorkingSet64 - ws0) / 1048576.0,6:F1}MB(+base) private={p.PrivateMemorySize64 / 1048576.0,6:F1}MB {extra}");
+}
+
+delegate void ReshapeFn(ReadOnlySpan<int> shape);
+delegate ReadOnlySpan<float> RunFn(ReadOnlySpan<float> input);

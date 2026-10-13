@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC transposed conv, stride == kernel, no pad (non-overlapping taps):
+// o[oy,ox,o] = act(b[o] + sum_c x[oy/kh, ox/kw, c] * w[(tap*ic + c)*oc + o]), tap = (oy%kh)*kw + ox%kw.
+// flags: 1 bias, (flags >> 1) act: 1 relu, 2 sigmoid.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) readonly buffer W { ET w[]; };
+layout(set = 0, binding = 2) readonly buffer B { float b[]; };
+layout(set = 0, binding = 3) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint ic, ih, iw, oc, kh, kw, flags; } p;
+
+float fexp(float v)
+{
+    v = clamp(v, -87.3, 88.7);
+    float fx = v * 1.4426950408889634 + 0.5;
+    float nf = floor(fx);
+    float r = v - nf * 0.693359375 - nf * -0.00021219444005469058;
+    float poly = (((((1.9875691500e-4 * r + 1.3981999507e-3) * r + 8.3334519073e-3) * r
+        + 4.1665795894e-2) * r + 1.6666665459e-1) * r + 5.0000001201e-1) * r * r + r + 1.0;
+    return poly * uintBitsToFloat((uint(int(nf)) + 127u) << 23);
+}
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    uint ow = p.iw * p.kw, oh = p.ih * p.kh;
+    if (id >= oh * ow * p.oc) return;
+    uint oc = id % p.oc, px = id / p.oc;
+    uint ox = px % ow, oy = px / ow;
+    uint tap = (oy % p.kh) * p.kw + ox % p.kw;
+    uint xb = ((oy / p.kh) * p.iw + ox / p.kw) * p.ic, wb = tap * p.ic * p.oc + oc;
+    float s = (p.flags & 1u) != 0u ? b[oc] : 0.0;
+    for (uint c = 0u; c < p.ic; c++) s += float(x[xb + c]) * float(w[wb + c * p.oc]);
+    uint act = p.flags >> 1;
+    if (act == 1u) s = max(s, 0.0);
+    else if (act == 2u) s = 1.0 / (1.0 + fexp(-s));
+    o[id] = ET(s);
+}

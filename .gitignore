@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+*.user
+vstest*.log
+artifacts/
+.baseline-bin/
+*.log
+*.f32
+build/nupkgs/
+build/nuget.exe

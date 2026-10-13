@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- tools/render_icon.py draws the PNGs from the same geometry -->
+  <g transform="rotate(-10 512 512)">
+    <g fill="#8C90F5">
+      <rect x="120" y="327" width="112" height="40" rx="20"/>
+      <rect x="120" y="437" width="112" height="40" rx="20"/>
+      <rect x="120" y="547" width="112" height="40" rx="20"/>
+      <rect x="120" y="657" width="112" height="40" rx="20"/>
+      <rect x="792" y="327" width="112" height="40" rx="20"/>
+      <rect x="792" y="437" width="112" height="40" rx="20"/>
+      <rect x="792" y="547" width="112" height="40" rx="20"/>
+      <rect x="792" y="657" width="112" height="40" rx="20"/>
+    </g>
+    <rect x="240" y="240" width="544" height="544" rx="68" fill="#FFFFFF" stroke="#1F35E0" stroke-width="56"/>
+    <g stroke="#8C90F5" stroke-width="26" stroke-linecap="round">
+      <line x1="342" y1="512" x2="457" y2="402"/>
+      <line x1="342" y1="512" x2="457" y2="622"/>
+      <line x1="457" y1="402" x2="572" y2="512"/>
+      <line x1="457" y1="622" x2="572" y2="512"/>
+    </g>
+    <g fill="#1F35E0">
+      <circle cx="342" cy="512" r="40"/>
+      <circle cx="457" cy="402" r="40"/>
+      <circle cx="457" cy="622" r="40"/>
+      <circle cx="572" cy="512" r="40"/>
+      <rect x="647" y="353" width="90" height="48" rx="24"/>
+      <rect x="647" y="443" width="90" height="48" rx="24"/>
+      <rect x="647" y="533" width="90" height="48" rx="24"/>
+      <rect x="647" y="623" width="90" height="48" rx="24"/>
+    </g>
+  </g>
+</svg>
