@@ -425,6 +425,27 @@ internal static unsafe partial class Ops
             Nhwc.ChannelBroadcast(bVec ? a : b, bVec ? b : a, dst, last, op, aVec, act);
             return;
         }
+        // grouped trailing-vector broadcast (NHWC SE gate [N,1,1,C] against [N,H,W,C]): one channel
+        // vector per leading index
+        if (last > 1 && (aShape.SequenceEqual(outShape) != bShape.SequenceEqual(outShape)))
+        {
+            bool bSmall = aShape.SequenceEqual(outShape);
+            int[] vs = bSmall ? bShape : aShape;
+            int rank = outShape.Length, off = rank - vs.Length, d = 0, groups = 1;
+            int Dim(int i) => i - off >= 0 ? vs[i - off] : 1;
+            for (; d < rank - 1 && Dim(d) == outShape[d]; d++) groups *= outShape[d];
+            bool ok = Dim(rank - 1) == last && groups > 1;
+            for (int i = d; ok && i < rank - 1; i++) ok = Dim(i) == 1;
+            if (ok)
+            {
+                ReadOnlySpan<float> full = bSmall ? a : b, vec = bSmall ? b : a;
+                int block = n / groups;
+                for (int g = 0; g < groups; g++)
+                    Nhwc.ChannelBroadcast(full.Slice(g * block, block), vec.Slice(g * last, last),
+                        dst.Slice(g * block, block), last, op, !bSmall, act);
+                return;
+            }
+        }
         // inner-block broadcast: a full-shape, b constant over trailing dims
         if (avx && aShape.SequenceEqual(outShape))
         {

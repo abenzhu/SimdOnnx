@@ -46,8 +46,7 @@ internal static unsafe partial class Avx2Kernels
     private static void ApplyAct(ref F32x8 v, ActivationKind act)
     {
         if (act == ActivationKind.Relu) v = V256.Max(v, F32x8.Zero);
-        else if (act == ActivationKind.Sigmoid) v = SimdMath.SigmoidCore(v);
-        else if (act == ActivationKind.Gelu) v = SimdMath.GeluCore(v);
+        else if (act != ActivationKind.None) v = Nhwc.Act8(v, act);
     }
 
     // lane-wise fetch with pad resolution (edge chunks only)

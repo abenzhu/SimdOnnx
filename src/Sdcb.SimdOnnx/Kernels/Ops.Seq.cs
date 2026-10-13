@@ -9,6 +9,22 @@ namespace Sdcb.SimdOnnx.Kernels;
 // last-axis mean, Sqrt, average pooling.
 internal static unsafe partial class Ops
 {
+    /// <summary>dst = act(src) (layout-agnostic; src and dst may alias).</summary>
+    public static void Activation(ReadOnlySpan<float> src, Span<float> dst, ActivationKind act)
+    {
+        src.CopyTo(dst);
+        int n = dst.Length, chunk = 16384, tasks = (n + chunk - 1) / chunk;
+        fixed (float* d0 = dst)
+        {
+            float* d = d0;
+            Nhwc.For(tasks, (long)n * 4, t =>
+            {
+                int s = t * chunk;
+                Nhwc.ActRow(d + s, Math.Min(chunk, n - s), act, Nhwc.UseAvx);
+            });
+        }
+    }
+
     public static void Sqrt(ReadOnlySpan<float> src, Span<float> dst)
     {
         int i = 0, VL = Vector<float>.Count;

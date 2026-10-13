@@ -156,6 +156,8 @@ public sealed unsafe class InferenceSession : IDisposable
                 break;
             }
             case ExecOp.Sqrt: Ops.Sqrt(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
+            case ExecOp.HardSwish: Ops.Activation(GetIn(n.In[0]), GetSpan(n.Out[0]), ActivationKind.HardSwish); break;
+            case ExecOp.Swish: Ops.Activation(GetIn(n.In[0]), GetSpan(n.Out[0]), ActivationKind.Swish); break;
             case ExecOp.Softmax:
             {
                 int[] s = values[n.In[0]].Shape;
@@ -392,7 +394,8 @@ public sealed unsafe class InferenceSession : IDisposable
     private int[] PhysAligned(int v, int outV)
     {
         CValue a = _plan.Values[v], o = _plan.Values[outV];
-        if (o.Layout is not { } lo || Layout.IsIdentity(lo) || a.Shape.SequenceEqual(o.Shape)) return a.PhysShape;
+        if (o.Layout is not { } lo) return a.PhysShape;
+        // also for same-shape operands: an equivalent layout (size-1 dims) has its own PhysShape order
         int off = lo.Length - a.Shape.Length;
         int[] p = new int[lo.Length];
         for (int i = 0; i < lo.Length; i++) p[i] = lo[i] - off >= 0 ? a.Shape[lo[i] - off] : 1;

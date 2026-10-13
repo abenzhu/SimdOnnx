@@ -133,7 +133,7 @@ internal static class GraphCompiler
             bool fuse = Env.Flag("NOFUSE") != "1";
             if (fuse)
             {
-                Fuse(nodes, values, outputValue);
+                Fuse(nodes, values, outputValue, opt);
                 RunPasses(PassStage.Logical, nodes, values, outputValue, opt);
                 // NHWC-only kernels (CPU channels-last + GPU); the NCHW oracle plan keeps the plain ops
                 if (opt.Nhwc && Env.Flag("NOFUSE_UP") != "1")
@@ -211,7 +211,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Structural fusions over the exec node list (single consumer chains).</summary>
-        private static void Fuse(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        private static void Fuse(List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
         {
             // pass 1: Pad -> Conv  (fold reflect/constant padding into the conv)
             // pass 2: Conv -> Relu (activation epilogue)
@@ -239,6 +239,7 @@ internal static class GraphCompiler
             // Relu/Sigmoid/elementwise-tail fusions
             FuseBiasAdd(nodes, values, outputValue);
             FuseLayerNorm(nodes, values);
+            if (!opt.Gpu) FuseGatedAct(nodes, values, outputValue);
             for (int i = 0; i + 1 < nodes.Count; i++)
             {
                 ExecNode a = nodes[i], b = nodes[i + 1];
@@ -362,14 +363,16 @@ internal static class GraphCompiler
                     ExecOp.Relu => ActivationKind.Relu,
                     ExecOp.Gelu => ActivationKind.Gelu,
                     ExecOp.Sigmoid => ActivationKind.Sigmoid,
+                    ExecOp.HardSwish => ActivationKind.HardSwish,
+                    ExecOp.Swish => ActivationKind.Swish,
                     _ => ActivationKind.None,
                 };
                 bool ok = a.P switch
                 {
-                    ConvP => got is ActivationKind.Relu or ActivationKind.Gelu,
+                    ConvP => got is ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish,
                     ConvTP => got is ActivationKind.Relu or ActivationKind.Sigmoid,
                     PoolP or ResizeP or EwP => got == ActivationKind.Relu,
-                    GemmP => got is ActivationKind.Relu or ActivationKind.Gelu,
+                    GemmP => got is ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish,
                     _ => false,
                 };
                 if (!ok) continue;
@@ -602,6 +605,35 @@ internal static class GraphCompiler
                     else if (a.P is GemmP g2) { g2.BiasValue = bv; g2.Act = ep.Act; }
                     a.Out = [b.Out[0]];
                     nodes.RemoveAt(i);
+                    i--;
+                    break;
+                }
+            }
+        }
+
+        /// <summary>CPU plans: Mul(x, HardSigmoid(x)) → HardSwish(x), Mul(x, Sigmoid(x)) → Swish(x); conv/gemm
+        /// epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
+        private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode mul = nodes[i];
+                if (mul.Op != ExecOp.Elementwise || mul.P is not EwP { Op: EwOp.Mul, Act: ActivationKind.None } || mul.In.Length != 2) continue;
+                for (int k = 0; k < 2; k++)
+                {
+                    int x = mul.In[k], g = mul.In[1 - k];
+                    int gi = nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == g);
+                    if (gi < 0 || gi > i || nodes[gi].In[0] != x || g == outputValue || !SoleUse(nodes, g, i)
+                        || values.Any(v => v.AliasOf == g)) continue;
+                    ExecNode gate = nodes[gi];
+                    ExecOp op;
+                    if (gate.Op == ExecOp.Sigmoid) op = ExecOp.Swish;
+                    else if (gate.Op == ExecOp.HardSigmoid && gate.P is HardSigmoidP hp
+                        && MathF.Abs(hp.Alpha - 1f / 6f) < 1e-6f && hp.Beta == 0.5f) op = ExecOp.HardSwish;
+                    else continue;
+                    if (!values[mul.Out[0]].Shape.SequenceEqual(values[x].Shape)) continue;
+                    nodes[i] = new ExecNode { Op = op, In = [x], Out = mul.Out, P = null, SrcNode = mul.SrcNode, Name = mul.Name };
+                    nodes.RemoveAt(gi);
                     i--;
                     break;
                 }

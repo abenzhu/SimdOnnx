@@ -31,6 +31,8 @@ internal static unsafe partial class Nhwc
         ActivationKind.Relu => AdvSimd.Max(v, V4.Zero),
         ActivationKind.Sigmoid => SimdMath.SigmoidCore(v),
         ActivationKind.Gelu => SimdMath.GeluCore(v),
+        ActivationKind.HardSwish => v * AdvSimd.Min(AdvSimd.Max(AdvSimd.FusedMultiplyAdd(Vector128.Create(0.5f), v, Vector128.Create(1f / 6f)), V4.Zero), Vector128.Create(1f)),
+        ActivationKind.Swish => v * SimdMath.SigmoidCore(v),
         _ => v,
     };
 

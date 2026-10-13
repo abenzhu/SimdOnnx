@@ -27,10 +27,12 @@ internal enum ExecOp
     ReduceMean,      // mean over the last axis, keepdims
     Sqrt,
     AvgPool,         // NCHW average pooling (PoolP; count_include_pad = 0)
+    HardSwish,       // x * clamp(x / 6 + 0.5, 0, 1) (CPU plans: HardSigmoid + Mul)
+    Swish,           // x * sigmoid(x) (CPU plans: Sigmoid + Mul)
     Ext,             // consumer-registered operator (ExecNode.Ext)
 }
 
-internal enum ActivationKind { None, Relu, Sigmoid, Gelu }
+internal enum ActivationKind { None, Relu, Sigmoid, Gelu, HardSwish, Swish }
 
 internal enum PadMode { Constant, Reflect }
 

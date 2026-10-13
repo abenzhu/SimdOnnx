@@ -218,7 +218,8 @@ internal sealed class LayoutPlanner
                 SetOut(n, lo);
                 break;
             }
-            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.Copy or ExecOp.HardSigmoid or ExecOp.Sqrt:
+            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.Copy or ExecOp.HardSigmoid or ExecOp.Sqrt
+                or ExecOp.HardSwish or ExecOp.Swish:
                 SetOut(n, L(n.In[0]));
                 break;
             case ExecOp.Slice:

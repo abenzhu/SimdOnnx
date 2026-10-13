@@ -69,7 +69,9 @@ internal static unsafe partial class Nhwc
     internal static float ActS(float v, ActivationKind act) =>
         act == ActivationKind.Relu ? MathF.Max(v, 0f) :
         act == ActivationKind.Sigmoid ? 1f / (1f + MathF.Exp(-v)) :
-        act == ActivationKind.Gelu ? 0.5f * v * (1f + SimdMath.ErfScalar(v * 0.70710678f)) : v;
+        act == ActivationKind.Gelu ? 0.5f * v * (1f + SimdMath.ErfScalar(v * 0.70710678f)) :
+        act == ActivationKind.HardSwish ? v * MathF.Min(MathF.Max(v * (1f / 6f) + 0.5f, 0f), 1f) :
+        act == ActivationKind.Swish ? v / (1f + MathF.Exp(-v)) : v;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static F32x8 Act8(F32x8 v, ActivationKind act) => act switch
@@ -77,6 +79,8 @@ internal static unsafe partial class Nhwc
         ActivationKind.Relu => V256.Max(v, F32x8.Zero),
         ActivationKind.Sigmoid => SimdMath.SigmoidCore(v),
         ActivationKind.Gelu => SimdMath.GeluCore(v),
+        ActivationKind.HardSwish => v * V256.Min(V256.Max(Fma.MultiplyAdd(v, V256.Create(1f / 6f), V256.Create(0.5f)), F32x8.Zero), V256.Create(1f)),
+        ActivationKind.Swish => v * SimdMath.SigmoidCore(v),
         _ => v,
     };
 
