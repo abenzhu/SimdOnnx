@@ -52,6 +52,8 @@ foreach (string e in engines)
         "gcdr-compile" => CompileSweep(),
         "gcdr-ref" => RunGcdr(new G.Engine.CompileOptions(false)),
         "paddle" => RunPaddle(),
+        "gcdr-mem" => MemGcdr(),
+        "paddle-mem" => MemPaddle(),
         "gcdr-vk" => RunGcdrVk(),
         "paddle-vk" => RunPaddleGpu("Vulkan", "GpuBackend", "GpuSession"),
         "gcdr-mtl" => RunGcdrMtl(),
@@ -101,6 +103,49 @@ float[] CompileSweep()
         G.Engine.CompiledModel.Compile(m, [shape[0], shape[1], shape[2], w]).CreateSession().Dispose();
     Console.WriteLine($"compile: {compile:F2} ms, compile+pack+session: {sw.Elapsed.TotalMilliseconds / count:F2} ms per new shape");
     return RunGcdr();
+}
+
+// retained memory after compiling/running a sweep of widths (REC-like shape churn)
+int[][] MemShapes() => Enumerable.Range(0, 24).Select(i => new[] { shape[0], shape[1], shape[2], shape[3] + 16 * i }).ToArray();
+
+void MemReport(string name, long gc0, long priv0)
+{
+    var p = Process.GetCurrentProcess();
+    p.Refresh();
+    Console.WriteLine($"{name,-11} managed={(GC.GetTotalMemory(true) - gc0) / 1048576.0,7:F1}MB private={(p.PrivateMemorySize64 - priv0) / 1048576.0,7:F1}MB ws={p.WorkingSet64 / 1048576.0,7:F1}MB");
+}
+
+float[] MemGcdr()
+{
+    long gc0 = GC.GetTotalMemory(true), priv0 = Process.GetCurrentProcess().PrivateMemorySize64;
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    var cm = new G.Engine.CpuModel(m, new G.Engine.CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+    MemReport("gcdr-load", gc0, priv0);
+    foreach (int[] sh in MemShapes())
+    {
+        using var s = new G.Engine.InferenceSession(cm.Plan(sh));
+        s.Run();
+    }
+    MemReport("gcdr-sweep", gc0, priv0);
+    GC.KeepAlive(cm);
+    return [];
+}
+
+float[] MemPaddle()
+{
+    long gc0 = GC.GetTotalMemory(true), priv0 = Process.GetCurrentProcess().PrivateMemorySize64;
+    P.Model m = P.Model.Load(modelBytes);
+    MemReport("paddle-load", gc0, priv0);
+    using var s = new P.InferenceSession(m, shape, 1);
+    foreach (int[] sh in MemShapes())
+    {
+        float[] inp = new float[sh.Aggregate(1, (a, b) => a * b)];
+        using var s2 = new P.InferenceSession(m, sh, 1);
+        s2.Run(inp);
+    }
+    MemReport("paddle-sweep", gc0, priv0);
+    GC.KeepAlive(m);
+    return [];
 }
 
 float[] RunGcdr(G.Engine.CompileOptions? opt = null)
@@ -227,9 +272,13 @@ float[] RunPaddleGpu(string backend, string factory, string sessionType)
 
 static double Time(Action a)
 {
+    long a0 = GC.GetTotalAllocatedBytes(true);
     long t0 = Stopwatch.GetTimestamp();
     a();
-    return Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+    double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+    AllocStats.Bytes += GC.GetTotalAllocatedBytes(true) - a0;
+    AllocStats.Runs++;
+    return ms;
 }
 
 void Report(string name, double compileMs, double first, double[] t, string extra)
@@ -238,8 +287,16 @@ void Report(string name, double compileMs, double first, double[] t, string extr
     var p = Process.GetCurrentProcess();
     p.Refresh();
     Console.WriteLine($"{name,-9} load+compile={compileMs,7:F1}ms first={first,7:F1}ms median={t[t.Length / 2],7:F2}ms min={t[0],7:F2}ms " +
-        $"peakWS={(p.PeakWorkingSet64 - ws0) / 1048576.0,6:F1}MB(+base) private={p.PrivateMemorySize64 / 1048576.0,6:F1}MB {extra}");
+        $"peakWS={(p.PeakWorkingSet64 - ws0) / 1048576.0,6:F1}MB(+base) private={p.PrivateMemorySize64 / 1048576.0,6:F1}MB " +
+        $"alloc/run={(AllocStats.Runs == 0 ? 0 : AllocStats.Bytes / AllocStats.Runs / 1024.0),7:F1}KB {extra}");
+    AllocStats.Bytes = 0;
+    AllocStats.Runs = 0;
 }
 
 delegate void ReshapeFn(ReadOnlySpan<int> shape);
 delegate ReadOnlySpan<float> RunFn(ReadOnlySpan<float> input);
+
+static class AllocStats
+{
+    public static long Bytes, Runs;
+}

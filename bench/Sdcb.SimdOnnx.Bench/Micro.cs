@@ -63,6 +63,68 @@ internal static class Micro
                     Console.WriteLine($"DwBlockAvx 4px x 64ch x 25 taps: {ns:F1} ns/call  ({ns * 4.4 / (taps * 4 * 64 / 8.0):F2} cycles per vector FMA @4.4GHz)");
                 }
                 break;
+            case "compile":
+            {
+                // per-shape plan compile cost after the first (packs cached): micro compile <model.onnx> CxHxW
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] chw = args[2].Split('x').Select(int.Parse).ToArray();
+                var cm = new CpuModel(model, new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+                foreach (int n in new[] { 8, 16, 24, 32, 40, 1, 2, 3 })
+                {
+                    long al = GC.GetAllocatedBytesForCurrentThread();
+                    long t0 = Stopwatch.GetTimestamp();
+                    ExecPlan plan = cm.Plan(args.Length > 3 ? [1, chw[0], chw[1] + 32 * n, chw[2]] : [n, .. chw]);
+                    Console.Write($"alloc {(GC.GetAllocatedBytesForCurrentThread() - al) / 1024.0,8:F0}KB  ");
+                    double ms = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;
+                    t0 = Stopwatch.GetTimestamp();
+                    using (var s = new InferenceSession(plan)) { }
+                    Console.WriteLine($"N={n,-3} plan {ms,7:F2} ms   session {Stopwatch.GetElapsedTime(t0).TotalMilliseconds,6:F2} ms  nodes={plan.Nodes.Length}");
+                }
+                break;
+            }
+            case "plansize":
+            {
+                // retained bytes per cached plan: micro plansize <model.onnx> NxCxHxW
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
+                var cm = new CpuModel(model, new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+                cm.Plan(s0);
+                long m0 = GC.GetTotalMemory(true);
+                var keep = new List<ExecPlan>();
+                int step = args.Length > 3 ? int.Parse(args[3]) : 8;
+                for (int i = 1; i <= 16; i++) keep.Add(cm.Plan([s0[0], s0[1], s0[2], s0[3] + step * i]));
+                long m1 = GC.GetTotalMemory(true);
+                Console.WriteLine($"retained per plan: {(m1 - m0) / 16 / 1024.0:F1} KB");
+                ExecPlan p = keep[^1];
+                long floats = 0;
+                var seen = new HashSet<float[]>(ReferenceEqualityComparer.Instance);
+                foreach (CValue v in p.Values)
+                    if (v.Floats is { } f && seen.Add(f)) floats += f.Length;
+                Console.WriteLine($"values={p.Values.Length} nodes={p.Nodes.Length} distinct const floats={floats * 4 / 1024.0:F1} KB");
+                foreach (CValue v in p.Values.Where(v => v.Floats is { Length: > 4096 }).OrderByDescending(v => v.Floats!.Length).Take(8))
+                    Console.WriteLine($"  {v.Name,-40} [{string.Join('x', v.Shape)}] {v.Floats!.Length * 4 / 1024.0:F1} KB shared={keep[0].Values.Any(u => ReferenceEquals(u.Floats, v.Floats))}");
+                break;
+            }
+            case "packsize":
+            {
+                // packed-weight bytes vs raw weights: micro packsize <model.onnx> NxCxHxW
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
+                long gc0 = GC.GetTotalMemory(true);
+                var cm = new CpuModel(model, new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+                ExecPlan p = cm.Plan(s0);
+                long gc1 = GC.GetTotalMemory(true);
+                long w = 0, u = 0, raw = 0;
+                foreach (ExecNode n in p.Nodes)
+                    if (n.P is ConvP { KernelPlan: NhwcConvPlan kp })
+                    {
+                        w += kp.W.Length; u += kp.WinoU?.Length ?? 0;
+                        raw += p.Values[n.In[1]].Floats?.Length ?? 0;
+                    }
+                Console.WriteLine($"conv raw={raw * 4 / 1048576.0:F2}MB packedW={w * 4 / 1048576.0:F2}MB winoU={u * 4 / 1048576.0:F2}MB  model+plan managed={(gc1 - gc0) / 1048576.0:F2}MB");
+                GC.KeepAlive(cm);
+                break;
+            }
             case "dw":
             {
                 foreach ((int h, int w, int c, int k, int s) in new[] { (5, 80, 64, 5, 1), (40, 80, 8, 3, 1), (20, 80, 16, 3, 1), (6, 80, 48, 3, 1) })

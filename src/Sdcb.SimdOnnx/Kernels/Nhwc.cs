@@ -38,10 +38,19 @@ internal static unsafe partial class Nhwc
     internal static ParallelOptions PO => Par.Options;
     internal static bool UseAvx => Avx2.IsSupported && Fma.IsSupported;
 
+    /// <summary>
+    /// body(0..n-1), split into min(threads, n) contiguous static shards when <paramref name="work"/>
+    /// (≈ MAC/64 for dense convs) is worth a fork; rows of one kernel cost about the same.
+    /// </summary>
     internal static void For(int n, long work, Action<int> body)
     {
-        if (work < 32768 || n == 1 || Par.Threads == 1) { for (int i = 0; i < n; i++) body(i); return; }
-        Par.For(0, n, body);
+        int threads = Par.Threads;
+        if (work < 32768 || n == 1 || threads == 1) { for (int i = 0; i < n; i++) body(i); return; }
+        int shards = Math.Min(threads, n);
+        Par.For(0, shards, w =>
+        {
+            for (int i = (int)((long)n * w / shards), e = (int)((long)n * (w + 1) / shards); i < e; i++) body(i);
+        });
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -154,11 +163,27 @@ internal static unsafe partial class Nhwc
     }
 
     // ======================== conv ========================
+    /// <summary>NHWC conv over <paramref name="batch"/> contiguous images ([batch, ih, iw, ic] → [batch, oh, ow, oc]).</summary>
     public static void Conv(ReadOnlySpan<float> src, int ih, int iw, int ic,
-        Span<float> dst, int oh, int ow, int oc, ConvP p, NhwcConvPlan kp, ReadOnlySpan<float> add)
+        Span<float> dst, int oh, int ow, int oc, ConvP p, NhwcConvPlan kp, ReadOnlySpan<float> add, int batch = 1)
     {
         if (!add.IsEmpty && add.Length != dst.Length)
             throw new NotSupportedException($"conv residual addend has {add.Length} elems, expected {dst.Length}.");
+        if (batch > 1 && p.Kernel is [1, 1] && p.Strides is [1, 1] && p.Pads.All(x => x == 0))
+        {
+            // pointwise: the batch folds into the row dimension
+            ih *= batch;
+            oh *= batch;
+            batch = 1;
+        }
+        if (batch > 1 && (kp.WinoU is not null || (UseAvx512 && !kp.Depthwise)))
+        {
+            int inImg = ih * iw * ic, outImg = oh * ow * oc;
+            for (int b = 0; b < batch; b++)
+                Conv(src.Slice(b * inImg, inImg), ih, iw, ic, dst.Slice(b * outImg, outImg), oh, ow, oc, p, kp,
+                    add.IsEmpty ? add : add.Slice(b * outImg, outImg));
+            return;
+        }
         if (kp.WinoU is not null)
         {
             WinogradConv(src, ih, iw, ic, dst, oh, ow, oc, p, kp, add);
@@ -170,29 +195,30 @@ internal static unsafe partial class Nhwc
         float[] padVec = new float[ic * kw + Ob];   // one constant-pad kernel row (Dense512 row runs)
         Array.Fill(padVec, p.PadValue);
         if (kp.Depthwise)
-            Depthwise(src, iw, ic, dst, oh, ow, kh, kw, p.Strides[1], rm, cm, padVec, p.PadValue, kp, add, p.Act);
+            Depthwise(src, ih, iw, ic, dst, oh, ow, kh, kw, p.Strides[1], rm, cm, padVec, p.PadValue, kp, add, p.Act, batch);
         else if (UseAvx512)
             Dense512(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
         else
-            Dense(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
+            Dense(src, ih, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act, batch);
     }
 
-    internal static void Dense(ReadOnlySpan<float> src, int iw, int ic, Span<float> dst,
+    internal static void Dense(ReadOnlySpan<float> src, int ih, int iw, int ic, Span<float> dst,
         int oh, int ow, int oc, int kh, int kw, int[] rm, int[] cm, float[] padVec,
-        NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
+        NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act, int batch = 1)
     {
-        int taps = kh * kw, nb = kp.Blocks;
+        int taps = kh * kw, nb = kp.Blocks, perImg = oh * nb;
+        long inImg = (long)ih * iw * ic, outImg = (long)oh * ow * oc;
         bool hasAdd = !add.IsEmpty, avx = UseAvx;
         fixed (float* sp0 = src, dp0 = dst, ap0 = add, wp0 = kp.W, bp0 = kp.Bias, pv0 = padVec)
         fixed (int* rm0 = rm, cm0 = cm)
         {
             var a = new DenseArgs(sp0, wp0, bp0, pv0, rm0, cm0, iw, ic, ow, oc, kh, kw, nb, act, avx);
             float* dp = dp0, ap = ap0;
-            For(oh * nb, (long)oh * ow * oc * taps * ic / 64, t =>
+            For(batch * perImg, batch * outImg * taps * ic / 64, t =>
             {
-                int y = t / nb, blk = t % nb;
-                long o = (long)y * ow * oc;
-                DenseRow(a, y, blk, dp + o, hasAdd ? ap + o : null);
+                int b = t / perImg, r = t - b * perImg, y = r / nb, blk = r % nb;
+                long o = b * outImg + (long)y * ow * oc;
+                DenseRow(b == 0 ? a : a.WithSrc(a.Src + b * inImg), y, blk, dp + o, hasAdd ? ap + o : null);
             });
         }
     }
@@ -206,6 +232,8 @@ internal static unsafe partial class Nhwc
         public readonly int Iw = iw, Ic = ic, Ow = ow, Oc = oc, Kh = kh, Kw = kw, Nb = nb;
         public readonly ActivationKind Act = act;
         public readonly bool Avx = avx;
+
+        public DenseArgs WithSrc(float* s) => new(s, W, Bias, PadVec, Rm, Cm, Iw, Ic, Ow, Oc, Kh, Kw, Nb, Act, Avx);
     }
 
     /// <summary>Output row <paramref name="y"/>, oc block <paramref name="blk"/> of a direct conv
@@ -430,9 +458,9 @@ internal static unsafe partial class Nhwc
 
     [ThreadStatic] private static float[]? t_padRow;
 
-    internal static void Depthwise(ReadOnlySpan<float> src, int iw, int c, Span<float> dst,
+    internal static void Depthwise(ReadOnlySpan<float> src, int ih, int iw, int c, Span<float> dst,
         int oh, int ow, int kh, int kw, int sw, int[] rm, int[] cm, float[] padVec, float padValue,
-        NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
+        NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act, int batch = 1)
     {
         bool hasAdd = !add.IsEmpty;
         // a whole constant-pad source row, so out-of-range kernel rows of interior pixels need no pointer table
@@ -445,31 +473,49 @@ internal static unsafe partial class Nhwc
         fixed (float* sp0 = src, dp0 = dst, ap0 = add, wp0 = kp.W, bp0 = kp.Bias, pv0 = padVec)
         fixed (int* rm0 = rm, cm0 = cm)
         {
-            var a = new DwArgs(sp0, dp0, hasAdd ? ap0 : null, wp0, bp0, pv0, padRow, rm0, cm0, iw, c, ow, kh, kw, sw, act);
-            if (Par.Threads == 1 || (long)oh * ow * c * kh * kw < 32768)
-                for (int y = 0; y < oh; y++) DwRow(a, y);
+            var a = new DwArgs(sp0, dp0, hasAdd ? ap0 : null, wp0, bp0, pv0, padRow, rm0, cm0, iw, c, oh, ow, kh, kw, sw,
+                (long)ih * iw * c, (long)oh * ow * c, padValue == 0f, act);
+            long macs = (long)batch * oh * ow * c * kh * kw;
+            if (Par.Threads == 1 || macs < 1_000_000)
+                for (int t = 0; t < batch * oh; t++) DwRow(a, t);
             else
-                Par.For(0, oh, y => DwRow(a, y));
+                For(batch * oh, macs, t => DwRow(a, t));
         }
     }
 
     /// <summary>Per-call depthwise constants (pointers into pinned/fixed storage).</summary>
     internal readonly struct DwArgs(float* sp, float* dp, float* ap, float* wp, float* bp, float* pv, float* padRow,
-        int* rm, int* cm, int iw, int c, int ow, int kh, int kw, int sw, ActivationKind act)
+        int* rm, int* cm, int iw, int c, int oh, int ow, int kh, int kw, int sw, long inImg, long outImg, bool clipRows, ActivationKind act)
     {
         public readonly float* Sp = sp, Dp = dp, Ap = ap, Wp = wp, Bp = bp, Pv = pv, PadRow = padRow;
         public readonly int* Rm = rm, Cm = cm;
-        public readonly int Iw = iw, C = c, Ow = ow, Kh = kh, Kw = kw, Sw = sw;
+        public readonly int Iw = iw, C = c, Oh = oh, Ow = ow, Kh = kh, Kw = kw, Sw = sw;
+        public readonly long InImg = inImg, OutImg = outImg;
+        /// <summary>Constant pad 0: out-of-range kernel rows contribute nothing and are skipped.</summary>
+        public readonly bool ClipRows = clipRows;
         public readonly ActivationKind Act = act;
     }
 
     // a static row body: pointer stores in a closure would force every captured value to be reloaded
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void DwRow(in DwArgs a, int y)
+    private static void DwRow(in DwArgs a, int t)
     {
-        float* sp = a.Sp, dp = a.Dp, ap = a.Ap, wp = a.Wp, bp = a.Bp, pv = a.Pv;
+        int img = t / a.Oh, y = t - img * a.Oh;
+        float* sp = a.Sp + img * a.InImg, dp = a.Dp + img * a.OutImg, ap = a.Ap == null ? null : a.Ap + img * a.OutImg;
+        float* wp = a.Wp, bp = a.Bp, pv = a.Pv;
         int* cmp = a.Cm, rmy = a.Rm + y * a.Kh;
-        int iw = a.Iw, c = a.C, ow = a.Ow, kh = a.Kh, kw = a.Kw, taps = kh * kw;
+        int iw = a.Iw, c = a.C, ow = a.Ow, kh = a.Kh, kw = a.Kw;
+        if (a.ClipRows)
+        {
+            // zero-padded rows: run only the in-range kernel rows (contiguous for constant padding)
+            int kyB = 0, kyE = kh;
+            while (kyB < kyE && rmy[kyB] < 0) kyB++;
+            while (kyE > kyB && rmy[kyE - 1] < 0) kyE--;
+            rmy += kyB;
+            wp += (long)kyB * kw * c;
+            kh = kyE - kyB;
+        }
+        int taps = kh * kw;
         ActivationKind act = a.Act;
         bool avx = UseAvx, neon = UseNeon;
         int VL = Vector<float>.Count, sw = a.Sw;

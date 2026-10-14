@@ -291,20 +291,10 @@ public sealed unsafe class InferenceSession : IDisposable
                             p, (NhwcConvPlan)p.KernelPlan!);
                     return true;
                 }
-                if (nb > 1 && p.Kernel is [1, 1] && p.Strides is [1, 1] && p.Pads.All(x => x == 0))
-                {
-                    // pointwise: the batch folds into the row dimension
-                    ReadOnlySpan<float> addAll = p.AddValue >= 0 ? GetIn(p.AddValue) : ReadOnlySpan<float>.Empty;
-                    Nhwc.Conv(GetIn(n.In[0]), nb * i[1], i[2], i[3], GetSpan(n.Out[0]), nb * o[1], o[2], o[3],
-                        p, (NhwcConvPlan)p.KernelPlan!, addAll);
-                    return true;
-                }
-                for (int b = 0; b < nb; b++)
-                {
-                    ReadOnlySpan<float> add = p.AddValue >= 0 ? Img(p.AddValue, b, nb) : ReadOnlySpan<float>.Empty;
-                    Nhwc.Conv(Img(n.In[0], b, nb), i[1], i[2], i[3], ImgOut(n.Out[0], b, nb), o[1], o[2], o[3],
-                        p, (NhwcConvPlan)p.KernelPlan!, add);
-                }
+                // one call for the whole batch: kernels shard batch × rows in a single parallel region
+                ReadOnlySpan<float> addAll = p.AddValue >= 0 ? GetIn(p.AddValue) : ReadOnlySpan<float>.Empty;
+                Nhwc.Conv(GetIn(n.In[0]), i[1], i[2], i[3], GetSpan(n.Out[0]), o[1], o[2], o[3],
+                    p, (NhwcConvPlan)p.KernelPlan!, addAll, nb);
                 return true;
             }
             case ExecOp.MaxPool:
