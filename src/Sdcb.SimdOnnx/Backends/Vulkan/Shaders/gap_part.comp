@@ -1,0 +1,30 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC global average pool, pass 1 of 2: fp32 partial sums of one pixel chunk.
+// part[(img * chunks + chunk) * c + ch]; workgroup = 64 channels x 4 pixel lanes; (x, y, z) = (ch group, chunk, image).
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer P { float part[]; };
+
+layout(push_constant) uniform PC { uint c, hw, per; } p;
+
+shared float red[4][64];
+
+void main()
+{
+    uint lx = gl_LocalInvocationID.x, ly = gl_LocalInvocationID.y;
+    uint ch = gl_WorkGroupID.x * 64u + lx, img = gl_WorkGroupID.z;
+    uint px0 = gl_WorkGroupID.y * p.per, px1 = min(px0 + p.per, p.hw);
+    float s = 0.0;
+    if (ch < p.c)
+    {
+        uint base = img * p.hw;
+        for (uint px = px0 + ly; px < px1; px += 4u) s += float(x[(base + px) * p.c + ch]);
+    }
+    red[ly][lx] = s;
+    barrier();
+    if (ly == 0u && ch < p.c)
+        part[(img * gl_NumWorkGroups.y + gl_WorkGroupID.y) * p.c + ch] = red[0][lx] + red[1][lx] + red[2][lx] + red[3][lx];
+}

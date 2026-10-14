@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC global average pool, pass 2 of 2: o[img * c + ch] = inv * sum over chunks of gap_part's partials.
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer P { float part[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint c, chunks; float inv; } p;
+
+void main()
+{
+    uint ch = gl_GlobalInvocationID.x, img = gl_WorkGroupID.y;
+    if (ch >= p.c) return;
+    float s = 0.0;
+    for (uint k = 0u; k < p.chunks; k++) s += part[(img * p.chunks + k) * p.c + ch];
+    o[img * p.c + ch] = ET(s * p.inv);
+}

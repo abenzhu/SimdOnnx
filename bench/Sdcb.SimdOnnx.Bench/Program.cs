@@ -232,12 +232,17 @@ float[] VkShapes()
     var be = G.Backends.Vulkan.VkBackend.Default;
     var opt = new G.Engine.CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true);
     long gc0 = GC.GetTotalMemory(true);
-    for (int i = 0; i < 12; i++)
+    // VKSHAPES_N = shape count, VKSHAPES_STEP = width step (0 = same shape every time)
+    int nShapes = int.TryParse(Environment.GetEnvironmentVariable("VKSHAPES_N"), out int ns) ? ns : 12;
+    int step = int.TryParse(Environment.GetEnvironmentVariable("VKSHAPES_STEP"), out int st) ? st : 32;
+    for (int i = 0; i < nShapes; i++)
     {
-        int[] sh = [shape[0], shape[1], shape[2], shape[3] + 32 * i];
+        int[] sh = [shape[0], shape[1], shape[2], shape[3] + step * i];
         var sw = Stopwatch.StartNew();
+        long al0 = GC.GetTotalAllocatedBytes(true);
         var g = be.AcquireGraph(m, sh, opt);
         double tg = sw.Elapsed.TotalMilliseconds;
+        double galloc = (GC.GetTotalAllocatedBytes(true) - al0) / 1048576.0;
         sw.Restart();
         using var s = new G.Backends.Vulkan.VkInferenceSession(be.Dev, g.Plan, g);
         g.Release();
@@ -248,7 +253,7 @@ float[] VkShapes()
         sw.Restart();
         s.Run();
         double tr2 = sw.Elapsed.TotalMilliseconds;
-        Console.WriteLine($"[{string.Join('x', sh)}] graph {tg,7:F2} ms  session {ts,6:F2} ms  run1 {tr,6:F2} ms  run2 {tr2,6:F2} ms  managed +{(GC.GetTotalMemory(true) - gc0) / 1048576.0,6:F1} MB consts#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(g.Consts)} {g.ConstBytes / 1048576.0:F1}MB");
+        Console.WriteLine($"[{string.Join('x', sh)}] graph {tg,7:F2} ms  session {ts,6:F2} ms  run1 {tr,6:F2} ms  run2 {tr2,6:F2} ms  managed +{(GC.GetTotalMemory(true) - gc0) / 1048576.0,6:F1} MB consts#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(g.Consts)} {g.ConstBytes / 1048576.0:F1}MB galloc={galloc:F1}MB ws={Process.GetCurrentProcess().WorkingSet64 / 1048576.0:F0}MB priv={Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0:F0}MB");
     }
     return [];
 }
@@ -266,8 +271,15 @@ float[] RunGcdrVk()
     Report("gcdr-vk", compileMs, first, times, $"f16={s.F16} gpu-arena={s.Arena.Size / 1048576.0:F1}MB");
     float[] o = s.Output.ToArray();
     if (prof)
-        foreach (var (name, ms) in s.DebugProfile().OrderByDescending(kv => kv.Value))
-            Console.WriteLine($"    {name,-16} {ms,7:F3}ms");
+    {
+        var agg = s.DebugProfile();
+        Console.WriteLine($"    gpu sum {agg.Values.Sum():F3}ms over {s.PerDispatch!.Length} dispatches");
+        foreach (var (name, ms) in agg.OrderByDescending(kv => kv.Value))
+            Console.WriteLine($"    {name,-16} {ms,7:F3}ms  n={s.PerDispatch!.Count(d => d.Name.StartsWith(name))}");
+        if (Environment.GetEnvironmentVariable("PROF_ALL") == "1")
+            foreach (var (name, ms) in s.PerDispatch!.OrderByDescending(d => d.Ms).Take(40))
+                Console.WriteLine($"      {ms,7:F3}ms {name}");
+    }
     return o;
 }
 

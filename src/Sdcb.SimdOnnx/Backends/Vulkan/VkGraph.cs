@@ -45,7 +45,7 @@ internal sealed class VkGraphModel : IDisposable
     private int _refs = 1;  // the graph cache holds the first reference
     private readonly VkConstStore _store;
     internal readonly VkBuffer Consts;       // all const tensors, backend-packed (shared store)
-    private readonly Dictionary<(int v, CK k), ulong> _constOff = new();
+    private readonly Dictionary<(int v, CK k), (VkBuffer buf, ulong off)> _constOff = new();
     internal readonly VkBuffer Dummy;        // 64B zero buffer for unused bindings
     internal readonly VkDispatch[] Dispatches;
     internal readonly ulong ConstBytes;
@@ -53,6 +53,12 @@ internal sealed class VkGraphModel : IDisposable
     internal readonly bool F16;
     /// <summary>Bytes per stored activation element.</summary>
     internal int Es => F16 ? 2 : 4;
+    /// <summary>Backend cache recency stamp.</summary>
+    internal long LastUse;
+    /// <summary>Arena bytes a session needs: the plan's activations, then this graph's scratch.</summary>
+    internal ulong ArenaBytes => _scratchOff + _scratchBytes;
+    private readonly ulong _scratchOff;
+    private ulong _scratchBytes;
 
 
     /// <param name="constKey">Sharing key for the const store (the source model): graphs of the
@@ -108,14 +114,15 @@ internal sealed class VkGraphModel : IDisposable
             if (k == CK.Raw && cv.Layout is { } l && !Engine.Layout.IsIdentity(l))
                 throw new NotSupportedException($"Vulkan: const '{cv.Name}' with non-identity layout");
         }
-        float[][] srcs = need.Select(x => plan.Values[x.v].Floats!).ToArray();
-        int[] kinds = need.Select(x => x.k.Id).ToArray();
-        _store = VkConstStore.Acquire(dev, constKey, f16, srcs, kinds, () => GpuPack.Build(plan, need, f16));
-        for (int i = 0; i < need.Count; i++) _constOff[need[i]] = _store.Offsets[i];
-        Consts = _store.Consts;
+        var items = need.Select(x => (plan.Values[x.v].Floats!, x.k.Id, plan.Values[x.v].Shape)).ToArray();
+        _store = VkConstStore.Acquire(dev, constKey, f16);
+        var placed = _store.Place(items, miss => GpuPack.Build(plan, miss.Select(i => need[i]).ToList(), f16));
+        for (int i = 0; i < need.Count; i++) _constOff[need[i]] = placed[i];
+        Consts = _store.Primary;
         Dummy = _store.Dummy;
         ConstBytes = _store.Bytes;
 
+        _scratchOff = ((ulong)plan.ArenaFloats * (ulong)Es + 255) & ~255UL;
         var disps = new List<VkDispatch>();
         NodeRanges = new (int start, int count)[plan.Nodes.Length];
         for (int i = 0; i < plan.Nodes.Length; i++)
@@ -164,6 +171,13 @@ internal sealed class VkGraphModel : IDisposable
     internal readonly (int start, int count)[] NodeRanges;
 
     // ---- value → bind resolution (byte offsets/sizes: all long math) ----
+    /// <summary>Transient arena space past the plan's values; one region, reused by every dispatch pair.</summary>
+    internal VkBind Scratch(ulong bytes)
+    {
+        _scratchBytes = Math.Max(_scratchBytes, bytes);
+        return new VkBind(VkSlot.Arena, _scratchOff, bytes);
+    }
+
     internal VkBind Bind(int valueId, CK? kind = null)
     {
         kind ??= CK.Raw;
@@ -171,11 +185,11 @@ internal sealed class VkGraphModel : IDisposable
         if (v.Buf >= 0)
             return new VkBind(VkSlot.Arena, (ulong)_plan.BufOffset[v.Buf] * (ulong)Es,
                 (ulong)Math.Max(v.ElementCount, 1) * (ulong)Es);
-        if (_constOff.TryGetValue((valueId, kind), out ulong off))
+        if (_constOff.TryGetValue((valueId, kind), out var c))
         {
             ulong es = F16 && !kind.Fp32 ? 2UL : 4UL;
             long elems = kind.Elems?.Invoke(v) ?? Math.Max(v.ElementCount, 1);
-            return new VkBind(VkSlot.Consts, off, (ulong)elems * es);
+            return new VkBind(c.buf, c.off, (ulong)elems * es);
         }
         if (v.Floats != null)
             throw new InvalidOperationException($"const value '{v.Name}' not packed as {kind}");
@@ -572,9 +586,18 @@ internal sealed class VkGraphModel : IDisposable
             {
                 RequireNhwc(n.In[0]);
                 int[] si = nhwcIn(0);
-                uint hw = (uint)si[1] * (uint)si[2];
-                yield return ND("gap", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOfF([(uint)si[3], hw], 1f / hw), ((uint)si[3] + 63) / 64, (uint)si[0]);
+                uint hw = (uint)si[1] * (uint)si[2], c = (uint)si[3], cg = (c + 63) / 64;
+                if (hw <= 512)
+                {
+                    yield return ND("gap", [Bind(n.In[0]), Bind(n.Out[0])], PcOfF([c, hw], 1f / hw), cg, (uint)si[0]);
+                    break;
+                }
+                // large planes: one workgroup per image starves the GPU; reduce pixel chunks in parallel
+                uint chunks = Math.Min((hw + 255) / 256, 1024u), per = (hw + chunks - 1) / chunks;
+                chunks = (hw + per - 1) / per;
+                VkBind part = Scratch((ulong)si[0] * chunks * c * 4);
+                yield return ND("gap_part", [Bind(n.In[0]), part], PcOf(c, hw, per), cg, chunks, (uint)si[0]);
+                yield return ND("gap_sum", [part, Bind(n.Out[0])], PcOfF([c, chunks], 1f / hw), cg, (uint)si[0]);
                 break;
             }
 

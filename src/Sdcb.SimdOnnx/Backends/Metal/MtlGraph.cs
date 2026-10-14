@@ -29,78 +29,103 @@ internal sealed class MtlDispatch
 }
 
 /// <summary>
-/// Device-side const tensors (backend-packed weights) plus a 64B zero buffer,
-/// shared by every <see cref="MtlGraphModel"/> of one model: per-size plans copy
-/// the same initializers, so instead of re-packing and re-uploading the weights
-/// per input size, a new graph whose const list is element-for-element identical
-/// (same consumer packing, same contents) reuses the existing buffer. A graph
-/// whose consts differ gets a private, unshared store. Ref-counted; the
-/// buffers are freed when the last graph releases.
+/// Device-side const tensors (backend-packed weights) plus a 64B zero buffer, pooled per
+/// (device, model): every <see cref="MtlGraphModel"/> of a model — any input size, any output
+/// truncation — binds the same packed entries. Entries are keyed by source array and consumer
+/// packing (content-compared when a plan re-materialized an array); a graph that needs entries the
+/// pool lacks uploads only those, as one more chunk. Ref-counted per graph; every chunk is freed
+/// when the last graph releases. Mirrors the Vulkan VkConstStore.
 /// </summary>
 internal sealed class MtlConstStore
 {
     private static readonly Dictionary<(MtlDevice dev, object key), MtlConstStore> s_shared = new();
 
+    private readonly MtlDevice _dev;
     private readonly (MtlDevice, object)? _key;
-    private readonly float[][] _src;
-    private readonly int[] _kinds;
+    private readonly List<Entry> _entries = new();
+    private readonly Dictionary<(float[] src, int kind), int> _byRef = new(RefKey.Instance);
+    private readonly List<MtlBuffer> _chunks = new();
     private int _refs = 1;
-    internal readonly MtlBuffer Consts, Dummy;
-    internal readonly ulong[] Offsets;
-    internal readonly ulong Bytes;
+    internal readonly MtlBuffer Dummy;
+    internal ulong Bytes { get; private set; }
+    internal MtlBuffer Primary => _chunks.Count > 0 ? _chunks[0] : Dummy;
 
-    private MtlConstStore(MtlDevice dev, (MtlDevice, object)? key, float[][] src, int[] kinds,
-        ulong[] offsets, byte[] host)
+    private readonly record struct Entry(float[] Src, int Kind, int[] Shape, MtlBuffer Buf, ulong Off);
+
+    private MtlConstStore(MtlDevice dev, (MtlDevice, object)? key)
     {
+        _dev = dev;
         _key = key;
-        _src = src;
-        _kinds = kinds;
-        Offsets = offsets;
-        Bytes = (ulong)host.LongLength;
         unsafe
         {
-            fixed (byte* hp = host) Consts = dev.NewBuffer(hp, (nuint)host.Length);
             byte* z = stackalloc byte[64];
             new Span<byte>(z, 64).Clear();
             Dummy = dev.NewBuffer(z, 64);
         }
     }
 
-    /// <summary>
-    /// Returns a store holding <paramref name="src"/> (kinds = consumer packing ids),
-    /// shared under <paramref name="key"/> when an identical list was uploaded before.
-    /// <paramref name="pack"/> (offsets, host bytes) only runs when a new store is built.
-    /// </summary>
-    internal static MtlConstStore Acquire(MtlDevice dev, object? key, float[][] src, int[] kinds,
-        Func<(ulong[] offsets, byte[] host)> pack)
+    internal static MtlConstStore Acquire(MtlDevice dev, object? key)
     {
-        if (key is null)
-        {
-            var (o, h) = pack();
-            return new MtlConstStore(dev, null, src, kinds, o, h);
-        }
+        if (key is null) return new MtlConstStore(dev, null);
         var k = (dev, key);
         lock (s_shared)
         {
-            if (s_shared.TryGetValue(k, out MtlConstStore? s) && s.Matches(src, kinds))
+            if (s_shared.TryGetValue(k, out MtlConstStore? s))
             {
                 s._refs++;
                 return s;
             }
-            var (offs, host) = pack();
-            bool share = s is null;   // keep the first registered store on a mismatch
-            var ns = new MtlConstStore(dev, share ? k : null, src, kinds, offs, host);
-            if (share) s_shared[k] = ns;
-            return ns;
+            s = new MtlConstStore(dev, k);
+            s_shared[k] = s;
+            return s;
         }
     }
 
-    private bool Matches(float[][] src, int[] kinds)
+    /// <summary>Buffer + byte offset of every item, uploading the missing ones as a new chunk.</summary>
+    internal (MtlBuffer buf, ulong off)[] Place(IReadOnlyList<(float[] src, int kind, int[] shape)> items,
+        Func<int[], (ulong[] offsets, byte[] host)> pack)
     {
-        if (src.Length != _src.Length || !kinds.AsSpan().SequenceEqual(_kinds)) return false;
-        for (int i = 0; i < src.Length; i++)
-            if (!ReferenceEquals(src[i], _src[i]) && !src[i].AsSpan().SequenceEqual(_src[i])) return false;
-        return true;
+        var placed = new (MtlBuffer buf, ulong off)[items.Count];
+        lock (_entries)
+        {
+            var missing = new List<int>();
+            for (int i = 0; i < items.Count; i++)
+            {
+                int e = Find(items[i].src, items[i].kind, items[i].shape);
+                if (e >= 0) placed[i] = (_entries[e].Buf, _entries[e].Off);
+                else missing.Add(i);
+            }
+            if (missing.Count == 0) return placed;
+            var (offs, host) = pack(missing.ToArray());
+            MtlBuffer chunk;
+            unsafe { fixed (byte* hp = host) chunk = _dev.NewBuffer(hp, (nuint)host.Length); }
+            _chunks.Add(chunk);
+            Bytes += (ulong)host.LongLength;
+            for (int j = 0; j < missing.Count; j++)
+            {
+                var (src, kind, shape) = items[missing[j]];
+                _byRef[(src, kind)] = _entries.Count;
+                _entries.Add(new Entry(src, kind, shape, chunk, offs[j]));
+                placed[missing[j]] = (chunk, offs[j]);
+            }
+        }
+        return placed;
+    }
+
+    private int Find(float[] src, int kind, int[] shape)
+    {
+        if (_byRef.TryGetValue((src, kind), out int e) && _entries[e].Shape.AsSpan().SequenceEqual(shape)) return e;
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            Entry x = _entries[i];
+            if (x.Kind == kind && x.Src.Length == src.Length && x.Shape.AsSpan().SequenceEqual(shape)
+                && x.Src.AsSpan().SequenceEqual(src))
+            {
+                _byRef[(src, kind)] = i;
+                return i;
+            }
+        }
+        return -1;
     }
 
     internal void Release()
@@ -111,8 +136,16 @@ internal sealed class MtlConstStore
             if (_key is { } k && s_shared.TryGetValue(k, out MtlConstStore? cur) && cur == this)
                 s_shared.Remove(k);
         }
-        Consts.Dispose();
+        foreach (MtlBuffer c in _chunks) c.Dispose();
         Dummy.Dispose();
+    }
+
+    private sealed class RefKey : IEqualityComparer<(float[] src, int kind)>
+    {
+        internal static readonly RefKey Instance = new();
+        public bool Equals((float[] src, int kind) a, (float[] src, int kind) b) => ReferenceEquals(a.src, b.src) && a.kind == b.kind;
+        public int GetHashCode((float[] src, int kind) k) =>
+            System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(k.src) * 31 + k.kind;
     }
 }
 
@@ -130,7 +163,7 @@ internal sealed class MtlGraphModel : IDisposable
     private int _refs = 1;  // the graph cache holds the first reference
     private readonly MtlConstStore _store;
     internal readonly MtlBuffer Consts;       // all const tensors, backend-packed (shared store)
-    private readonly Dictionary<(int v, CK k), ulong> _constOff = new();
+    private readonly Dictionary<(int v, CK k), (MtlBuffer buf, ulong off)> _constOff = new();
     internal readonly MtlBuffer Dummy;        // 64B zero buffer for unused bindings
     internal readonly MtlDispatch[] Dispatches;
     internal readonly ulong ConstBytes;
@@ -192,11 +225,11 @@ internal sealed class MtlGraphModel : IDisposable
             if (k == CK.Raw && cv.Layout is { } l && !Engine.Layout.IsIdentity(l))
                 throw new NotSupportedException($"Metal: const '{cv.Name}' with non-identity layout");
         }
-        float[][] srcs = need.Select(x => plan.Values[x.v].Floats!).ToArray();
-        int[] kinds = need.Select(x => x.k.Id).ToArray();
-        _store = MtlConstStore.Acquire(dev, constKey, srcs, kinds, () => GpuPack.Build(plan, need, true));
-        for (int i = 0; i < need.Count; i++) _constOff[need[i]] = _store.Offsets[i];
-        Consts = _store.Consts;
+        var items = need.Select(x => (plan.Values[x.v].Floats!, x.k.Id, plan.Values[x.v].Shape)).ToArray();
+        _store = MtlConstStore.Acquire(dev, constKey);
+        var placed = _store.Place(items, miss => GpuPack.Build(plan, miss.Select(i => need[i]).ToList(), true));
+        for (int i = 0; i < need.Count; i++) _constOff[need[i]] = placed[i];
+        Consts = _store.Primary;
         Dummy = _store.Dummy;
         ConstBytes = _store.Bytes;
 
@@ -255,11 +288,11 @@ internal sealed class MtlGraphModel : IDisposable
         if (v.Buf >= 0)
             return new MtlBind(MtlSlot.Arena, (ulong)_plan.BufOffset[v.Buf] * (ulong)Es,
                 (ulong)Math.Max(v.ElementCount, 1) * (ulong)Es);
-        if (_constOff.TryGetValue((valueId, kind), out ulong off))
+        if (_constOff.TryGetValue((valueId, kind), out var c))
         {
             ulong es = !kind.Fp32 ? 2UL : 4UL;
             long elems = kind.Elems?.Invoke(v) ?? Math.Max(v.ElementCount, 1);
-            return new MtlBind(MtlSlot.Consts, off, (ulong)elems * es);
+            return new MtlBind(c.buf, c.off, (ulong)elems * es);
         }
         if (v.Floats != null)
             throw new InvalidOperationException($"const value '{v.Name}' not packed as {kind}");
@@ -702,8 +735,8 @@ internal sealed class MtlGraphModel : IDisposable
     /// <summary>Debug/test: const buffer + byte offset of (value, packing-kind) for diagnostics.</summary>
     internal (MtlBuffer buf, ulong off, bool half) DebugConst(int valueId, CK kind)
     {
-        return _constOff.TryGetValue((valueId, kind), out ulong o)
-            ? (Consts, o, !kind.Fp32)
+        return _constOff.TryGetValue((valueId, kind), out var c)
+            ? (c.buf, c.off, !kind.Fp32)
             : (Dummy, ulong.MaxValue, false);
     }
 

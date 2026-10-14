@@ -82,6 +82,19 @@ internal static class Micro
                 }
                 break;
             }
+            case "vkcompile":
+            {
+                // Vulkan-target plan compile cost per new shape: micro vkcompile <model.onnx> NxCxHxW [count]
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
+                int count = args.Length > 3 ? int.Parse(args[3]) : 200;
+                var opt = new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true, Target: PlanTarget.Vulkan);
+                GraphCompiler.Compile(model, s0, opt);
+                long t0 = Stopwatch.GetTimestamp();
+                for (int i = 0; i < count; i++) GraphCompiler.Compile(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40)], opt);
+                Console.WriteLine($"compile avg {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / count:F3} ms");
+                break;
+            }
             case "plansize":
             {
                 // retained bytes per cached plan: micro plansize <model.onnx> NxCxHxW

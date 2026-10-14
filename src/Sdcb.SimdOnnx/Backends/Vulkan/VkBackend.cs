@@ -52,24 +52,30 @@ internal sealed unsafe class VkBackend : IDisposable
     {
         opt = opt with { Target = PlanTarget.Vulkan, Nhwc = true };
         var key = (m, string.Join("x", shape), opt);
-        if (_graphs.TryGetValue(key, out var g)) return g;
+        if (_graphs.TryGetValue(key, out var g))
+        {
+            g.LastUse = Interlocked.Increment(ref _clock);
+            return g;
+        }
         // weights live in a per-model const store shared across sizes, so a graph is
         // just a plan + dispatch list (no per-size device memory)
         g = new VkGraphModel(Dev, GraphCompiler.Compile(m, shape, opt), F16, constKey: m);
+        g.LastUse = Interlocked.Increment(ref _clock);
         if (!_graphs.TryAdd(key, g)) { g.Dispose(); return _graphs[key]; }
-        // bound the cache: evict an arbitrary other graph beyond the cap
+        // bound the cache: evict the least recently used other graph beyond the cap
         while (_graphs.Count > MaxGraphs)
         {
-            var victim = _graphs.Keys.FirstOrDefault(k => !k.Equals(key));
+            var victim = _graphs.Where(kv => !kv.Key.Equals(key)).OrderBy(kv => kv.Value.LastUse).Select(kv => kv.Key).FirstOrDefault();
             if (victim.Equals(default)) break;
             if (_graphs.TryRemove(victim, out var old)) old.Release();
         }
         return g;
     }
 
-    // graphs hold no device memory beyond the shared const store; the bound is for
-    // the managed plans (each holds its own copy of the model's const floats)
-    private const int MaxGraphs = 96;
+    // graphs hold no device memory (consts are pooled per model); the bound is for the managed
+    // plans (~0.4 MB each). OCR alone sees ~150 distinct det/rec shapes over a varied image set.
+    private const int MaxGraphs = 256;
+    private long _clock;
 
     /// <summary><see cref="GraphFor"/> plus a caller reference. Retries when a concurrent
     /// eviction freed the cached graph between lookup and acquire (never resurrects it).</summary>

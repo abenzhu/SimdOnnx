@@ -12,7 +12,6 @@ internal sealed unsafe class VkSessionBuffers : IDisposable
     private readonly VkDevice _dev;
     internal VkBuffer? Arena, StageIn, StageOut;
     internal float* InMap, OutMap;
-    internal float[] InHost = [], OutHost = [];
     internal ulong ArenaBytes, InBytes, OutBytes;
     /// <summary>Bumped whenever a device buffer is replaced (sessions re-record against the new one).</summary>
     internal int Generation;
@@ -44,8 +43,6 @@ internal sealed unsafe class VkSessionBuffers : IDisposable
             OutMap = (float*)StageOut.Map();
             Generation++;
         }
-        if (InHost.Length < inFloats) { InHost = new float[inFloats]; Generation++; }
-        if (OutHost.Length < outFloats) { OutHost = new float[outFloats]; Generation++; }
     }
 
     public void Dispose()
@@ -73,7 +70,6 @@ public sealed unsafe class VkInferenceSession : IDisposable
     private readonly VkBuffer _stageIn;   // host-visible float input staging
     private readonly VkBuffer _stageOut;  // host-visible float output staging
     private float* _stageInMap, _stageOutMap;
-    private readonly float[] _inHost, _outHost;
     private readonly VkSessionBuffers? _shared;   // borrowed buffers (not owned / not freed)
     private readonly int _sharedGen;
     private readonly IntPtr _cmd, _fence;
@@ -97,7 +93,7 @@ public sealed unsafe class VkInferenceSession : IDisposable
         _outOff = (ulong)plan.BufOffset[plan.Values[plan.OutputValue].Buf] * (ulong)_es;
         if (shared is not null)
         {
-            shared.Ensure((ulong)plan.ArenaFloats * (ulong)_es + 64, StageInBytes, StageOutBytes, _inFloats, _outFloats);
+            shared.Ensure(graph.ArenaBytes + 64, StageInBytes, StageOutBytes, _inFloats, _outFloats);
             _shared = shared;
             _sharedGen = shared.Generation;
             Arena = shared.Arena!;
@@ -105,18 +101,14 @@ public sealed unsafe class VkInferenceSession : IDisposable
             _stageOut = shared.StageOut!;
             _stageInMap = shared.InMap;
             _stageOutMap = shared.OutMap;
-            _inHost = shared.InHost;
-            _outHost = shared.OutHost;
         }
         else
         {
-            Arena = dev.NewStorageBuffer((ulong)plan.ArenaFloats * (ulong)_es + 64, hostVisible: false);
+            Arena = dev.NewStorageBuffer(graph.ArenaBytes + 64, hostVisible: false);
             _stageIn = dev.NewStorageBuffer(StageInBytes, hostVisible: true, preferHost: true);
             _stageOut = dev.NewStorageBuffer(StageOutBytes, hostVisible: true, preferHost: true);
             _stageInMap = (float*)_stageIn.Map();
             _stageOutMap = (float*)_stageOut.Map();
-            _inHost = new float[_inFloats];
-            _outHost = new float[_outFloats];
         }
         _fence = dev.NewFence();
 
@@ -164,10 +156,11 @@ public sealed unsafe class VkInferenceSession : IDisposable
     public int[] InputShape => _plan.Values[_plan.InputValue].Shape;
     public int[] OutputShape => _plan.Values[_plan.OutputValue].Shape;
 
-    /// <summary>The writable input window (host copy staged on <see cref="Run"/>).</summary>
-    public Span<float> Input => _inHost.AsSpan(0, _inFloats);
-    /// <summary>The output tensor after <see cref="Run"/>.</summary>
-    public ReadOnlySpan<float> Output => _outHost.AsSpan(0, _outFloats);
+    /// <summary>The writable input window: the mapped fp32 staging buffer itself (no host copy).
+    /// Do not write it between <see cref="Submit"/> and <see cref="Wait"/>.</summary>
+    public Span<float> Input => new(_stageInMap, _inFloats);
+    /// <summary>The output tensor after <see cref="Run"/> (the mapped staging buffer; valid until the next run).</summary>
+    public ReadOnlySpan<float> Output => new(_stageOutMap, _outFloats);
 
     /// <summary>False once the borrowed buffers were regrown by another session (re-create this one).</summary>
     internal bool BuffersCurrent => _shared is null || _shared.Generation == _sharedGen;
@@ -440,22 +433,34 @@ public sealed unsafe class VkInferenceSession : IDisposable
         Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         _dev.Submit(cmd, fence);
         _dev.WaitFence(fence);
-        // timed passes: one dispatch per submit, min of 2
-        var sw = new System.Diagnostics.Stopwatch();
-        for (int rep = 0; rep < 2; rep++)
+        // timed passes: GPU timestamps after every dispatch of one production-like submit, min of 5
+        var qci = new Vk.VkQueryPoolCreateInfo { SType = VkConst.StQueryPoolCreateInfo, QueryType = VkConst.QueryTypeTimestamp, QueryCount = (uint)n + 1 };
+        Vk.Check(Vk.vkCreateQueryPool(_dev.Device, &qci, null, out IntPtr pool), "vkCreateQueryPool");
+        var ts = new ulong[n + 1];
+        for (int rep = 0; rep < 5; rep++)
+        {
+            Vk.vkResetCommandBuffer(cmd, 0);
+            Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+            Vk.vkCmdResetQueryPool(cmd, pool, 0, (uint)n + 1);
+            _dev.CmdComputeBarrier(cmd);
+            Vk.vkCmdWriteTimestamp(cmd, 0x2000u /* BOTTOM_OF_PIPE */, pool, 0);
             for (int i = 0; i < n; i++)
             {
-                var d = _graph.Dispatches[i];
-                Vk.vkResetCommandBuffer(cmd, 0);
-                Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
-                RecordDispatch(d);
-                Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-                sw.Restart();
-                _dev.Submit(cmd, fence);
-                _dev.WaitFence(fence);
-                double ms = sw.Elapsed.TotalMilliseconds;
+                RecordDispatch(_graph.Dispatches[i]);
+                Vk.vkCmdWriteTimestamp(cmd, 0x2000u, pool, (uint)i + 1);
+            }
+            Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+            _dev.Submit(cmd, fence);
+            _dev.WaitFence(fence);
+            fixed (ulong* t = ts)
+                Vk.Check(Vk.vkGetQueryPoolResults(_dev.Device, pool, 0, (uint)n + 1, (nuint)(ts.Length * 8), t, 8, 1u | 2u /* 64BIT | WAIT */), "vkGetQueryPoolResults");
+            for (int i = 0; i < n; i++)
+            {
+                double ms = (ts[i + 1] - ts[i]) * _dev.TimestampPeriodNs * 1e-6;
                 if (ms < best[i]) best[i] = ms;
             }
+        }
+        Vk.vkDestroyQueryPool(_dev.Device, pool, null);
         _dev.DestroyFence(fence);
         _dev.FreeCommandBuffer(cmd);
         var agg = new Dictionary<string, double>();
@@ -495,7 +500,8 @@ public sealed unsafe class VkInferenceSession : IDisposable
     /// <summary>Debug/test: copy host input into the arena's input region.</summary>
     internal void DebugUploadInput()
     {
-        ToStorage(_inHost.AsSpan(0, _inFloats), _stageInMap, F16);
+        float[] host = Input.ToArray();
+        ToStorage(host, _stageInMap, F16);
         _stageIn.Flush(0, InputBytes);
         IntPtr cmd = _dev.NewCommandBuffer();
         IntPtr fence = _dev.NewFence();
@@ -508,6 +514,7 @@ public sealed unsafe class VkInferenceSession : IDisposable
         _dev.WaitFence(fence);
         _dev.DestroyFence(fence);
         _dev.FreeCommandBuffer(cmd);
+        host.CopyTo(Input);
     }
 
     /// <summary>Copy host input into staging and run the recorded pipeline.</summary>
@@ -523,7 +530,6 @@ public sealed unsafe class VkInferenceSession : IDisposable
     {
         if (!BuffersCurrent) throw new InvalidOperationException("Shared Vulkan buffers were regrown; recreate the session.");
         // staging is fp32 in both modes (fp16 sessions convert on the device)
-        ToStorage(_inHost.AsSpan(0, _inFloats), _stageInMap, false);
         _stageIn.Flush(0, StageInBytes);
         _dev.Submit(_cmd, _fence);
     }
@@ -533,7 +539,6 @@ public sealed unsafe class VkInferenceSession : IDisposable
     {
         _dev.WaitFence(_fence);
         _stageOut.Invalidate(0, StageOutBytes);
-        FromStorage(_stageOutMap, _outHost.AsSpan(0, _outFloats), false);
     }
 
     public void Dispose()

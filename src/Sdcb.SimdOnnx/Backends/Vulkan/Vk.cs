@@ -583,7 +583,7 @@ internal static class VkConst
     public const uint SharingExclusive = 0;
 
     // VkQueryType / VkQueryResultFlagBits
-    public const uint QueryTypeTimestamp = 1;
+    public const uint QueryTypeTimestamp = 2;
     public const uint QueryResult64 = 0x1;
     public const uint QueryResultWait = 0x2;
 }
