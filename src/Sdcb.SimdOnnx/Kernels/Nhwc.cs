@@ -35,12 +35,12 @@ internal sealed class NhwcConvPlan
 internal static unsafe partial class Nhwc
 {
     internal const int Ob = 16, Tile = 6;
-    internal static readonly ParallelOptions PO = new() { MaxDegreeOfParallelism = Avx2Kernels.Threads };
+    internal static ParallelOptions PO => Par.Options;
     internal static bool UseAvx => Avx2.IsSupported && Fma.IsSupported;
 
     internal static void For(int n, long work, Action<int> body)
     {
-        if (work < 32768 || n == 1) { for (int i = 0; i < n; i++) body(i); return; }
+        if (work < 32768 || n == 1 || Par.Threads == 1) { for (int i = 0; i < n; i++) body(i); return; }
         Parallel.For(0, n, PO, body);
     }
 

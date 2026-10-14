@@ -217,8 +217,9 @@ internal enum PlanTarget { Cpu, Vulkan, Metal }
 /// <param name="MemFuse">memory fusions (conv+pool and extension memory passes; NHWC only).</param>
 /// <param name="Target">backend the plan runs on.</param>
 /// <param name="Extensions">consumer-registered operators and graph passes.</param>
+/// <param name="OutputName">tensor to stop at instead of the graph output (nodes it does not need are dropped).</param>
 internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
-    PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null)
+    PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null, string? OutputName = null)
 {
     public bool Gpu => Target != PlanTarget.Cpu;
     /// <summary>SIMDONNX_NHWC=0 (or legacy GCDRNET_NHWC=0) forces the all-NCHW plan (A/B oracle).</summary>

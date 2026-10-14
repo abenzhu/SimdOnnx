@@ -51,6 +51,8 @@ public sealed unsafe class InferenceSession : IDisposable
     }
     /// <summary>Input tensor shape (e.g. [1,3,H,W]).</summary>
     public int[] InputShape => _plan.Values[_inputValue].Shape;
+    /// <summary>Intra-op thread budget of <see cref="Run"/> (0 = process default).</summary>
+    public int Threads { get; set; }
     internal ExecPlan Plan => _plan;
     public int[] OutputShape => _plan.Values[_outputValue].Shape;
 
@@ -74,9 +76,10 @@ public sealed unsafe class InferenceSession : IDisposable
         return GetSpan(valueId);
     }
 
-    /// <summary>Runs the whole graph. Input must already be written to <see cref="Input"/>.</summary>
+    /// <summary>Runs the graph. Input must already be written to <see cref="Input"/>.</summary>
     public void Run()
     {
+        using var par = Par.Use(Threads);
         ExecNode[] nodes = _plan.Nodes;
         CValue[] values = _plan.Values;
         for (int i = 0; i < nodes.Length; i++)

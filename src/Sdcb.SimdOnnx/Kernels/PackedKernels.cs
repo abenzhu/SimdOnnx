@@ -9,7 +9,7 @@ namespace Sdcb.SimdOnnx.Kernels;
 /// <summary>WebAssembly SIMD128 (PackedSimd) versions of the non-conv ops that have AVX2 / NEON kernels.</summary>
 internal static unsafe class PackedKernels
 {
-    private static readonly ParallelOptions PO = new() { MaxDegreeOfParallelism = Avx2Kernels.Threads };
+    private static ParallelOptions PO => Par.Options;
 
     /// <summary>Row-wise LayerNorm over the last axis (c); rows split across threads in groups
     /// (<see cref="NeonKernels.LayerNorm"/> with separate multiply + add).</summary>

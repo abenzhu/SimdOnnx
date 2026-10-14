@@ -117,6 +117,12 @@ internal static class GraphCompiler
             }
 
             // graph outputs
+            if (opt.OutputName is { } outName)
+            {
+                if (!_byName.TryGetValue(outName, out int ov))
+                    throw new ArgumentException($"Tensor '{outName}' is not produced by the graph.", nameof(opt));
+                return FuseAndPlan(_nodes, _values, _bufSize, _inputValue, ov, opt);
+            }
             if (g.Outputs.Count != 1) throw new NotSupportedException("Expected single graph output.");
             int outputValue = _byName[g.Outputs[0].Name];
 

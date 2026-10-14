@@ -8,6 +8,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Sdcb.SimdOnnx\Sdcb.SimdOnnx.csproj" />
     <!-- A/B reference engine while porting; removed once SimdPaddleOCR runs on SimdOnnx. -->
-    <ProjectReference Include="..\..\..\SimdPaddleOCR\src\Sdcb.SimdPaddleOCR\Sdcb.SimdPaddleOCR.csproj" />
+    <ProjectReference Include="..\..\.baseline-bin\paddle-main\src\Sdcb.SimdPaddleOCR\Sdcb.SimdPaddleOCR.csproj" />
   </ItemGroup>
 </Project>

@@ -17,13 +17,8 @@ namespace Sdcb.SimdOnnx.Kernels;
 /// </summary>
 internal static unsafe partial class Avx2Kernels
 {
-    internal static readonly int Threads = InitThreads();
-    private static int InitThreads()
-    {
-        string? s = Environment.GetEnvironmentVariable("GCDRNET_THREADS");
-        return int.TryParse(s, out int t) && t > 0 ? t : Environment.ProcessorCount;
-    }
-    private static readonly ParallelOptions PO = new() { MaxDegreeOfParallelism = Threads };
+    internal static int Threads => Par.Threads;
+    private static ParallelOptions PO => Par.Options;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static F32x8 Fma(F32x8 a, F32x8 b, F32x8 c) => V256.FusedMultiplyAdd(a, b, c);

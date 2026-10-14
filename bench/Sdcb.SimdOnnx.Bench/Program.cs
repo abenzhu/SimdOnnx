@@ -43,6 +43,7 @@ foreach (string e in engines)
     {
         _ when e.StartsWith("file:") => System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(File.ReadAllBytes(e[5..])).ToArray(),
         "gcdr" => RunGcdr(),
+        "gcdr-compile" => CompileSweep(),
         "gcdr-ref" => RunGcdr(new G.Engine.CompileOptions(false)),
         "paddle" => RunPaddle(),
         "gcdr-vk" => RunGcdrVk(),
@@ -77,6 +78,23 @@ foreach (string e in engines)
         argmax = $" argmax-diff={diff}/{rows}";
     }
     Console.WriteLine($"  vs {engines[0]}: max|d|={maxAbs:E2} mean|d|={sumAbs / o.Length:E2} mask@0.3 flips={flips} / {o.Length}{argmax}");
+}
+
+float[] CompileSweep()
+{
+    // per-shape specialization cost once the model is loaded (REC widths vary per line)
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    G.Engine.CompiledModel.Compile(m, shape);
+    var sw = Stopwatch.StartNew();
+    int count = 0;
+    for (int w = shape[3] + 8; w < shape[3] + 8 + 32 * 8; w += 32, count++)
+        G.Engine.CompiledModel.Compile(m, [shape[0], shape[1], shape[2], w]);
+    double compile = sw.Elapsed.TotalMilliseconds / count;
+    sw.Restart();
+    for (int w = shape[3] + 8; w < shape[3] + 8 + 32 * 8; w += 32)
+        G.Engine.CompiledModel.Compile(m, [shape[0], shape[1], shape[2], w]).CreateSession().Dispose();
+    Console.WriteLine($"compile: {compile:F2} ms, compile+pack+session: {sw.Elapsed.TotalMilliseconds / count:F2} ms per new shape");
+    return RunGcdr();
 }
 
 float[] RunGcdr(G.Engine.CompileOptions? opt = null)

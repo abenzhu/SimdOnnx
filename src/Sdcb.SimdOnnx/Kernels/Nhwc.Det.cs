@@ -133,7 +133,7 @@ internal static unsafe partial class Nhwc
     /// <summary>dst[c] = mean over all hw pixels of src[hw, c]; per-chunk partial sums, reduced in chunk order.</summary>
     public static void GlobalAvgPool(ReadOnlySpan<float> src, int hw, int c, Span<float> dst)
     {
-        int chunks = (int)Math.Clamp((long)hw * c / 65536, 1, Avx2Kernels.Threads);
+        int chunks = (int)Math.Clamp((long)hw * c / 65536, 1, Par.Threads);
         float[] part = new float[chunks * c];
         bool v = V128;
         fixed (float* sp0 = src, pp0 = part)
