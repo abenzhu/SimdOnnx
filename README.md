@@ -26,6 +26,12 @@ Targets `net10.0` and `netstandard2.0` (CPU only, `Vector<T>` and scalar kernels
 Pre-release. The public API is minimal (`OnnxModel`, `CompiledModel`, `InferenceSession`);
 engine internals are shared with the first-party consumers above, which pin an exact version.
 
+## Performance
+
+Before/after numbers for both consumers (interleaved A/B on the same machine) and the open
+performance work are in [docs/perf.md](docs/perf.md); trade-offs are logged in
+[docs/decisions.md](docs/decisions.md).
+
 ## Device verification
 
 Apple Silicon (Metal), arm64 Linux/Android (NEON) and mobile Vulkan were ported best effort

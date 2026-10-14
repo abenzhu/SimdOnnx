@@ -728,6 +728,7 @@ internal sealed class VkGraphModel : IDisposable
     internal static (uint x, uint y) G2(uint n)
     {
         uint g = G(n), gx = Math.Min(g, 65535u);
+        if (gx == 0) return (0, 1); // empty tensor (e.g. a zero-length pad slice): no-op dispatch
         return (gx, (g + gx - 1) / gx);
     }
 

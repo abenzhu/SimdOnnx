@@ -9,3 +9,6 @@ artifacts/
 *.f32
 build/nupkgs/
 build/nuget.exe
+
+# raw A/B benchmark JSON (summaries live in docs/ab/*.txt)
+docs/ab/paddle/
