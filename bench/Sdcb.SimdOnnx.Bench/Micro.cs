@@ -87,7 +87,8 @@ internal static class Micro
                 // retained bytes per cached plan: micro plansize <model.onnx> NxCxHxW
                 var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
                 int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
-                var cm = new CpuModel(model, new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+                var popt = new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true, Target: Environment.GetEnvironmentVariable("PLAN_GPU") == "1" ? PlanTarget.Vulkan : PlanTarget.Cpu);
+                var cm = new CpuModel(model, popt);
                 cm.Plan(s0);
                 long m0 = GC.GetTotalMemory(true);
                 var keep = new List<ExecPlan>();

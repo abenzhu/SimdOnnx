@@ -56,6 +56,7 @@ foreach (string e in engines)
         "paddle-mem" => MemPaddle(),
         "gcdr-vk" => RunGcdrVk(),
         "gcdr-vkdiff" => VkDiff(),
+        "gcdr-vkshapes" => VkShapes(),
         "paddle-vk" => RunPaddleGpu("Vulkan", "GpuBackend", "GpuSession"),
         "gcdr-mtl" => RunGcdrMtl(),
         "paddle-mtl" => RunPaddleGpu("Metal", "MetalBackend", "MetalSession"),
@@ -220,6 +221,34 @@ float[] VkDiff()
             Console.WriteLine($"#{i,-3} {n.Op,-13} {(bad ? "BAD" : "ok "),-4} max|d|={maxd:G4} @{at} (|want|max {maxw:G4}) gpu={got[at]:G5} cpu={want[at]:G5} " +
                 string.Join(" ", n.In.Select(x => $"[{string.Join('x', plan.Values[x].PhysShape)}]")) + " -> " + $"[{string.Join('x', v.PhysShape)}] {n.P}");
         }
+    }
+    return [];
+}
+
+// per-new-shape GPU cost (REC width churn): graph compile, session creation, first run, managed growth
+float[] VkShapes()
+{
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    var be = G.Backends.Vulkan.VkBackend.Default;
+    var opt = new G.Engine.CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true);
+    long gc0 = GC.GetTotalMemory(true);
+    for (int i = 0; i < 12; i++)
+    {
+        int[] sh = [shape[0], shape[1], shape[2], shape[3] + 32 * i];
+        var sw = Stopwatch.StartNew();
+        var g = be.AcquireGraph(m, sh, opt);
+        double tg = sw.Elapsed.TotalMilliseconds;
+        sw.Restart();
+        using var s = new G.Backends.Vulkan.VkInferenceSession(be.Dev, g.Plan, g);
+        g.Release();
+        double ts = sw.Elapsed.TotalMilliseconds;
+        sw.Restart();
+        s.Run();
+        double tr = sw.Elapsed.TotalMilliseconds;
+        sw.Restart();
+        s.Run();
+        double tr2 = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"[{string.Join('x', sh)}] graph {tg,7:F2} ms  session {ts,6:F2} ms  run1 {tr,6:F2} ms  run2 {tr2,6:F2} ms  managed +{(GC.GetTotalMemory(true) - gc0) / 1048576.0,6:F1} MB consts#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(g.Consts)} {g.ConstBytes / 1048576.0:F1}MB");
     }
     return [];
 }

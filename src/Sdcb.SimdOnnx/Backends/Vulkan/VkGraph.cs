@@ -138,9 +138,6 @@ internal sealed class VkGraphModel : IDisposable
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
         long m = (long)so[0] * so[1] * so[2];
-        // SG16 (Intel Xe2) BN=32 build on 1x1 convs hangs the device intermittently (B580, driver
-        // 32.0.101.8135): those convs take the per-element shaders until the variant is fixed
-        if (dev.CoopM8 && cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && so[3] % 64 != 0) return false;
         if (cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && Environment.GetEnvironmentVariable("GCDRNET_VK_CM1X1") == "0") return false;
         return so[3] % 8 == 0 && (m + 127) / 128 <= 65535;   // cin % 8 != 0 -> scalar-gather stem variant
     }
@@ -358,8 +355,11 @@ internal sealed class VkGraphModel : IDisposable
                 if (UseCoopConv(_dev, F16, _plan, n, p))
                 {
                     // BM = 128 rows (pixels) in every variant; BN by oc divisibility
+                    // SG16 (Intel Xe2): the BN=32 build on 1x1 convs hangs the device intermittently (B580,
+                    // driver 32.0.101.8135) — those take the BN=64 build with masked tail columns
+                    bool no32 = _dev.CoopM8 && p.Kernel[0] == 1 && p.Kernel[1] == 1;
                     (string cm, uint bn) = ic % 8 != 0 ? ("conv_cm_n32s", 32u)
-                        : oc % 128 == 0 ? ("conv_cm", 128u) : oc % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
+                        : oc % 128 == 0 ? ("conv_cm", 128u) : oc % 64 == 0 || no32 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
                     uint m = nb * oh * ow, kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic, kd = (kr + 7u) & ~7u;
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
                         | (p.PadMode == PadMode.Reflect ? 4u : 0u)
