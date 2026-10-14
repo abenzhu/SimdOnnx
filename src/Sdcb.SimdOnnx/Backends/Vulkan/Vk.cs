@@ -43,6 +43,7 @@ internal static unsafe partial class Vk
 
     public static void Check(VkResult r, string what)
     {
+        if (r == VkResult.ErrorDeviceLost) throw new VkDeviceLostException(what);
         if (r != VkResult.Success)
             throw new InvalidOperationException($"Vulkan {what} failed: {r}");
     }

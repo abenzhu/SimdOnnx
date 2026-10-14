@@ -136,7 +136,7 @@ internal static class GraphCompiler
             // fusion passes operate on the logical graph and are layout-blind;
             // physical layout is decided afterwards by LayoutPlanner
             Prune(nodes, values, outputValue);
-            bool fuse = Env.Flag("NOFUSE") != "1";
+            bool fuse = opt.Fuse && Env.Flag("NOFUSE") != "1";
             if (fuse)
             {
                 Fuse(nodes, values, outputValue, opt);
@@ -475,22 +475,25 @@ internal static class GraphCompiler
                 while (values[v].AliasOf >= 0 && values[values[v].AliasOf].Buf == values[v].Buf) v = values[v].AliasOf;
                 return v;
             }
-            int Producer(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
-            int Readers(int buf, out int only)
+            // value -> producing node and buffer -> reading nodes, kept current across fusions; fused Adds
+            // are only marked dead (indices stay stable) and dropped at the end
+            var producer = new Dictionary<int, int>();
+            var readers = new Dictionary<int, List<int>>();
+            void AddReader(int buf, int j)
             {
-                int count = 0;
-                only = -1;
-                for (int j = 0; j < nodes.Count; j++)
-                {
-                    ExecNode m = nodes[j];
-                    if (m.In.Any(iv => values[iv].Buf == buf) || m.ParamRefs().Any(iv => values[iv].Buf == buf))
-                    {
-                        count++;
-                        only = j;
-                    }
-                }
-                return count;
+                if (buf < 0) return;
+                if (!readers.TryGetValue(buf, out var l)) readers[buf] = l = new List<int>(2);
+                if (l.Count == 0 || l[^1] != j) { if (!l.Contains(j)) l.Add(j); }
             }
+            for (int j = 0; j < nodes.Count; j++)
+            {
+                ExecNode m = nodes[j];
+                if (m.Out.Length == 1 && !producer.ContainsKey(m.Out[0])) producer[m.Out[0]] = j;
+                foreach (int iv in m.In) AddReader(values[iv].Buf, j);
+                foreach (int iv in m.ParamRefs()) AddReader(values[iv].Buf, j);
+            }
+            int Producer(int v) => producer.TryGetValue(v, out int j) ? j : -1;
+            var dead = new bool[nodes.Count];
             for (int bi = 0; bi < nodes.Count; bi++)
             {
                 ExecNode b = nodes[bi];
@@ -504,7 +507,8 @@ internal static class GraphCompiler
                     if (cp.Act != ActivationKind.None || cp.Group > 1 || cp.AddValue >= 0) continue;
                     int outV = nodes[ci].Out[0], other = b.In[1 - k];
                     int buf = values[outV].Buf;
-                    if (buf < 0 || buf == values[outputValue].Buf || Readers(buf, out int only) != 1 || only != bi) continue;
+                    if (buf < 0 || buf == values[outputValue].Buf
+                        || !readers.TryGetValue(buf, out var rd) || rd.Count != 1 || rd[0] != bi) continue;
                     if (!values[other].Shape.SequenceEqual(values[b.Out[0]].Shape) ||
                         !values[outV].Shape.SequenceEqual(values[b.Out[0]].Shape)) continue;
                     int op = Producer(Root(other));
@@ -514,11 +518,19 @@ internal static class GraphCompiler
                     // the conv now writes the Add's result; readers of the old Add output follow
                     int addOut = b.Out[0];
                     nodes[ci].Out = [addOut];
-                    nodes.RemoveAt(bi);
-                    bi--;
+                    producer[addOut] = ci;
+                    producer.Remove(outV);
+                    foreach (int iv in b.In)
+                        if (values[iv].Buf >= 0 && readers.TryGetValue(values[iv].Buf, out var l)) l.Remove(bi);
+                    AddReader(values[other].Buf, ci);
+                    dead[bi] = true;
                     break;
                 }
             }
+            int w = 0;
+            for (int j = 0; j < nodes.Count; j++)
+                if (!dead[j]) nodes[w++] = nodes[j];
+            nodes.RemoveRange(w, nodes.Count - w);
         }
 
         internal static void Redirect(List<ExecNode> nodes, List<CValue> values, int oldValue, int newValue)

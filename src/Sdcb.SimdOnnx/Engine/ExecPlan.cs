@@ -220,7 +220,7 @@ internal enum PlanTarget { Cpu, Vulkan, Metal }
 /// <param name="OutputName">tensor to stop at instead of the graph output (nodes it does not need are dropped).</param>
 internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
     PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null, string? OutputName = null,
-    bool LogicalOutput = false)
+    bool LogicalOutput = false, bool Fuse = true)
 {
     public bool Gpu => Target != PlanTarget.Cpu;
     /// <summary>SIMDONNX_NHWC=0 (or legacy GCDRNET_NHWC=0) forces the all-NCHW plan (A/B oracle).</summary>

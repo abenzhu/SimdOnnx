@@ -14,8 +14,37 @@ internal sealed unsafe class VkBackend : IDisposable
     // (model, shape, options) -> compiled graph (dispatch list; weights live in the per-model const store)
     private readonly ConcurrentDictionary<(OnnxModel m, string shape, CompileOptions opt), VkGraphModel> _graphs = new();
 
-    private static readonly Lazy<VkBackend> s_default = new(() => new VkBackend());
-    internal static VkBackend Default => s_default.Value;
+    private static VkBackend? s_default;
+    private static System.Runtime.ExceptionServices.ExceptionDispatchInfo? s_createError;
+    private static readonly object s_gate = new();
+
+    /// <summary>
+    /// The process-wide backend. After a device loss the next access creates a new device; objects
+    /// built on the lost one (graphs, sessions, buffers) stay dead and must be re-created by callers.
+    /// A failed first creation (no usable Vulkan) is cached and rethrown.
+    /// </summary>
+    internal static VkBackend Default
+    {
+        get
+        {
+            VkBackend? b = Volatile.Read(ref s_default);
+            if (b is not null && !b.Dev.Lost) return b;
+            lock (s_gate)
+            {
+                s_createError?.Throw();
+                if (s_default is null || s_default.Dev.Lost)
+                {
+                    try { s_default = new VkBackend(); }
+                    catch (Exception ex) when (s_default is null)
+                    {
+                        s_createError = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+                        throw;
+                    }
+                }
+                return s_default;
+            }
+        }
+    }
 
     /// <summary>
     /// Plan options for GPU compiles: always channels-last (shaders address NHWC).

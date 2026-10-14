@@ -6,9 +6,16 @@ using System.Runtime.InteropServices;
 
 namespace Sdcb.SimdOnnx.Backends.Vulkan;
 
+/// <summary>The device was lost (driver reset / GPU fault). Everything created on it is dead;
+/// <see cref="VkBackend.Default"/> creates a fresh device on its next use.</summary>
+internal sealed class VkDeviceLostException(string what)
+    : InvalidOperationException($"Vulkan {what} failed: ErrorDeviceLost");
+
 internal unsafe sealed class VkDevice : IDisposable
 {
     public IntPtr Instance, PhysDevice, Device, Queue;
+    /// <summary>Set once a submit or fence wait reported the device lost.</summary>
+    internal volatile bool Lost;
     public string DeviceName = "";
     public uint VendorId;
     public uint SubgroupSize;
@@ -165,7 +172,8 @@ internal unsafe sealed class VkDevice : IDisposable
         // Prefer a compute-only family (no GRAPHICS bit) for async-compute —
         // but only if it supports timestamps; otherwise fall back to graphics+compute.
         d.QueueFamily = uint.MaxValue;
-        for (uint i = 0; i < nqf; i++)
+        bool asyncCompute = Environment.GetEnvironmentVariable("GCDRNET_VK_QUEUE") != "gfx";
+        for (uint i = 0; i < nqf && asyncCompute; i++)
             if ((qf[i].QueueFlags & VkConst.QueueCompute) != 0 && (qf[i].QueueFlags & 1u) == 0
                 && qf[i].TimestampValidBits > 0)
             { d.QueueFamily = i; break; }
@@ -855,7 +863,8 @@ internal unsafe sealed class VkDevice : IDisposable
             CommandBufferCount = 1, PCommandBuffers = &cmd,
         };
         VkResult r;
-        lock (QueueLock) r = Vk.vkQueueSubmit(Queue, 1, &si, fence);
+        lock (QueueLock) r = Lost ? VkResult.ErrorDeviceLost : Vk.vkQueueSubmit(Queue, 1, &si, fence);
+        if (r == VkResult.ErrorDeviceLost) Lost = true;
         Vk.Check(r, "vkQueueSubmit");
     }
 
@@ -866,7 +875,9 @@ internal unsafe sealed class VkDevice : IDisposable
 
     public void WaitFence(IntPtr fence)
     {
-        Vk.Check(Vk.vkWaitForFences(Device, 1, &fence, 1, ulong.MaxValue), "vkWaitForFences");
+        VkResult r = Vk.vkWaitForFences(Device, 1, &fence, 1, ulong.MaxValue);
+        if (r == VkResult.ErrorDeviceLost) Lost = true;
+        Vk.Check(r, "vkWaitForFences");
         Vk.Check(Vk.vkResetFences(Device, 1, &fence), "vkResetFences");
     }
 

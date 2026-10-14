@@ -23,16 +23,19 @@ recognised lines (old/new).
 | medium cpu 1w | 1137.6 | 1148.2 | 1.01 | 234.0/214.2 | 11.8/15.8 | 863.7/875.6 | 1105/1189 | 1004/1004 |
 | medium cpu 4w | 556.3 | 522.2 | **0.94** | 232.0/203.7 | 22.3/26.2 | 1124.0/1046.3 | 1173/1427 | 1004/1004 |
 | medium cpu 16w | 686.9 | 671.8 | **0.98** | 249.0/220.8 | 19.7/54.8 | 2496.3/2548.1 | 1269/1786 | 1004/1004 |
-| tiny vulkan 4w | 21.9 | 30.7 | 1.40 | 6.2/8.5 | 1.3/1.4 | 6.4/10.3 | 577/748 | 740/741 |
-| small vulkan 4w | 32.7 | 39.4 | 1.20 | 7.7/9.8 | 1.3/1.3 | 16.3/22.9 | 656/933 | 950/955 |
-| medium vulkan 4w | 56.6 | 59.2 | 1.05 | 22.4/16.9 | 1.4/1.3 | 26.5/35.6 | 951/1946 | 1003/1003 |
+| tiny vulkan 4w | 20.3 | 22.0 | 1.09 | 4.6/4.9 | 1.3/1.2 | 5.8/6.1 | 578/664 | 740/741 |
+| small vulkan 4w | 37.9 | 41.3 | 1.09 | 8.2/9.0 | 1.4/1.3 | 14.8/17.0 | 658/785 | 950/955 |
+| medium vulkan 4w | 58.6 | 61.0 | 1.04 | 22.2/15.9 | 1.5/1.2 | 27.4/32.3 | 953/1175 | 1003/1003 |
 
 - **CPU**: at parity or faster in every configuration (small det is ~1.9x faster). Accuracy identical.
-- **Vulkan**: correct (accuracy equal or better) but **slower than the old hand-fused Paddle GPU
-  path** on tiny/small, and peak working set is higher (up to 2x on medium). Medium det is
-  faster. Open work, see below.
-- **Memory (CPU)**: peak working set is 5–40% higher, mostly at 16 workers on medium (per-shape
-  plan cache + per-session arenas). Open work.
+- **Vulkan**: correct (accuracy equal or better), now within 4–9% of the old hand-fused Paddle
+  GPU path in the run above. Vulkan medians are noisy on this machine: four other interleaved
+  runs during this work gave tiny 1.14–1.35, small 1.09–1.43, medium 0.97–1.07. Stage means
+  (det/cls/rec) are at parity; the remaining gap is per-new-shape setup (plan compile + graph +
+  session, ~3–8 ms each, ~150 new shapes per 100 images) and the CPU stages it competes with.
+  Medium det is faster.
+- **Memory**: Vulkan peak working set +15–23% (was +100% on medium before the per-model const
+  pool); CPU +5–40%, mostly at 16 workers on medium (per-shape plan cache + per-session arenas).
 
 ## SimdGcdrNet (`Sdcb.SimdGcdrNet.Benchmark`, e2e ms)
 
@@ -47,11 +50,20 @@ recognised lines (old/new).
 
 ## Known gaps / next steps
 
-1. **Paddle Vulkan latency** (tiny +40%, small +20%). The old backend ran PP-OCR through
-   hand-written fused shaders (SE block, conv+bn+hardswish chains, fused rec head); the generic
-   graph emits more dispatches. Candidates: HardSigmoid epilogue / SE fusion, two-pass GAP
-   (one workgroup per 64 channels per image underuses the GPU), batched submission of unit graphs.
-2. **Paddle Vulkan memory** (medium peak 951 → 1946 MB): audit per-shape `VkGraphModel` host
-   allocations and the shared session buffers' high-water marks.
-3. **CPU memory at high worker counts**: per-shape plan LRU (64) × 3 plan kinds, arenas per worker.
-4. **Metal**: ported best effort, compiled but not run on Apple hardware in this change.
+1. **Per-shape setup cost** on GPU (the old backend derived per-shape schedules from one prebuilt
+   graph): faster fusion passes (several are O(nodes²) with LINQ; `FuseConvResidual` done), fewer
+   allocations per compile (~1 MB), or a shape-polymorphic plan.
+2. **CPU memory at high worker counts**: per-shape plan LRU (64) × 3 plan kinds, arenas per worker.
+3. **Metal**: ported best effort (incl. the const pool), compiled but not run on Apple hardware.
+
+## What closed most of the Vulkan gap (2026-10-14)
+
+| change | effect |
+|---|---|
+| per-model const pool (entries shared across shapes and output truncations) | medium peak WS 1946 → 1175 MB; no more ~170 MB weight re-pack + upload per CTC/logits graph |
+| two-pass GAP (`gap_part`/`gap_sum`, chunked over pixels) | det GPU time 3.9 → 2.7 ms (GAP was a third of it) |
+| zero-copy staging (`Input`/`Output` are the mapped staging buffers) | det 736x960 5.6 → 3.8 ms wall |
+| LRU graph cache 96 → 256 | rec graphs 154 compiles → 88 (no thrash) |
+| Paddle: compile device graphs at `Reshape`/`ReshapeMany` on the thread pool | det/rec setup overlaps preprocessing |
+| Paddle: CTC head (MatMul+ArgMax) on the thread pool in growing batches | rec CPU head 1879 → 1412 ms per 100 images (medium) |
+| GPU-timestamp profiler (`GCDRNET_PROF=1`, VK_QUERY_TYPE_TIMESTAMP was 1 instead of 2) | per-dispatch device times instead of submit round trips |

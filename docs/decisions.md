@@ -39,8 +39,13 @@ the old GcdrNet main. It correlates with the BN=32 1x1 coopmat conv; on subgroup
 convs now always use the BN=64 variant (`conv_cm_n64`). Stress runs went from flaky to clean
 (det/rec 8/8, GcdrNet 5/5). `GCDRNET_VK_CM1X1=0` disables coopmat 1x1 entirely if it recurs.
 A rare DeviceLost in GcdrNet's size-switching Vulkan test (~1 in 10 full-suite runs) remains.
+*Update 2026-10-14:* most of that flakiness was test interference, see below.
 
 ## 2026-10-13 — Ship with Paddle Vulkan slower than the old hand-fused backend
+
+*Update 2026-10-14:* the gap is now 4–9% in the last interleaved run (noisy: 0.97–1.43 across
+runs), memory +15–23% instead of +100%; see `docs/perf.md`. The remaining gap is per-new-shape
+setup, not kernels.
 
 CPU met the "not slower" bar everywhere (see `docs/perf.md`); Paddle Vulkan did not (tiny +40%,
 small +20%, medium +5%), and Vulkan peak working set is higher. Rather than port the old
@@ -63,3 +68,39 @@ its own tests for what it still owns (CTC/MatMul argmax head, preprocessing, pip
 Consumers pin `Sdcb.SimdOnnx` exactly and restore it from the ProGet test feed through a
 `nuget.config` with package-source mapping (only `Sdcb.SimdOnnx` comes from ProGet). Before
 merging to main: publish the engine to nuget.org and delete the ProGet source.
+
+## 2026-10-14 — GPU consts pooled per model, not per identical const list
+
+The const store used to be shared only between graphs whose const lists matched exactly; the
+CTC/logits graphs (truncated outputs) of every rec shape therefore re-packed and re-uploaded the
+whole model (~170 MB of allocations each, medium rec), which was the "Vulkan memory doubled".
+Now each (device, model, precision) has one pool of packed entries keyed by source array +
+packing kind (content-compared on a reference miss); a graph uploads only missing entries as a
+new chunk, and const binds address the chunk buffer directly (`VkSlot.Direct`). Metal mirrors it.
+
+## 2026-10-14 — Device loss: recover instead of failing forever
+
+`VK_ERROR_DEVICE_LOST` raises `VkDeviceLostException` and marks the device lost;
+`VkBackend.Default` then creates a new device on next use. Paddle finishes the failing call on the
+CPU and goes back to the GPU (permanent CPU fallback only after 3 losses per session); GcdrNet
+retries the image once on a fresh pipeline pool. Objects of the lost device are abandoned, not
+destroyed. Tests for this are opt-in (`SIMDONNX_TEST_DEVICELOSS=1`) because they disturb every
+other Vulkan test in the process.
+
+## 2026-10-14 — B580 flakiness: what was found
+
+- GcdrNet's Vulkan tests failed ~1 in 4–10 full runs ("size-switch differs from a fresh
+  worker", earlier also DeviceLost). Two tests changed process-wide state while others ran in
+  parallel: `NoFuse_MatchesFused` set `GCDRNET_NOFUSE` (other tests then compiled unfused graphs)
+  and the ConvDot route test flipped `ConvDot` on the shared device. Fixed with
+  `CompileOptions.Fuse` and a private device for the ConvDot test: 0 failures in 25 + 10 runs.
+- Validation layers (core, thread safety) on a 4-worker Paddle Vulkan run: clean. GPU-assisted
+  validation on the GcdrNet Vulkan tests: no out-of-bounds access; it reports shared-memory races in
+  `conv_cm` between `coopMatStore` and the epilogue loads of the same subgroup, separated by
+  `subgroupMemoryBarrierShared(); subgroupBarrier()` — taken as false positives of GPU-AV's race
+  model for cooperative-matrix ops, not changed.
+- Paddle Vulkan e2e stress (tiny, 4 workers): 0 crashes in 46 runs; an access violation inside the driver's
+  `vkQueueSubmit` was seen 3 times in one cluster (while VS Code was installing an update) and
+  once a run silently fell back to the CPU; neither reproduced afterwards. Fallbacks now log one
+  line to stderr. `GCDRNET_VK_QUEUE=gfx` (graphics queue instead of async compute) was tried:
+  no stability difference, 2x slower, so it stays a debug knob.
