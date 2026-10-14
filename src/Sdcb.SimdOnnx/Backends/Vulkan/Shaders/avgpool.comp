@@ -1,0 +1,40 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC average pool over n images (zero padding; flags bit0 = count_include_pad).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC {
+    uint c, ih, iw, oh, ow;
+    uint kh, kw, sh, sw, pt, pl;
+    uint flags;
+    uint n;
+} p;
+
+void main()
+{
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= p.c * p.oh * p.ow * max(p.n, 1u)) return;
+    uint ch = id % p.c, px = id / p.c;
+    uint ox = px % p.ow, oyg = px / p.ow;
+    uint img = oyg / p.oh, oy = oyg - img * p.oh, ibase = img * p.ih;
+    float s = 0.0;
+    uint cnt = 0u;
+    for (uint ky = 0u; ky < p.kh; ky++)
+    {
+        int sy = int(oy * p.sh + ky) - int(p.pt);
+        if (uint(sy) >= p.ih) continue;
+        for (uint kx = 0u; kx < p.kw; kx++)
+        {
+            int sx = int(ox * p.sw + kx) - int(p.pl);
+            if (uint(sx) >= p.iw) continue;
+            s += float(x[((ibase + uint(sy)) * p.iw + uint(sx)) * p.c + ch]);
+            cnt++;
+        }
+    }
+    float div = (p.flags & 1u) != 0u ? float(p.kh * p.kw) : float(max(cnt, 1u));
+    o[id] = ET(s / div);
+}

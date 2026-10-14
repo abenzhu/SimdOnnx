@@ -87,6 +87,7 @@ layout(push_constant) uniform PC {
     uint mDim; uint nDim; uint kDim; uint flags;
     uint outW; uint inW; uint inH; uint cin; uint kW;
     uint sH; uint sW; uint pT; uint pL; uint kReal;
+    uint outH;                         // rows of one image: m spans batch * outH * outW
 } p;
 
 #ifdef LITE
@@ -113,12 +114,14 @@ float actf(float v, uint act)
 {
     if (act == 1u) return max(v, 0.0);
     if (act == 2u) return 0.5 * v * (1.0 + ferf(v * 0.7071067811865475));
+    if (act == 3u) return v * clamp(v * (1.0 / 6.0) + 0.5, 0.0, 1.0);
     return v;
 }
 
 int mirror(int i, int d) { if (d <= 1) return 0; while (i < 0 || i >= d) i = i < 0 ? -i : 2 * d - 2 - i; return i; }
 
 int rowY[LA], rowX[LA];
+uint rowBase[LA];                      // first input pixel of the row's image
 bool rowOk[LA];
 
 void loadSlice(out uvec4 ra[LA], out uvec4 rb[LB], out uint va, out uint vb,
@@ -156,7 +159,7 @@ void loadSlice(out uvec4 ra[LA], out uvec4 rb[LB], out uint va, out uint vb,
             bool inb = iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW);
             if (reflect && rowOk[i] && !inb) { iy = mirror(iy, int(p.inH)); ix = mirror(ix, int(p.inW)); inb = true; }
             bool ok = kok && rowOk[i] && inb && k < p.kReal;
-            h[e] = x1[ok ? (uint(iy) * p.inW + uint(ix)) * p.cin + ci : 0u];
+            h[e] = x1[ok ? (rowBase[i] + uint(iy) * p.inW + uint(ix)) * p.cin + ci : 0u];
             h[e] = ok ? h[e] : float16_t(0.0);
         }
         ra[i] = uvec4(packFloat2x16(f16vec2(h[0], h[1])), packFloat2x16(f16vec2(h[2], h[3])),
@@ -172,7 +175,7 @@ void loadSlice(out uvec4 ra[LA], out uvec4 rb[LB], out uint va, out uint vb,
         bool inb = iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW);
         if (reflect && rowOk[i] && !inb) { iy = mirror(iy, int(p.inH)); ix = mirror(ix, int(p.inW)); inb = true; }
         bool ok = kok && rowOk[i] && inb;
-        uint px = ok ? uint(iy) * p.inW + uint(ix) : 0u;
+        uint px = ok ? rowBase[i] + uint(iy) * p.inW + uint(ix) : 0u;
         ra[i] = x8[px * cq + (ci >> 3)];
         va |= ok ? 1u << i : 0u;
     }
@@ -243,7 +246,9 @@ void main()
     uint r0 = tid / BKQ;
     [[unroll]] for (uint i = 0u; i < LA; i++) {
         uint gm = m0 + r0 + i * RSTEP;
-        uint oy = gm / p.outW, ox = gm - oy * p.outW;
+        uint img = gm / (p.outH * p.outW), gr = gm - img * (p.outH * p.outW);
+        uint oy = gr / p.outW, ox = gr - oy * p.outW;
+        rowBase[i] = img * p.inH * p.inW;
         rowOk[i] = gm < p.mDim;
         rowY[i] = int(oy * p.sH) - int(p.pT);
         rowX[i] = int(ox * p.sW) - int(p.pL);

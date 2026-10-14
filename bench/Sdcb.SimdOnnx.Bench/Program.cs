@@ -55,6 +55,7 @@ foreach (string e in engines)
         "gcdr-mem" => MemGcdr(),
         "paddle-mem" => MemPaddle(),
         "gcdr-vk" => RunGcdrVk(),
+        "gcdr-vkdiff" => VkDiff(),
         "paddle-vk" => RunPaddleGpu("Vulkan", "GpuBackend", "GpuSession"),
         "gcdr-mtl" => RunGcdrMtl(),
         "paddle-mtl" => RunPaddleGpu("Metal", "MetalBackend", "MetalSession"),
@@ -179,6 +180,48 @@ float[] RunGcdr(G.Engine.CompileOptions? opt = null)
                     string.Join(" ", n.Out.Select(v => $"[{string.Join('x', cm.Plan.Values[v].PhysShape)}]")) + $" {n.P}");
     }
     return s.Output.ToArray();
+}
+
+// per-node GPU vs CPU on the same (Vulkan-target) plan: first mismatching nodes
+float[] VkDiff()
+{
+    G.Onnx.OnnxModel m = G.Onnx.OnnxModel.Load(modelBytes);
+    var be = G.Backends.Vulkan.VkBackend.Default;
+    var plan = G.Engine.GraphCompiler.Compile(m, shape, G.Backends.Vulkan.VkBackend.PlanOptions);
+    using var cpu = new G.Engine.InferenceSession(plan);
+    using var gpu = be.NewSession(m, shape);
+    input.CopyTo(cpu.Input);
+    input.CopyTo(gpu.Input);
+    gpu.DebugUploadInput();
+    var graph = be.GraphFor(m, shape);
+    int shown = 0;
+    for (int i = 0; i < plan.Nodes.Length && shown < 6; i++)
+    {
+        var n = plan.Nodes[i];
+        cpu.ExecNode(i);
+        var (ds, dc) = graph.NodeRanges[i];
+        gpu.DebugRunRange(ds, dc);
+        int ov = n.Out[0];
+        var v = plan.Values[ov];
+        float[] got = new float[v.ElementCount];
+        gpu.DebugDownload(ov, got);
+        float[] want = cpu.ValueSpan(ov).ToArray();
+        double maxd = 0, maxw = 1e-6; int at = 0;
+        for (int j = 0; j < want.Length; j++)
+        {
+            double d = Math.Abs(got[j] - want[j]);
+            if (!(d <= maxd)) { maxd = d; at = j; }
+            maxw = Math.Max(maxw, Math.Abs(want[j]));
+        }
+        bool bad = !(maxd <= 0.05 * maxw + 0.05);
+        if (bad || Environment.GetEnvironmentVariable("VKDIFF_ALL") == "1")
+        {
+            shown += bad ? 1 : 0;
+            Console.WriteLine($"#{i,-3} {n.Op,-13} {(bad ? "BAD" : "ok "),-4} max|d|={maxd:G4} @{at} (|want|max {maxw:G4}) gpu={got[at]:G5} cpu={want[at]:G5} " +
+                string.Join(" ", n.In.Select(x => $"[{string.Join('x', plan.Values[x].PhysShape)}]")) + " -> " + $"[{string.Join('x', v.PhysShape)}] {n.P}");
+        }
+    }
+    return [];
 }
 
 float[] RunGcdrVk()

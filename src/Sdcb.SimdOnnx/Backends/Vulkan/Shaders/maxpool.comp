@@ -11,14 +11,16 @@ layout(push_constant) uniform PC {
     uint c, ih, iw, oh, ow;
     uint kh, kw, sh, sw, pt, pl;
     uint relu;
+    uint n;             // batch
 } p;
 
 void main()
 {
     uint id = gl_GlobalInvocationID.x;
-    if (id >= p.c * p.oh * p.ow) return;
+    if (id >= p.c * p.oh * p.ow * max(p.n, 1u)) return;
     uint ch = id % p.c, px = id / p.c;
-    uint ox = px % p.ow, oy = px / p.ow;
+    uint ox = px % p.ow, oyg = px / p.ow;
+    uint img = oyg / p.oh, oy = oyg - img * p.oh, ibase = img * p.ih;
     float m = -3.4e38;
     for (uint ky = 0u; ky < p.kh; ky++)
     {
@@ -28,7 +30,7 @@ void main()
         {
             int sx = int(ox * p.sw + kx) - int(p.pl);
             if (uint(sx) >= p.iw) continue;
-            m = max(m, float(x[(uint(sy) * p.iw + uint(sx)) * p.c + ch]));
+            m = max(m, float(x[((ibase + uint(sy)) * p.iw + uint(sx)) * p.c + ch]));
         }
     }
     if (m == -3.4e38) m = 0.0;

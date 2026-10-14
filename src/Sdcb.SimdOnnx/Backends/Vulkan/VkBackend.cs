@@ -12,7 +12,7 @@ internal sealed unsafe class VkBackend : IDisposable
 {
     internal readonly VkDevice Dev;
     // (model, c, h, w) -> compiled graph (weights upload + dispatch list)
-    private readonly ConcurrentDictionary<(OnnxModel m, int c, int h, int w, bool physIo, EngineExtensions? ext), VkGraphModel> _graphs = new();
+    private readonly ConcurrentDictionary<(OnnxModel m, int n, int c, int h, int w, bool physIo, EngineExtensions? ext), VkGraphModel> _graphs = new();
 
     private static readonly Lazy<VkBackend> s_default = new(() => new VkBackend());
     internal static VkBackend Default => s_default.Value;
@@ -33,7 +33,7 @@ internal sealed unsafe class VkBackend : IDisposable
         Dev = VkDevice.Create();
     }
 
-    /// <summary>Standalone session for one model at [1,c,h,w] (test path).</summary>
+    /// <summary>Standalone session for one model at [n,c,h,w] (test path).</summary>
     public VkInferenceSession NewSession(OnnxModel m, int[] shape) => NewSession(m, shape, null);
 
     internal VkInferenceSession NewSession(OnnxModel m, int[] shape, EngineExtensions? ext)
@@ -46,11 +46,11 @@ internal sealed unsafe class VkBackend : IDisposable
     /// <summary>Compiled GPU graph for a model+shape (cached, bounded).</summary>
     internal VkGraphModel GraphFor(OnnxModel m, int[] shape, bool physIo = false, EngineExtensions? ext = null)
     {
-        var key = (m, shape[1], shape[2], shape[3], physIo, ext);
+        var key = (m, shape[0], shape[1], shape[2], shape[3], physIo, ext);
         if (_graphs.TryGetValue(key, out var g)) return g;
         // weights live in a per-model const store shared across sizes, so a graph is
         // just a plan + dispatch list (no per-size device memory)
-        g = new VkGraphModel(Dev, GraphCompiler.Compile(m, [1, shape[1], shape[2], shape[3]],
+        g = new VkGraphModel(Dev, GraphCompiler.Compile(m, [shape[0], shape[1], shape[2], shape[3]],
             (physIo ? PipeOptions : PlanOptions) with { Extensions = ext }), F16, constKey: m);
         if (!_graphs.TryAdd(key, g)) { g.Dispose(); return _graphs[key]; }
         // bound the cache: evict an arbitrary other graph beyond the cap

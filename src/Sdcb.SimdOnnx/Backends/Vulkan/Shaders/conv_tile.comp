@@ -22,8 +22,8 @@ layout(push_constant) uniform PC {
     uint oc, oh, ow;
     uint kh, kw, sh, sw;
     uint pt, pl;
-    uint flags;     // bit0 hasBias, bit1 reflectPad, bit2 relu, bit3 hasAdd, bit4 gelu
-    uint pad0;
+    uint flags;     // bit0 hasBias, bit1 reflectPad, bit2 relu, bit3 hasAdd, bit4 gelu, bit5 hardswish
+    uint n;         // batch: workgroup rows span n * ceil(oh / BH) tiles
 } p;
 
 #ifndef KH
@@ -61,7 +61,10 @@ float ferf(float v)
 void main()
 {
     uint oc0 = gl_WorkGroupID.z * BM;
-    uint oy0 = gl_WorkGroupID.y * BH;
+    uint tilesY = (p.oh + BH - 1u) / BH;
+    uint img = gl_WorkGroupID.y / tilesY;
+    uint oy0 = (gl_WorkGroupID.y - img * tilesY) * BH;
+    uint xin = img * p.ih * p.iw * p.ic, xout = img * p.oh * p.ow * p.oc;
     uint ox0 = gl_WorkGroupID.x * BW;
     uint K = KH * KW * p.ic;
     uint tid = gl_LocalInvocationID.x;
@@ -99,10 +102,10 @@ void main()
                 {
                     if (uint(sy) >= p.ih) sy = mirror(sy, int(p.ih));
                     if (uint(sx) >= p.iw) sx = mirror(sx, int(p.iw));
-                    v = float(x[(uint(sy) * p.iw + uint(sx)) * p.ic + ch]);
+                    v = float(x[xin + (uint(sy) * p.iw + uint(sx)) * p.ic + ch]);
                 }
                 else if (uint(sy) < p.ih && uint(sx) < p.iw)
-                    v = float(x[(uint(sy) * p.iw + uint(sx)) * p.ic + ch]);
+                    v = float(x[xin + (uint(sy) * p.iw + uint(sx)) * p.ic + ch]);
             }
             uint si = n * BKP + bk;
             Bsv[si >> 2][si & 3u] = v;
@@ -128,6 +131,7 @@ void main()
     bool relu = (p.flags & 4u) != 0u;
     bool hasAdd = (p.flags & 8u) != 0u;
     bool gelu = (p.flags & 16u) != 0u;
+    bool hswish = (p.flags & 32u) != 0u;
     uint gm0 = oc0 + tm * 4u;
     // constant component indices only: keeps acc[] in registers (no local-memory spill)
     vec4 bias = vec4(
@@ -141,7 +145,7 @@ void main()
         uint n = tn * 8u + uint(j);
         uint oy = oy0 + (n >> 4), ox = ox0 + (n & 15u);
         if (oy >= p.oh || ox >= p.ow || gm0 >= p.oc) continue;
-        uint base = (oy * p.ow + ox) * p.oc + gm0;
+        uint base = xout + (oy * p.ow + ox) * p.oc + gm0;
         vec4 v = acc[j] + bias;
         if (hasAdd)
         {
@@ -158,6 +162,7 @@ void main()
                            0.5 * v.y * (1.0 + ferf(v.y * 0.7071067811865475)),
                            0.5 * v.z * (1.0 + ferf(v.z * 0.7071067811865475)),
                            0.5 * v.w * (1.0 + ferf(v.w * 0.7071067811865475)));
+        if (hswish) v = v * clamp(v * (1.0 / 6.0) + 0.5, vec4(0.0), vec4(1.0));
         o[base] = ET(v.x);
         if (gm0 + 1u < p.oc) o[base + 1u] = ET(v.y);
         if (gm0 + 2u < p.oc) o[base + 2u] = ET(v.z);

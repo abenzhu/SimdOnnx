@@ -134,10 +134,10 @@ internal sealed class VkGraphModel : IDisposable
     private static bool UseCoopConv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return false;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
-        long m = (long)so[1] * so[2];
+        long m = (long)so[0] * so[1] * so[2];
         // SG16 (Intel Xe2) BN=32 build on 1x1 convs hangs the device intermittently (B580, driver
         // 32.0.101.8135): those convs take the per-element shaders until the variant is fixed
         if (dev.CoopM8 && cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && so[3] % 64 != 0) return false;
@@ -204,6 +204,23 @@ internal sealed class VkGraphModel : IDisposable
 
     internal static uint G(uint n) => (n + 255) / 256;
 
+    /// <summary>uints, one float, then more uints (push-constant blocks with a float in the middle).</summary>
+    internal static byte[] PcOf3(uint[] ints, float f, uint[] tail)
+    {
+        byte[] b = new byte[(ints.Length + 1 + tail.Length) * 4];
+        Buffer.BlockCopy(ints, 0, b, 0, ints.Length * 4);
+        BitConverter.GetBytes(f).CopyTo(b, ints.Length * 4);
+        Buffer.BlockCopy(tail, 0, b, (ints.Length + 1) * 4, tail.Length * 4);
+        return b;
+    }
+
+    /// <summary>Shaders without a batch index: the value must hold one image.</summary>
+    private void RequireSingle(int valueId)
+    {
+        if (_plan.Values[valueId].PhysShape is { Length: 4 } s && s[0] != 1)
+            throw new NotSupportedException($"Vulkan: '{_plan.Values[valueId].Name}' batch {s[0]} on a single-image shader");
+    }
+
     /// <summary>
     /// Broadcast strides (padded rank-4, storage order of the output) of operand
     /// <paramref name="a"/> onto output <paramref name="o"/>. Output physical dim i
@@ -236,6 +253,11 @@ internal sealed class VkGraphModel : IDisposable
         // all addressing on storage-order shapes
         int[] shapeIn(int k) => V[n.In[k]].PhysShape;
         int[] shapeOut() => V[n.Out[0]].PhysShape;
+        // spatial ops address [n,h,w,c] from the logical shape: NHWC-equivalent storage of a
+        // 1x1-spatial value may keep an NCHW-ordered PhysShape (same bytes, different dims)
+        int[] nhwc(int v) => V[v].Shape is [var nn, var cc, var hh, var ww] ? [nn, hh, ww, cc] : V[v].PhysShape;
+        int[] nhwcIn(int k) => nhwc(n.In[k]);
+        int[] nhwcOut() => nhwc(n.Out[0]);
         int nOut() => checked((int)V[n.Out[0]].ElementCount);
 
         switch (n.Op)
@@ -288,7 +310,8 @@ internal sealed class VkGraphModel : IDisposable
                 if (p.Pool is { } pool)
                 {
                     // small-ic stem conv + 2x2/2 max pool (GraphCompiler.GpuSmallConv)
-                    int[] ci = shapeIn(0), co = shapeOut(), cw = V[n.In[1]].Shape;
+                    int[] ci = nhwcIn(0), co = nhwcOut(), cw = V[n.In[1]].Shape;
+                    if (ci[0] != 1) throw new NotSupportedException("Vulkan convpool: batch > 1");
                     if (!GraphCompiler.GpuSmallConv(p, cw, ci[3]) || p.AddValue >= 0 || ci[1] != co[1] * 2 || ci[2] != co[2] * 2)
                         throw new NotSupportedException("Vulkan convpool: unsupported conv");
                     uint pf = (p.BiasValue >= 0 ? 1u : 0u) | (p.PadMode == PadMode.Reflect ? 2u : 0u)
@@ -303,9 +326,9 @@ internal sealed class VkGraphModel : IDisposable
                     break;
                 }
                 if (p.AddValue >= 0) RequireNhwc(p.AddValue);
-                int[] si = shapeIn(0), sw_ = V[n.In[1]].Shape, so = shapeOut();   // [1,h,w,c]
+                int[] si = nhwcIn(0), sw_ = V[n.In[1]].Shape, so = nhwcOut();   // [1,h,w,c]
                 uint ih = (uint)si[1], iw = (uint)si[2], ic = (uint)si[3];
-                uint oc = (uint)sw_[0], oh = (uint)so[1], ow = (uint)so[2];
+                uint oc = (uint)sw_[0], oh = (uint)so[1], ow = (uint)so[2], nb = (uint)so[0];
                 if (p.PadMode == PadMode.Constant && p.PadValue != 0f)
                     throw new NotSupportedException("Vulkan conv: nonzero constant pad");
                 if (p.Dilations.Any(d => d != 1))
@@ -316,7 +339,10 @@ internal sealed class VkGraphModel : IDisposable
                     | (p.PadMode == PadMode.Reflect ? 2u : 0u)
                     | (p.Act == ActivationKind.Relu ? 4u : 0u)
                     | (p.AddValue >= 0 ? 8u : 0u)
-                    | (p.Act == ActivationKind.Gelu ? 16u : 0u);
+                    | (p.Act == ActivationKind.Gelu ? 16u : 0u)
+                    | (p.Act == ActivationKind.HardSwish ? 32u : 0u);
+                if (p.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish))
+                    throw new NotSupportedException($"Vulkan conv: {p.Act} epilogue");
                 if (p.Group > 1)
                 {
                     if (p.Group != ic || oc != ic) throw new NotSupportedException("grouped non-depthwise conv");
@@ -324,9 +350,9 @@ internal sealed class VkGraphModel : IDisposable
                     bool v4 = _dev.Vec4Eltwise && ic % 4 == 0;
                     yield return ND(v4 ? "depthwise4" : "depthwise",
                         [Bind(n.In[0]), Bind(n.In[1], CK.DwW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
-                        PcOfF(U((int)ic, (int)ih, (int)iw, (int)oh, (int)ow, p.Kernel[0], p.Kernel[1],
-                            p.Strides[0], p.Strides[1], p.Pads[0], p.Pads[1], (int)(flags & ~8u)), p.PadValue),
-                        G(ic * oh * ow / (v4 ? 4u : 1u)), name: "depthwise");
+                        PcOf3(U((int)ic, (int)ih, (int)iw, (int)oh, (int)ow, p.Kernel[0], p.Kernel[1],
+                            p.Strides[0], p.Strides[1], p.Pads[0], p.Pads[1], (int)(flags & ~8u)), p.PadValue, [nb]),
+                        G(nb * ic * oh * ow / (v4 ? 4u : 1u)), name: "depthwise");
                     break;
                 }
                 if (UseCoopConv(_dev, F16, _plan, n, p))
@@ -334,14 +360,14 @@ internal sealed class VkGraphModel : IDisposable
                     // BM = 128 rows (pixels) in every variant; BN by oc divisibility
                     (string cm, uint bn) = ic % 8 != 0 ? ("conv_cm_n32s", 32u)
                         : oc % 128 == 0 ? ("conv_cm", 128u) : oc % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
-                    uint m = oh * ow, kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic, kd = (kr + 7u) & ~7u;
+                    uint m = nb * oh * ow, kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic, kd = (kr + 7u) & ~7u;
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
                         | (p.PadMode == PadMode.Reflect ? 4u : 0u)
-                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                        | ((p.Act switch { ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, _ => 0u }) << 4);
                     yield return ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvWT), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                         PcOf(m, oc, kd, cflags, ow, iw, ih, ic, (uint)p.Kernel[1],
-                            (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1], kr),
+                            (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1], kr, oh),
                         (m + 127) / 128, (oc + bn - 1) / bn, name: "conv_cm");
                     break;
                 }
@@ -350,7 +376,7 @@ internal sealed class VkGraphModel : IDisposable
                     p.Kernel[0] == 3 && p.Kernel[1] == 3 && p.Strides[0] == 2 && p.Strides[1] == 2 ? "conv_k33s2" :
                     p.Kernel[0] == 1 && p.Kernel[1] == 1 && p.Strides[0] == 1 && p.Strides[1] == 1 ? "conv_k11s1" :
                     "conv_gen";
-                if (_dev.ConvDot && F16 && convShader is "conv_k33s1" or "conv_k33s2" && ic % 4 == 0 && oc % 4 == 0)
+                if (_dev.ConvDot && F16 && nb == 1 && (p.Act != ActivationKind.HardSwish) && convShader is "conv_k33s1" or "conv_k33s2" && ic % 4 == 0 && oc % 4 == 0)
                 {
                     // Adreno 750 sweep (ms, 1600x1152 gc+dr): stride 1 at 4 px x 8 oc, stride 2 at 2 px x 8 oc
                     uint tm = p.Strides[1] == 1 ? 4u : 2u, tn = oc % 8 == 0 ? 2u : 1u;
@@ -368,8 +394,8 @@ internal sealed class VkGraphModel : IDisposable
                     [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                     PcOf(ic, ih, iw, oc, oh, ow, (uint)p.Kernel[0], (uint)p.Kernel[1],
                         (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1],
-                        flags, 0),
-                    (ow + 15) / 16, (oh + 7) / 8, (oc + 63) / 64, name: "conv");
+                        flags, nb),
+                    (ow + 15) / 16, nb * ((oh + 7) / 8), (oc + 63) / 64, name: "conv");
                 break;
             }
 
@@ -377,13 +403,13 @@ internal sealed class VkGraphModel : IDisposable
             {
                 var p = (PoolP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
                 yield return ND(v4 ? "maxpool4" : "maxpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
                         (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
-                        (uint)p.Pads[0], (uint)p.Pads[1], p.FuseRelu ? 1u : 0u),
-                    G((uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "maxpool");
+                        (uint)p.Pads[0], (uint)p.Pads[1], p.FuseRelu ? 1u : 0u, (uint)so[0]),
+                    G((uint)so[0] * (uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "maxpool");
                 break;
             }
 
@@ -414,7 +440,7 @@ internal sealed class VkGraphModel : IDisposable
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
                     yield return ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
-                        PcOf(m, nn, k, cflags, m, m, 1u, k, 1u, 1u, 1u, 0u, 0u, k),
+                        PcOf(m, nn, k, cflags, m, m, 1u, k, 1u, 1u, 1u, 0u, 0u, k, 1u),
                         (m + 127) / 128, (nn + bn - 1) / bn, name: "gemm_cm");
                     break;
                 }
@@ -433,7 +459,7 @@ internal sealed class VkGraphModel : IDisposable
                 }
                 yield return ND("gemm",
                     [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
-                    PcOf(m, nn, k, gflags),
+                    PcOf(m, nn, k, gflags, 0u, 0u, 0u),
                     (nn + 63) / 64, (m + 63) / 64, name: "gemm");
                 break;
             }
@@ -442,9 +468,10 @@ internal sealed class VkGraphModel : IDisposable
             {
                 var p = (ResizeP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
+                RequireSingle(n.In[0]);
                 bool hasAdd = n.In.Length > 1;
                 if (hasAdd) RequireNhwc(n.In[1]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 uint flags = (p.FuseRelu ? 1u : 0u) | (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u);
                 bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
                 yield return ND(v4 ? "bilinear4" : "bilinear", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
@@ -476,14 +503,15 @@ internal sealed class VkGraphModel : IDisposable
             {
                 // only planner relayouts reach here; the perm is physical
                 var p = (TransposeP)n.P!;
-                int[] is4 = Pad4(shapeIn(0));
-                int[] os4 = Pad4(shapeOut());
-                int[] ostr = Strides(os4), istr = Strides(is4);
-                int[] perm4 = PermuteTo4(p.Perm, shapeIn(0).Length);
-                yield return ND("transpose", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOf(U(nOut(), ostr[0], ostr[1], ostr[2],
-                        istr[perm4[0]], istr[perm4[1]], istr[perm4[2]], istr[perm4[3]])),
-                    G((uint)nOut()));
+                int[] is6 = PadR(shapeIn(0)), os6 = PadR(shapeOut());
+                int[] ostr = StridesR(os6), istr = StridesR(is6);
+                int[] perm6 = PermuteToR(p.Perm, shapeIn(0).Length);
+                uint[] pc = new uint[12];
+                pc[0] = (uint)nOut();
+                for (int k = 0; k < 5; k++) pc[1 + k] = (uint)ostr[k];
+                for (int k = 0; k < 6; k++) pc[6 + k] = (uint)istr[perm6[k]];
+                (uint tx, uint ty) = G2((uint)nOut());
+                yield return ND("transpose", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty);
                 break;
             }
 
@@ -491,21 +519,20 @@ internal sealed class VkGraphModel : IDisposable
             {
                 // SliceP.Axes are physical after the layout pass
                 var p = (SliceP)n.P!;
-                int[] is4 = Pad4(shapeIn(0)), os4 = Pad4(shapeOut());
-                int[] ostr = Strides(os4), istr = Strides(is4);
-                uint[] st = [0, 0, 0, 0], sp = [1, 1, 1, 1];
-                int shift = 4 - shapeIn(0).Length;
+                int[] is6 = PadR(shapeIn(0)), os6 = PadR(shapeOut());
+                int[] ostr = StridesR(os6), istr = StridesR(is6);
+                uint[] pc = new uint[24];
+                pc[0] = (uint)nOut();
+                for (int k = 0; k < 5; k++) pc[1 + k] = (uint)ostr[k];
+                for (int k = 0; k < 6; k++) { pc[12 + k] = 1; pc[18 + k] = (uint)istr[k]; }
+                int shift = MaxRank - shapeIn(0).Length;
                 for (int i = 0; i < p.Axes.Length; i++)
                 {
-                    st[p.Axes[i] + shift] = (uint)p.Starts[i];
-                    sp[p.Axes[i] + shift] = (uint)p.Steps[i];
+                    pc[6 + p.Axes[i] + shift] = (uint)p.Starts[i];
+                    pc[12 + p.Axes[i] + shift] = (uint)p.Steps[i];
                 }
-                yield return ND("slice", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOf(U(nOut(), ostr[0], ostr[1], ostr[2],
-                        (int)st[0], (int)st[1], (int)st[2], (int)st[3],
-                        (int)sp[0], (int)sp[1], (int)sp[2], (int)sp[3],
-                        istr[0], istr[1], istr[2], istr[3])),
-                    G((uint)nOut()));
+                (uint tx, uint ty) = G2((uint)nOut());
+                yield return ND("slice", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty);
                 break;
             }
 
@@ -544,10 +571,10 @@ internal sealed class VkGraphModel : IDisposable
             case ExecOp.GlobalAvgPool:
             {
                 RequireNhwc(n.In[0]);
-                int[] si = shapeIn(0);
+                int[] si = nhwcIn(0);
                 uint hw = (uint)si[1] * (uint)si[2];
                 yield return ND("gap", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOfF([(uint)si[3], hw], 1f / hw), ((uint)si[3] + 63) / 64);
+                    PcOfF([(uint)si[3], hw], 1f / hw), ((uint)si[3] + 63) / 64, (uint)si[0]);
                 break;
             }
 
@@ -555,7 +582,8 @@ internal sealed class VkGraphModel : IDisposable
             {
                 var p = (ConvTP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                RequireSingle(n.In[0]);
+                int[] si = nhwcIn(0), so = nhwcOut();
                 uint act = p.Act switch { ActivationKind.None => 0u, ActivationKind.Relu => 1u, ActivationKind.Sigmoid => 2u,
                     _ => throw new NotSupportedException($"Vulkan ConvTranspose: {p.Act}") };
                 yield return ND("convt", [Bind(n.In[0]), Bind(n.In[1], CK.ConvTW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
@@ -569,10 +597,60 @@ internal sealed class VkGraphModel : IDisposable
             {
                 var p = (ResizeNearestP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                RequireSingle(n.In[0]);
+                int[] si = nhwcIn(0), so = nhwcOut();
                 yield return ND("nearest", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2]], p.Scales[2], p.Scales[3]),
                     G((uint)nOut()));
+                break;
+            }
+
+            case ExecOp.HardSwish or ExecOp.Swish:
+                yield return ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)nOut(), n.Op == ExecOp.HardSwish ? 5u : 6u), G((uint)nOut()));
+                break;
+
+            case ExecOp.Softmax:
+            {
+                CValue x = V[n.In[0]];
+                uint len = (uint)x.Shape[^1];
+                if ((uint)shapeIn(0)[^1] != len) throw new NotSupportedException("Vulkan Softmax: last axis not innermost");
+                uint rows = (uint)(x.ElementCount / len);
+                uint gx = Math.Min(rows, 65535u);
+                yield return ND("softmax", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(rows, len),
+                    gx, (rows + gx - 1) / gx, name: "softmax");
+                break;
+            }
+
+            case ExecOp.AvgPool:
+            {
+                var p = (PoolP)n.P!;
+                RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
+                int[] si = nhwcIn(0), so = nhwcOut();
+                yield return ND("avgpool", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
+                        (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
+                        (uint)p.Pads[0], (uint)p.Pads[1], p.CountIncludePad ? 1u : 0u, (uint)so[0]),
+                    G((uint)nOut()), name: "avgpool");
+                break;
+            }
+
+            case ExecOp.MatMul:
+            {
+                // batched [.., M, K] x [.., K, N] on logical (identity-layout) storage; B may broadcast
+                CValue a = V[n.In[0]], b = V[n.In[1]], o = V[n.Out[0]];
+                if (a.Layout is not null && !a.Layout.SequenceEqual(Engine.Layout.Identity(a.Shape.Length)) ||
+                    b.Layout is not null && !b.Layout.SequenceEqual(Engine.Layout.Identity(b.Shape.Length)) ||
+                    o.Layout is not null && !o.Layout.SequenceEqual(Engine.Layout.Identity(o.Shape.Length)))
+                    throw new NotSupportedException("Vulkan MatMul: permuted layout");
+                uint m = (uint)a.Shape[^2], k = (uint)a.Shape[^1], nn = (uint)b.Shape[^1];
+                uint batch = (uint)(o.ElementCount / ((long)m * nn));
+                long aBatch = a.ElementCount / ((long)m * k), bBatch = b.ElementCount / ((long)k * nn);
+                if (aBatch != batch || (bBatch != batch && bBatch != 1))
+                    throw new NotSupportedException("Vulkan MatMul: batch broadcast");
+                yield return ND("gemm", [Bind(n.In[0]), Bind(n.In[1]), B(-1, CK.F32), Bind(n.Out[0])],
+                    PcOf(m, nn, k, 0u, m * k, bBatch == 1 ? 0u : k * nn, m * nn),
+                    (nn + 63) / 64, (m + 63) / 64, batch, name: "matmul");
                 break;
             }
 
@@ -620,6 +698,39 @@ internal sealed class VkGraphModel : IDisposable
     }
 
     // pad a shape to rank 4 with leading 1s
+    private const int MaxRank = 6;
+
+    /// <summary>Right-aligned rank-6 view (leading 1s) for the generic slice / transpose shaders.</summary>
+    private static int[] PadR(int[] s)
+    {
+        if (s.Length > MaxRank) throw new NotSupportedException($"Vulkan: rank {s.Length} > {MaxRank}");
+        int[] r = [1, 1, 1, 1, 1, 1];
+        s.CopyTo(r, MaxRank - s.Length);
+        return r;
+    }
+
+    private static int[] StridesR(int[] shape6)
+    {
+        int[] s = new int[MaxRank]; s[MaxRank - 1] = 1;
+        for (int i = MaxRank - 2; i >= 0; i--) s[i] = s[i + 1] * shape6[i + 1];
+        return s;
+    }
+
+    private static int[] PermuteToR(int[] perm, int rank)
+    {
+        int shift = MaxRank - rank;
+        int[] p6 = [0, 1, 2, 3, 4, 5];
+        for (int i = 0; i < rank; i++) p6[i + shift] = perm[i] + shift;
+        return p6;
+    }
+
+    /// <summary>256-thread groups for n items, split over x/y past the 65535 x-limit.</summary>
+    internal static (uint x, uint y) G2(uint n)
+    {
+        uint g = G(n), gx = Math.Min(g, 65535u);
+        return (gx, (g + gx - 1) / gx);
+    }
+
     private static int[] Pad4(int[] s)
     {
         if (s.Length == 4) return s;

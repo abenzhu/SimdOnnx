@@ -13,8 +13,9 @@ layout(set = 0, binding = 3) writeonly buffer O { ET o[]; };
 layout(push_constant) uniform PC {
     uint c, ih, iw, oh, ow;
     uint kh, kw, sh, sw, pt, pl;
-    uint flags;         // bit0 hasBias, bit1 reflect, bit2 relu, bit4 gelu
+    uint flags;         // bit0 hasBias, bit1 reflect, bit2 relu, bit4 gelu, bit5 hardswish
     float padVal;
+    uint n;             // batch (images of ih x iw)
 } p;
 
 int mirror(int i, int d) { if (d <= 1) return 0; while (i < 0 || i >= d) i = i < 0 ? -i : 2 * d - 2 - i; return i; }
@@ -31,9 +32,10 @@ float ferf(float v)
 void main()
 {
     uint id = gl_GlobalInvocationID.x;
-    if (id >= p.c * p.oh * p.ow) return;
+    if (id >= p.c * p.oh * p.ow * max(p.n, 1u)) return;
     uint ch = id % p.c, px = id / p.c;
-    uint ox = px % p.ow, oy = px / p.ow;
+    uint ox = px % p.ow, oyg = px / p.ow;
+    uint img = oyg / p.oh, oy = oyg - img * p.oh, ibase = img * p.ih;
     bool refl = (p.flags & 2u) != 0u;
     float acc = ((p.flags & 1u) != 0u) ? b[ch] : 0.0;
     for (uint ky = 0u; ky < p.kh; ky++)
@@ -47,11 +49,12 @@ void main()
             bool oob = uint(sy) >= p.ih || uint(sx) >= p.iw;
             int yy = refl ? mirror(sy, int(p.ih)) : clamp(sy, 0, int(p.ih) - 1);
             int xx = refl ? mirror(sx, int(p.iw)) : clamp(sx, 0, int(p.iw) - 1);
-            float xv = float(x[(uint(yy) * p.iw + uint(xx)) * p.c + ch]);
+            float xv = float(x[((ibase + uint(yy)) * p.iw + uint(xx)) * p.c + ch]);
             acc += wv * (oob && !refl ? p.padVal : xv);
         }
     }
     if ((p.flags & 4u) != 0u) acc = max(acc, 0.0);
     if ((p.flags & 16u) != 0u) acc = 0.5 * acc * (1.0 + ferf(acc * 0.7071067811865475));
+    if ((p.flags & 32u) != 0u) acc = acc * clamp(acc * (1.0 / 6.0) + 0.5, 0.0, 1.0);
     o[id] = ET(acc);
 }

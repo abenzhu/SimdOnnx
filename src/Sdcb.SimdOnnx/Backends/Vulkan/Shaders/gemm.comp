@@ -2,7 +2,8 @@
 #extension GL_GOOGLE_include_directive : require
 #include "et.glsl"
 // Tiled GEMM: C[M,N] = A[M,K] * B + bias[N]; B is [K,N] or [N,K] when transB.
-// Tile 64x64, K-chunk 16, 256 threads -> 4x4 each.
+// Tile 64x64, K-chunk 16, 256 threads -> 4x4 each. Workgroup z = batch (element strides sa/sb/so;
+// sb = 0 broadcasts B).
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer A  { ET a[]; };
@@ -13,6 +14,7 @@ layout(set = 0, binding = 3) writeonly buffer O { ET o[]; };
 layout(push_constant) uniform PC {
     uint m, n, k;
     uint flags;     // bit0 transB, bit1 hasBias, bit2 relu, bit3 gelu
+    uint sa, sb, so;
 } p;
 
 const uint BM = 64u, BN = 64u, BK = 16u;
@@ -35,6 +37,7 @@ void main()
     uint tid = gl_LocalInvocationID.x;
     uint ty = tid >> 4, tx = tid & 15u;
     bool transB = (p.flags & 1u) != 0u;
+    uint za = gl_WorkGroupID.z * p.sa, zb = gl_WorkGroupID.z * p.sb, zo = gl_WorkGroupID.z * p.so;
 
     float acc[4][4];
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.0;
@@ -45,7 +48,7 @@ void main()
         {
             uint kk = e >> 6, mm = e & 63u;
             uint gm = m0 + mm, gk = k0 + kk;
-            As[e] = (gm < p.m && gk < p.k) ? float(a[gm * p.k + gk]) : 0.0;
+            As[e] = (gm < p.m && gk < p.k) ? float(a[za + gm * p.k + gk]) : 0.0;
         }
         for (uint e = tid; e < BK * BN; e += 256u)
         {
@@ -53,7 +56,7 @@ void main()
             uint gn = n0 + nn, gk = k0 + kk;
             float v = 0.0;
             if (gn < p.n && gk < p.k)
-                v = float(transB ? b[gn * p.k + gk] : b[gk * p.n + gn]);
+                v = float(transB ? b[zb + gn * p.k + gk] : b[zb + gk * p.n + gn]);
             Bs[e] = v;
         }
         barrier();
@@ -82,7 +85,7 @@ void main()
             if (hasBias) v += bs[gn];
             if ((p.flags & 4u) != 0u) v = max(v, 0.0);
             if ((p.flags & 8u) != 0u) v = 0.5 * v * (1.0 + ferf(v * 0.7071067811865475));
-            o[gm * p.n + gn] = ET(v);
+            o[zo + gm * p.n + gn] = ET(v);
         }
     }
 }

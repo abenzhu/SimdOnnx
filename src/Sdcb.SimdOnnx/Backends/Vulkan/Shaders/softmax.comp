@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// Row softmax over contiguous rows of `len` (the last axis): one 256-thread workgroup per row,
+// max / sum-of-exp reductions in shared memory, fp32 math.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint rows, len; } p;
+
+shared float red[256];
+
+void main()
+{
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (row >= p.rows) return;
+    uint t = gl_LocalInvocationID.x, base = row * p.len;
+    float m = -3.4e38;
+    for (uint i = t; i < p.len; i += 256u) m = max(m, float(x[base + i]));
+    red[t] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (t < s) red[t] = max(red[t], red[t + s]);
+        barrier();
+    }
+    m = red[0];
+    barrier();
+    float sum = 0.0;
+    for (uint i = t; i < p.len; i += 256u) sum += exp(float(x[base + i]) - m);
+    red[t] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (t < s) red[t] += red[t + s];
+        barrier();
+    }
+    float inv = 1.0 / red[0];
+    for (uint i = t; i < p.len; i += 256u) o[base + i] = ET(exp(float(x[base + i]) - m) * inv);
+}
