@@ -42,7 +42,11 @@ internal static class SimdMath
         var y = p * (r * r) + r + Vector<float>.One;
         // scale by 2^n
         var ni = Vector.ConvertToInt32(nf) + new Vector<int>(127);
+#if NET
         var pow2n = Vector.AsVectorSingle(ni << 23);
+#else
+        var pow2n = Vector.AsVectorSingle(ni * new Vector<int>(1 << 23));
+#endif
         return y * pow2n;
     }
 
@@ -56,7 +60,7 @@ internal static class SimdMath
 
     // ---------- sigmoid = 1/(1+e^-x) ----------
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector<float> SigmoidV(Vector<float> x) =>
+    internal static Vector<float> SigmoidV(Vector<float> x) =>
         Vector<float>.One / (Vector<float>.One + Exp(-x));
 
     public static void Sigmoid(ReadOnlySpan<float> src, Span<float> dst)
@@ -69,7 +73,7 @@ internal static class SimdMath
 
     // ---------- erf(x): Abramowitz–Stegun 7.1.26 (max ~1.5e-7) ----------
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector<float> ErfV(Vector<float> x)
+    internal static Vector<float> ErfV(Vector<float> x)
     {
         var sign = Vector.ConditionalSelect(Vector.LessThan(x, Vector<float>.Zero),
             -Vector<float>.One, Vector<float>.One);
@@ -94,6 +98,10 @@ internal static class SimdMath
     }
 
     // ---------- gelu(x) = 0.5*x*(1+erf(x/√2)) ----------
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector<float> GeluV(Vector<float> x) =>
+        new Vector<float>(0.5f) * x * (Vector<float>.One + ErfV(x * new Vector<float>(0.70710678118654752f)));
+
     public static void Gelu(ReadOnlySpan<float> src, Span<float> dst)
     {
         int n = src.Length, i = 0, VL = Vector<float>.Count;

@@ -309,7 +309,7 @@ internal static unsafe partial class Nhwc
     /// calls out — passing the accumulators to a helper (by reference under the x64 ABIs) makes
     /// RyuJIT keep all twelve on the stack, a load + store around every FMA.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void TileAvxK(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
     {
         F32x8 a0 = Avx.LoadVector256(bb), b0 = Avx.LoadVector256(bb + 8);
@@ -383,6 +383,11 @@ internal static unsafe partial class Nhwc
             TileVec4(ptrs, rows, taps, ic, wb, bb, outp, addp, oc, lanes, act);
             return;
         }
+        if (vec && VL == 8)
+        {
+            TileVec8(ptrs, rows, taps, ic, wb, bb, outp, addp, oc, lanes, act);
+            return;
+        }
         float* acc = stackalloc float[Ob];
         for (int i = 0; i < rows; i++)
         {
@@ -416,7 +421,7 @@ internal static unsafe partial class Nhwc
     /// accumulators (+4 weight vectors), instead of a stack accumulator round-tripped through
     /// memory on every multiply-add. Same per-lane op order (acc + w·x) as the generic loop.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void TileVec4(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
         float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
@@ -497,7 +502,7 @@ internal static unsafe partial class Nhwc
     }
 
     // a static row body: pointer stores in a closure would force every captured value to be reloaded
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static void DwRow(in DwArgs a, int t)
     {
         int img = t / a.Oh, y = t - img * a.Oh;
@@ -521,7 +526,8 @@ internal static unsafe partial class Nhwc
         int VL = Vector<float>.Count, sw = a.Sw;
         float** ptrs4 = stackalloc float*[taps * 4];
         // interior groups of 4 pixels address taps from kh row bases: no per-pixel pointer table
-        bool runs = avx ? c % 8 == 0 : neon && c % 4 == 0;
+        bool vec8 = !avx && !neon && UseVec8;
+        bool runs = avx || vec8 ? c % 8 == 0 : neon && c % 4 == 0;
         float** rows = stackalloc float*[kh];
         for (int ky = 0; ky < kh; ky++)
         {
@@ -537,7 +543,8 @@ internal static unsafe partial class Nhwc
                 float** rp = ptrs4;
                 for (int ky = 0; ky < kh; ky++) rp[ky] = rows[ky] + col;
                 if (avx) DwRunAvx(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
-                else DwRunNeon(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
+                else if (neon) DwRunNeon(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
+                else DwRunVec(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
                 continue;
             }
             float** pp = ptrs4;
@@ -558,7 +565,8 @@ internal static unsafe partial class Nhwc
             long ob0 = ((long)y * ow + x0) * c;
             float* ad0 = ap == null ? null : ap + ob0;
             int done = avx ? DwBlockAvx(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act)
-                : neon ? DwBlockNeon(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act) : 0;
+                : neon ? DwBlockNeon(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act)
+                : vec8 ? DwBlockVec(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act) : 0;
             if (done == c) continue;
             for (int px = 0; px < np; px++)
             {
@@ -566,7 +574,7 @@ internal static unsafe partial class Nhwc
                 float* o = dp + ob0 + (long)px * c;
                 float* ad = ad0 == null ? null : ad0 + (long)px * c;
                 int ch = done;
-                if (avx || neon) { }
+                if (avx || neon || vec8) { }
                 else if (UsePacked)
                     ch = DepthwisePixelPk(ptrs, taps, c, wp, bp, ad, o, act);
                 else if (Vector.IsHardwareAccelerated && act is ActivationKind.None or ActivationKind.Relu)

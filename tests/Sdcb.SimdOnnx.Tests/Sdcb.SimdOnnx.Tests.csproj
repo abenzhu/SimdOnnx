@@ -2,7 +2,17 @@
   <PropertyGroup>
     <AssemblyName>Sdcb.SimdOnnx.Tests</AssemblyName>
     <RootNamespace>Sdcb.SimdOnnx.Tests</RootNamespace>
+    <TargetFramework></TargetFramework>
+    <!-- net48 runs the netstandard2.0 build (Vector<T> / scalar tiers) on .NET Framework (Windows only). -->
+    <TargetFrameworks>net10.0</TargetFrameworks>
+    <TargetFrameworks Condition="'$(OS)' == 'Windows_NT'">net10.0;net48</TargetFrameworks>
   </PropertyGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <!-- hardware-intrinsic kernels and GPU backends are net10.0 only -->
+    <Compile Remove="Avx512KernelTests.cs;NeonKernelTests.cs;MtlKernelTests.cs;VkKernelTests.cs;VkDebugTests.cs" />
+    <PackageReference Include="PolySharp" Version="1.15.0" PrivateAssets="all" />
+    <PackageReference Include="System.Text.Json" Version="10.0.0" />
+  </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>

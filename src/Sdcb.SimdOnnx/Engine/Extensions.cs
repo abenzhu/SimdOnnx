@@ -1,6 +1,8 @@
 using System.Reflection;
+#if NET
 using Sdcb.SimdOnnx.Backends.Metal;
 using Sdcb.SimdOnnx.Backends.Vulkan;
+#endif
 
 namespace Sdcb.SimdOnnx.Engine;
 
@@ -33,12 +35,14 @@ internal abstract class ExtOp
 
     /// <summary>Consts the Vulkan dispatches bind, with the packing each needs.</summary>
     public virtual IEnumerable<(int value, ConstKind kind)> GpuConsts(ExecNode n) => [];
+#if NET
 
     public virtual IEnumerable<VkDispatch> EmitVulkan(VkGraphModel g, ExecNode n) =>
         throw new NotSupportedException($"Vulkan: extension op {Name} not implemented");
 
     public virtual IEnumerable<MtlDispatch> EmitMetal(MtlGraphModel g, ExecNode n) =>
         throw new NotSupportedException($"Metal: extension op {Name} not implemented");
+#endif
 }
 
 /// <summary>When a <see cref="GraphPass"/> runs.</summary>
@@ -213,8 +217,12 @@ internal static class GpuPack
         {
             if (half)
             {
+#if NET
                 Span<Half> dst = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, Half>(host.AsSpan(checked((int)off), data.Length * 2));
                 for (int i = 0; i < data.Length; i++) dst[i] = (Half)data[i];
+#else
+                throw new PlatformNotSupportedException("fp16 GPU constants need net10.0.");
+#endif
             }
             else
                 System.Runtime.InteropServices.MemoryMarshal.AsBytes(data.AsSpan()).CopyTo(host.AsSpan(checked((int)off)));

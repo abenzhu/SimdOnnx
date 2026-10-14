@@ -910,7 +910,7 @@ internal static class GraphCompiler
                 if (end < 0) end += rank;
                 start = Math.Clamp(start, 0, rank);
                 end = Math.Clamp(end, 0, rank);
-                long[] dims = x.Shape[start..end].Select(d => (long)d).ToArray();
+                long[] dims = x.Shape.AsSpan()[start..end].ToArray().Select(d => (long)d).ToArray();
                 AddValue(new CValue { Name = n.Outputs[0], Shape = [dims.Length], DType = 7, Ints = dims });
                 return;
             }
@@ -1165,7 +1165,7 @@ internal static class GraphCompiler
             int[] dil = n.IntsAttr("dilations").Select(v => (int)v).ToArray();
             if (dil.Length == 0) dil = Enumerable.Repeat(1, wd.Length - 2).ToArray();
             if (n.StringAttr("auto_pad", "NOTSET") is "SAME_UPPER")
-                pads = SameUpperPads(x.Shape[2..], wd[2..], strides, dil);
+                pads = SameUpperPads(x.Shape.AsSpan()[2..].ToArray(), wd.AsSpan()[2..].ToArray(), strides, dil);
             int group = (int)n.IntAttr("group", 1);
             int[] outShape = new int[wd.Length];
             outShape[0] = x.Shape[0];
@@ -1180,7 +1180,7 @@ internal static class GraphCompiler
                 new ConvP
                 {
                     Pads = pads, Strides = strides, Dilations = dil,
-                    Kernel = wd[2..], Group = group, BiasValue = biasV,
+                    Kernel = wd.AsSpan()[2..].ToArray(), Group = group, BiasValue = biasV,
                 }, n);
         }
 
@@ -1195,7 +1195,7 @@ internal static class GraphCompiler
             int[] pads = n.IntsAttr("pads").Select(v => (int)v).ToArray();
             if (pads.Length == 0) pads = new int[2 * kernel.Length];
             if (n.StringAttr("auto_pad", "NOTSET") is "SAME_UPPER")
-                pads = SameUpperPads(x.Shape[2..], kernel, strides, Enumerable.Repeat(1, kernel.Length).ToArray());
+                pads = SameUpperPads(x.Shape.AsSpan()[2..].ToArray(), kernel, strides, Enumerable.Repeat(1, kernel.Length).ToArray());
             int[] outShape = (int[])x.Shape.Clone();
             for (int d = 0; d < kernel.Length; d++)
                 outShape[2 + d] = (x.Shape[2 + d] + pads[d] + pads[d + kernel.Length] - kernel[d]) / strides[d] + 1;
@@ -1245,7 +1245,7 @@ internal static class GraphCompiler
                 throw new NotSupportedException($"ReduceMean '{n.Name}': axes [{string.Join(',', axes)}] (rank {rank}).");
             int[] shape = (int[])x.Shape.Clone();
             shape[^1] = 1;
-            if (!keep) shape = shape[..^1];
+            if (!keep) shape = shape.AsSpan()[..^1].ToArray();
             Emit(ExecOp.ReduceMean, [Input(0, n)], ActivationValue(n.Outputs[0], shape), null, n);
         }
 
@@ -1288,7 +1288,7 @@ internal static class GraphCompiler
                 Emit(ExecOp.Gemm, [Input(0, n), Input(1, n)], ActivationValue(n.Outputs[0], gs), new GemmP(), n);
                 return;
             }
-            int[] ab = a.Shape[..^2], bb = b.Shape[..^2];
+            int[] ab = a.Shape.AsSpan()[..^2].ToArray(), bb = b.Shape.AsSpan()[..^2].ToArray();
             int[] batch = BroadcastShape(ab, bb);
             int[] shape = [.. batch, a.Shape[^2], b.Shape[^1]];
             Emit(ExecOp.MatMul, [Input(0, n), Input(1, n)], ActivationValue(n.Outputs[0], shape), null, n);
@@ -1317,7 +1317,7 @@ internal static class GraphCompiler
         {
             CValue x = V(Input(0, n));
             CValue w = V(Input(1, n));   // [ic, oc/group, kh, kw]
-            int[] k = w.Shape[2..];
+            int[] k = w.Shape.AsSpan()[2..].ToArray();
             int[] strides = n.IntsAttr("strides").Select(v => (int)v).ToArray();
             if (strides.Length == 0) strides = [1, 1];
             int[] pads = n.IntsAttr("pads").Select(v => (int)v).ToArray();

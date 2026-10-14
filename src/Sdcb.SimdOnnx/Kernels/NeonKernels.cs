@@ -27,7 +27,7 @@ internal static unsafe class NeonKernels
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static void LayerNormRow(float* xr, float* dr, int c, float* wp, float* bp, float eps)
     {
         V4 sum = V4.Zero, sq = V4.Zero;

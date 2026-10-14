@@ -29,7 +29,7 @@ internal static unsafe partial class Nhwc
         && Environment.GetEnvironmentVariable("DOTNET_EnableAVX512F") != "0";
 
     /// <summary>Tile5 rows × 32 oc: dst[r*ds + 0..15] ← block wb, dst[r*ds + 16..31] ← block wb + wStep.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void Tile512x32(float** ptrs, int taps, int ic, float* wb, long wStep, float* bb, float* dst, int ds)
     {
         F32x16 a0 = Avx512F.LoadVector512(bb), b0 = Avx512F.LoadVector512(bb + Ob);
@@ -79,7 +79,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>Tile5 rows × 16 oc (odd block count tail): dst[r*ds + 0..15].</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void Tile512x16(float** ptrs, int taps, int ic, float* wb, float* bb, float* dst, int ds)
     {
         F32x16 a0 = Avx512F.LoadVector512(bb);

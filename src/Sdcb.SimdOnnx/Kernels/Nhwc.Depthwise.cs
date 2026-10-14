@@ -19,7 +19,7 @@ namespace Sdcb.SimdOnnx.Kernels;
 internal static unsafe partial class Nhwc
 {
     /// <returns>Number of leading channels handled (multiple of the vector width).</returns>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static int DwBlockAvx(float** ptrs, int taps, int c, float* w, float* b, float* o, float* ad, int np, ActivationKind act)
     {
         int ch = 0;
@@ -91,7 +91,7 @@ internal static unsafe partial class Nhwc
     /// <paramref name="rows"/> (kernel-row bases at pixel 0's first column), pixel stride
     /// <paramref name="ps"/> floats, tap stride <paramref name="c"/>.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void DwRunAvx(float** rows, int kh, int kw, int c, int ps, float* w, float* b, float* o, float* ad, ActivationKind act)
     {
         int ch = 0;
@@ -156,7 +156,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <inheritdoc cref="DwRunAvx"/>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void DwRunNeon(float** rows, int kh, int kw, int c, int ps, float* w, float* b, float* o, float* ad, ActivationKind act)
     {
         int ch = 0;
@@ -221,7 +221,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <inheritdoc cref="DwBlockAvx"/>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static int DwBlockNeon(float** ptrs, int taps, int c, float* w, float* b, float* o, float* ad, int np, ActivationKind act)
     {
         int ch = 0;

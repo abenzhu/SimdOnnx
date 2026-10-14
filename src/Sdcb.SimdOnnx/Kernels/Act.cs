@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Wasm;
@@ -15,48 +16,55 @@ internal static unsafe class Act
 
     internal interface IAct
     {
-        static abstract Vector256<float> V(Vector256<float> x);
-        static abstract Vector128<float> V(Vector128<float> x);
-        static abstract float S(float x);
+        Vector256<float> V(Vector256<float> x);
+        Vector128<float> V(Vector128<float> x);
+        Vector<float> V(Vector<float> x);
+        float S(float x);
     }
 
     private struct Relu : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) => Vector256.Max(x, Vector256<float>.Zero);
-        public static Vector128<float> V(Vector128<float> x) => Vector128.Max(x, Vector128<float>.Zero);
-        public static float S(float x) => MathF.Max(x, 0f);
+        public Vector<float> V(Vector<float> x) => Vector.Max(x, Vector<float>.Zero);
+        public Vector256<float> V(Vector256<float> x) => Vector256.Max(x, Vector256<float>.Zero);
+        public Vector128<float> V(Vector128<float> x) => Vector128.Max(x, Vector128<float>.Zero);
+        public float S(float x) => MathF.Max(x, 0f);
     }
     private struct Sigmoid : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) => SimdMath.SigmoidCore(x);
-        public static Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.SigmoidPk(x) : SimdMath.SigmoidCore(x);
-        public static float S(float x) => 1f / (1f + MathF.Exp(-x));
+        public Vector<float> V(Vector<float> x) => SimdMath.SigmoidV(x);
+        public Vector256<float> V(Vector256<float> x) => SimdMath.SigmoidCore(x);
+        public Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.SigmoidPk(x) : SimdMath.SigmoidCore(x);
+        public float S(float x) => 1f / (1f + MathF.Exp(-x));
     }
     private struct Gelu : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) => SimdMath.GeluCore(x);
-        public static Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.GeluPk(x) : SimdMath.GeluCore(x);
-        public static float S(float x) => 0.5f * x * (1f + SimdMath.ErfScalar(x * 0.70710678118654752f));
+        public Vector<float> V(Vector<float> x) => SimdMath.GeluV(x);
+        public Vector256<float> V(Vector256<float> x) => SimdMath.GeluCore(x);
+        public Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.GeluPk(x) : SimdMath.GeluCore(x);
+        public float S(float x) => 0.5f * x * (1f + SimdMath.ErfScalar(x * 0.70710678118654752f));
     }
     private struct Erf : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) => SimdMath.ErfCore(x);
-        public static Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.ErfPk(x) : SimdMath.ErfCore(x);
-        public static float S(float x) => SimdMath.ErfScalar(x);
+        public Vector<float> V(Vector<float> x) => SimdMath.ErfV(x);
+        public Vector256<float> V(Vector256<float> x) => SimdMath.ErfCore(x);
+        public Vector128<float> V(Vector128<float> x) => PackedSimd.IsSupported ? SimdMath.ErfPk(x) : SimdMath.ErfCore(x);
+        public float S(float x) => SimdMath.ErfScalar(x);
     }
     private struct HardSwish : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) =>
+        public Vector<float> V(Vector<float> x) => x * Vector.Min(Vector.Max(x * new Vector<float>(1f / 6f) + new Vector<float>(0.5f), Vector<float>.Zero), Vector<float>.One);
+        public Vector256<float> V(Vector256<float> x) =>
             x * Vector256.Min(Vector256.Max(x * Vector256.Create(1f / 6f) + Vector256.Create(0.5f), Vector256<float>.Zero), Vector256<float>.One);
-        public static Vector128<float> V(Vector128<float> x) =>
+        public Vector128<float> V(Vector128<float> x) =>
             x * Vector128.Min(Vector128.Max(x * Vector128.Create(1f / 6f) + Vector128.Create(0.5f), Vector128<float>.Zero), Vector128<float>.One);
-        public static float S(float x) => x * Math.Clamp(x * (1f / 6f) + 0.5f, 0f, 1f);
+        public float S(float x) => x * Math.Clamp(x * (1f / 6f) + 0.5f, 0f, 1f);
     }
     private struct Swish : IAct
     {
-        public static Vector256<float> V(Vector256<float> x) => x * SimdMath.SigmoidCore(x);
-        public static Vector128<float> V(Vector128<float> x) => x * (PackedSimd.IsSupported ? SimdMath.SigmoidPk(x) : SimdMath.SigmoidCore(x));
-        public static float S(float x) => x / (1f + MathF.Exp(-x));
+        public Vector<float> V(Vector<float> x) => x * SimdMath.SigmoidV(x);
+        public Vector256<float> V(Vector256<float> x) => x * SimdMath.SigmoidCore(x);
+        public Vector128<float> V(Vector128<float> x) => x * (PackedSimd.IsSupported ? SimdMath.SigmoidPk(x) : SimdMath.SigmoidCore(x));
+        public float S(float x) => x / (1f + MathF.Exp(-x));
     }
 
     public static void Apply(float* s, float* d, long n, ActivationKind act)
@@ -87,14 +95,17 @@ internal static unsafe class Act
         });
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static void Run<T>(float* s, float* d, long n) where T : struct, IAct
     {
         long i = 0;
         if (Vector256.IsHardwareAccelerated)
-            for (; i + 8 <= n; i += 8) T.V(Vector256.Load(s + i)).Store(d + i);
+            for (; i + 8 <= n; i += 8) default(T).V(Vector256.Load(s + i)).Store(d + i);
         else if (Vector128.IsHardwareAccelerated)
-            for (; i + 4 <= n; i += 4) T.V(Vector128.Load(s + i)).Store(d + i);
-        for (; i < n; i++) d[i] = T.S(s[i]);
+            for (; i + 4 <= n; i += 4) default(T).V(Vector128.Load(s + i)).Store(d + i);
+        else if (Vector.IsHardwareAccelerated)
+            for (int vl = Vector<float>.Count; i + vl <= n; i += vl)
+                Unsafe.WriteUnaligned(d + i, default(T).V(Unsafe.ReadUnaligned<Vector<float>>(s + i)));
+        for (; i < n; i++) d[i] = default(T).S(s[i]);
     }
 }

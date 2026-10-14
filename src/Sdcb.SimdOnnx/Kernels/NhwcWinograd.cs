@@ -250,7 +250,7 @@ internal static unsafe partial class Nhwc
         (uint)i < (uint)n ? i : reflect ? Reflect(i, n) : -1;
 
     /// <summary>V[xi] = (B^T d B)[xi] for one tile, all channels; V row stride per xi = vStride.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void InputTransform(float** d, int ic, float* v, long vStride)
     {
         int VL = Vector<float>.Count;
@@ -291,7 +291,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>tmp[(py*4+px)*16 + l] = (A^T m A)[py,px] for one tile's 16 oc lanes; m row stride per xi = mStride.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void OutputTransform(float* m, long mStride, float* tmp)
     {
         int VL = Vector<float>.Count;
@@ -329,7 +329,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary><see cref="InputTransform"/> with 16 lanes (AVX-512; ic % 16 == 0). Same per-lane ops → same bits.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void InputTransform512(float** d, int ic, float* v, long vStride)
     {
         var t = stackalloc Vector512<float>[36];
@@ -366,7 +366,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary><see cref="OutputTransform"/> with one 16-lane vector per element (AVX-512).</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void OutputTransform512(float* m, long mStride, float* tmp)
     {
         var s = stackalloc Vector512<float>[24];

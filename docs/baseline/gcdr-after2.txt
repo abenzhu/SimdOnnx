@@ -1,0 +1,14 @@
+cpu-e2e 1600x1152 t=1        cpu e2e 1600x1152: 945.6 ms  peakWS=303MB
+cpu-nets 1600x1152 t=1       gc 301.7 ms, dr 629.1 ms, total 930.8 ms  peakWS=454MB
+cpu-e2e 1600x1152 t=4        cpu e2e 1600x1152: 451.9 ms  peakWS=309MB
+cpu-nets 1600x1152 t=4       gc 148.2 ms, dr 304.1 ms, total 452.3 ms  peakWS=469MB
+cpu-e2e 1600x1152 t=16       cpu e2e 1600x1152: 241.0 ms  peakWS=343MB
+cpu-nets 1600x1152 t=16      gc 76.5 ms, dr 147.7 ms, total 224.2 ms  peakWS=490MB
+vulkan-e2e 1600x1152         vulkan e2e 1600x1152: 16.7 ms (incl. upload/download)  peakWS=185MB
+cpu-e2e 3200x2304 t=1        cpu e2e 3200x2304: 3900.6 ms  peakWS=838MB
+cpu-nets 3200x2304 t=1       gc 1236.5 ms, dr 2564.8 ms, total 3801.3 ms  peakWS=1,470MB
+cpu-e2e 3200x2304 t=4        cpu e2e 3200x2304: 1813.0 ms  peakWS=853MB
+cpu-nets 3200x2304 t=4       gc 579.8 ms, dr 1220.7 ms, total 1800.5 ms  peakWS=1,483MB
+cpu-e2e 3200x2304 t=16       cpu e2e 3200x2304: 794.3 ms  peakWS=908MB
+cpu-nets 3200x2304 t=16      gc 274.3 ms, dr 549.1 ms, total 823.3 ms  peakWS=1,526MB
+vulkan-e2e 3200x2304         vulkan e2e 3200x2304: 68.3 ms (incl. upload/download)  peakWS=207MB

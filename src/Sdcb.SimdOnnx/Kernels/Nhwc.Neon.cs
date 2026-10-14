@@ -47,7 +47,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>Residual / activation epilogue of a finished 6 × 16 scratch tile.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void TileNeonStore(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         for (int r = 0; r < rows; r++, part += Ob)
@@ -89,7 +89,7 @@ internal static unsafe partial class Nhwc
     /// loaded one group ahead for the in-order A53), ic % 4 leftovers by broadcast. Never calls
     /// out, so the 24 accumulators stay in registers.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void TileNeonK(float** ptrs, int taps, int coff, int ic, long wTap, float* wb, float* bb, float* dst, int ds,
         bool relu = false)
     {

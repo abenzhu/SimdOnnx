@@ -49,7 +49,7 @@ internal static unsafe partial class Nhwc
     /// row r's ic inputs of tap and wb + tap·wTap its [ic][16] weights. Two 8-oc passes; the k loop
     /// never calls out, so the accumulators stay in registers.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void TilePkK(float** ptrs, int ps, int taps, int ic, long wTap, float* wb, float* bb, float* dst, int ds)
     {
         for (int h = 0; h < Ob; h += 8)
@@ -83,7 +83,7 @@ internal static unsafe partial class Nhwc
     }
 
     /// <summary>Residual / activation epilogue of a finished [rows][16] scratch tile.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void StorePk(float* part, int rows, float* outp, float* addp, int oc, int lanes, ActivationKind act)
     {
         for (int r = 0; r < rows; r++, part += Ob)
@@ -185,7 +185,7 @@ internal static unsafe partial class Nhwc
     /// One depthwise output pixel on PackedSimd: 16 then 4 channels per step, bias-initialized, taps
     /// ascending, + residual, activation. Returns the first channel left for the scalar tail.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static int DepthwisePixelPk(float** ptrs, int taps, int c, float* wp, float* bp, float* ad, float* o, ActivationKind act)
     {
         int ch = 0;
