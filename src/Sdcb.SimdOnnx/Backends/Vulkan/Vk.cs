@@ -514,7 +514,7 @@ internal static class VkConst
     public const uint StMemoryBarrier = 46;
     public const uint StBufferMemoryBarrier = 44;
     public const uint QueueFamilyIgnored = 0xFFFFFFFFu;
-    public const uint StPhysicalDeviceFeatures2 = 49;
+    public const uint StPhysicalDeviceFeatures2 = 1000059000u;
     public const uint StPhysicalDevice16BitStorageFeatures = 1000083000u;
     public const uint StPhysicalDeviceShaderFloat16Int8Features = 1000082000u;
     public const uint StPhysicalDeviceVulkanMemoryModelFeatures = 1000211000u;
@@ -523,7 +523,7 @@ internal static class VkConst
     public const uint StPhysicalDeviceSubgroupProperties = 1000094000u;
     public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225000u;
     public const uint StPhysicalDeviceSubgroupSizeControlFeaturesEXT = 1000225002u;
-    public const uint StPhysicalDeviceProperties2 = 1000059000u;
+    public const uint StPhysicalDeviceProperties2 = 1000059001u;
     public const uint StPipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225001u;
 
     // VkPhysicalDeviceType

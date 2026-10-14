@@ -138,6 +138,10 @@ internal sealed class VkGraphModel : IDisposable
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
         long m = (long)so[1] * so[2];
+        // SG16 (Intel Xe2) BN=32 build on 1x1 convs hangs the device intermittently (B580, driver
+        // 32.0.101.8135): those convs take the per-element shaders until the variant is fixed
+        if (dev.CoopM8 && cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && so[3] % 64 != 0) return false;
+        if (cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && Environment.GetEnvironmentVariable("GCDRNET_VK_CM1X1") == "0") return false;
         return so[3] % 8 == 0 && (m + 127) / 128 <= 65535;   // cin % 8 != 0 -> scalar-gather stem variant
     }
 

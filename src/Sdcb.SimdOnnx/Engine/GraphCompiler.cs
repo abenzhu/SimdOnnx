@@ -764,7 +764,9 @@ internal static class GraphCompiler
             out int[] offsets, out int arenaFloats)
         {
             int bufCount = bufSize.Count;
-            const int Align = 16; // floats (64B)
+            // 32 floats: 128 B in fp32, 64 B in fp16 — GPU arena offsets bind as storage-buffer descriptors,
+            // which must honour minStorageBufferOffsetAlignment (64 B on most desktop GPUs)
+            const int Align = 32;
             int AlignUp(int v) => (v + Align - 1) & ~(Align - 1);
 
             int[] def = Enumerable.Repeat(int.MaxValue, bufCount).ToArray();
