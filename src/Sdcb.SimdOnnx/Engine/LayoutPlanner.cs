@@ -41,17 +41,17 @@ internal sealed class LayoutPlanner
     }
 
     public static void Run(List<ExecNode> nodes, List<CValue> values, List<int> bufSize,
-        int inputValue, ref int outputValue, bool physicalIo)
+        int inputValue, ref int outputValue, bool physicalIn, bool physicalOut)
     {
         var lp = new LayoutPlanner(nodes, values, bufSize);
         CValue inV = values[inputValue];
-        inV.Layout = physicalIo && inV.Shape.Length == 4 ? Layout.Nhwc : Layout.Identity(inV.Shape.Length);
+        inV.Layout = physicalIn && inV.Shape.Length == 4 ? Layout.Nhwc : Layout.Identity(inV.Shape.Length);
 
         for (lp._at = 0; lp._at < nodes.Count; lp._at++)
             lp.Plan(nodes[lp._at]);
 
         lp.L(outputValue);
-        if (!physicalIo)
+        if (!physicalOut)
         {
             CValue ov = values[outputValue];
             int[] id = Layout.Identity(ov.Shape.Length);

@@ -100,7 +100,14 @@ internal static unsafe partial class Nhwc
                 }
                 continue;
             }
-            for (int l = 0; l < lanes; l++)
+            int l4 = 0;
+            for (; l4 + 4 <= lanes; l4 += 4)
+            {
+                V4 v = LdP(part + l4);
+                if (ad != null) v = PackedSimd.Add(v, LdP(ad + l4));
+                PackedSimd.Store(o + l4, ActP(v, act));
+            }
+            for (int l = l4; l < lanes; l++)
                 o[l] = ActS(ad != null ? part[l] + ad[l] : part[l], act);
         }
     }

@@ -37,6 +37,20 @@ internal static class Par
         return new Scope(prev);
     }
 
+    /// <summary>
+    /// Parallel.For under the calling thread's budget; a budget of one (or a single index) runs inline —
+    /// Parallel.For at MaxDegreeOfParallelism 1 still hops through the thread pool (tens of µs per call).
+    /// </summary>
+    internal static void For(int from, int to, Action<int> body)
+    {
+        if (to - from <= 1 || Threads <= 1)
+        {
+            for (int i = from; i < to; i++) body(i);
+            return;
+        }
+        Parallel.For(from, to, Options, body);
+    }
+
     internal readonly struct Scope(int prev) : IDisposable
     {
         public void Dispose() => t_threads = prev;

@@ -27,7 +27,7 @@ internal static unsafe partial class Nhwc
         for (int g0 = 0; g0 < nt; g0 += tg)
         {
             int tn = Math.Min(tg, nt - g0);
-            Parallel.For(0, (tn + 7) / 8, PO, k =>
+            Par.For(0, (tn + 7) / 8, k =>
             {
                 float** dp6 = stackalloc float*[36];
                 for (int t = k * 8, te = Math.Min(tn, t + 8); t < te; t++)
@@ -46,7 +46,7 @@ internal static unsafe partial class Nhwc
                     InputTransform(dp6, ic, V + (long)t * ic, (long)tg * ic);
                 }
             });
-            Parallel.For(0, 36 * nb, PO, j =>
+            Par.For(0, 36 * nb, j =>
             {
                 int xi = j / nb, blk = j % nb;
                 float** ptrs = stackalloc float*[Tile];
@@ -63,7 +63,7 @@ internal static unsafe partial class Nhwc
                 }
             });
             int chunks = (tn + 15) / 16;
-            Parallel.For(0, chunks * nb, PO, j =>
+            Par.For(0, chunks * nb, j =>
             {
                 int blk = j % nb, t0 = j / nb * 16;
                 float* tmp = stackalloc float[16 * Ob];

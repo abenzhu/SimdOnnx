@@ -11,19 +11,23 @@ namespace Sdcb.SimdOnnx.Engine;
 internal sealed class CpuModel
 {
     private readonly Dictionary<string, (ExecPlan plan, long used)> _plans = new(StringComparer.Ordinal);
-    private readonly CpuKernels.Cache _packs = new();
+    private readonly CpuKernels.Cache _packs;
     private readonly int _capacity;
     private long _clock;
 
-    internal CpuModel(OnnxModel model, CompileOptions? options = null, int capacity = 64)
+    /// <param name="packs">Packed-weight cache to share with other CPU models of the same graph
+    /// (e.g. a head-truncated variant); null = private.</param>
+    internal CpuModel(OnnxModel model, CompileOptions? options = null, int capacity = 64, CpuKernels.Cache? packs = null)
     {
         Model = model;
         Options = options ?? CompileOptions.Default;
         _capacity = Math.Max(1, capacity);
+        _packs = packs ?? new CpuKernels.Cache();
     }
 
     internal OnnxModel Model { get; }
     internal CompileOptions Options { get; }
+    internal CpuKernels.Cache Packs => _packs;
 
     /// <summary>The packed plan for <paramref name="shape"/> (compiled on first use).</summary>
     internal ExecPlan Plan(ReadOnlySpan<int> shape)

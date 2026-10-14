@@ -90,7 +90,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, wp0 = w, bp0 = bias, dp0 = dst)
         {
             float* sp = sp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, ob * yb, PO, tile =>
+            Par.For(0, ob * yb, tile =>
             {
                 Conv3x3Tile(sp, ic, ih, iw, wp, hasBias ? bp : null, dp, oc, oh, ow,
                     pt, pl, mode, padVal, act, tile / yb * 4, tile % yb * 2);
@@ -191,7 +191,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, wp0 = w, bp0 = bias, dp0 = dst)
         {
             float* sp = sp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, ((oc + 3) / 4) * stripes, PO, tile =>
+            Par.For(0, ((oc + 3) / 4) * stripes, tile =>
             {
                 int o0 = tile / stripes * 4;
                 int hw0 = tile % stripes * stride;
@@ -263,7 +263,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, wp0 = w, bp0 = bias, dp0 = dst)
         {
             float* sp = sp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, ob * yb, PO, tile =>
+            Par.For(0, ob * yb, tile =>
             {
                 ConvS2Tile(sp, ic, ih, iw, wp, hasBias ? bp : null, dp, oc, oh, ow,
                     pt, pl, mode, padVal, act, tile / yb * 4, tile % yb * 2);
@@ -393,7 +393,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, wp0 = w, bp0 = bias, dp0 = dst)
         {
             float* sp = sp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, ic * oh, PO, t =>
+            Par.For(0, ic * oh, t =>
         {
             int c = t / oh, y = t % oh;
             float* sbase = sp + c * ih * iw;
@@ -457,7 +457,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, dp0 = dst)
         {
             float* sp = sp0, dp = dp0;
-            Parallel.For(0, c * oh, PO, t =>
+            Par.For(0, c * oh, t =>
         {
             int ch = t / oh, y = t % oh;
             float* sbase = sp + ch * ih * iw;
@@ -508,7 +508,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* ap0 = a, bp0 = b, cp0 = bias, dp0 = dst)
         {
             float* ap = ap0, bp = bp0, cp = cp0, dp = dp0;
-            Parallel.For(0, (M + 3) / 4, PO, t =>
+            Par.For(0, (M + 3) / 4, t =>
             {
                 int m0 = t * 4;
                 GemmTile(ap, m0, Math.Min(4, M - m0), K, bp, N, hasBias ? cp : null, dp);
@@ -566,7 +566,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* xp0 = x, wp0 = w, bp0 = b, dp0 = dst)
         {
             float* xp = xp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, rows, PO, r =>
+            Par.For(0, rows, r =>
         {
             float* xr = xp + r * c;
             float* dr = dp + r * c;
@@ -606,7 +606,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, dp0 = dst)
         {
             float* sp = sp0, dp = dp0;
-            Parallel.For(0, chunks, PO, t =>
+            Par.For(0, chunks, t =>
             {
                 int i0 = t * stride, i1 = Math.Min(n, i0 + stride);
                 int i = i0;
@@ -648,7 +648,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* ap0 = a, bp0 = b, dp0 = dst)
         {
             float* ap = ap0, bp = bp0, dp = dp0;
-            Parallel.For(0, chunks, PO, t =>
+            Par.For(0, chunks, t =>
             {
                 int i0 = t * stride, i1 = Math.Min(n, i0 + stride);
                 int i = i0;
@@ -677,7 +677,7 @@ internal static unsafe partial class Avx2Kernels
         {
             float* ap = ap0, dp = dp0;
             F32x8 vs = V256.Create(s);
-            Parallel.For(0, chunks, PO, t =>
+            Par.For(0, chunks, t =>
             {
                 int i0 = t * stride, i1 = Math.Min(n, i0 + stride);
                 int i = i0;
@@ -706,7 +706,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* ap0 = a, bp0 = b, dp0 = dst)
         {
             float* ap = ap0, bp = bp0, dp = dp0;
-            Parallel.For(0, outer, PO, e =>
+            Par.For(0, outer, e =>
             {
                 int rem = e, bo = 0;
                 for (int d = 0; d < rank - 1; d++)
@@ -762,7 +762,7 @@ internal static unsafe partial class Avx2Kernels
             float* sp = sp0, dp = dp0;
             int* y0a = y0p, y1a = y1p, x0a = x0p, x1a = x1p;
             float* wya = wyp, wxa = wxp;
-            Parallel.For(0, c * oh, PO, t =>
+            Par.For(0, c * oh, t =>
             {
                 int ch = t / oh, y = t % oh;
                 float* r0 = sp + (ch * ih + y0a[y]) * iw;
@@ -808,7 +808,7 @@ internal static unsafe partial class Avx2Kernels
         fixed (float* sp0 = src, dp0 = dst)
         {
             float* sp = sp0, dp = dp0;
-            Parallel.For(0, copies * ya, PO, t =>
+            Par.For(0, copies * ya, t =>
             {
                 int o = t / ya, ty = t % ya;
                 float* sb = sp + o * srcStride, db = dp + o * dstStride;
@@ -871,7 +871,7 @@ internal static unsafe partial class Avx2Kernels
         {
             float* sp = sp0, dp = dp0;
             int* mya = myp, mxa = mxp;
-            Parallel.For(0, nc * oh, PO, t =>
+            Par.For(0, nc * oh, t =>
             {
                 int ch = t / oh, y = t % oh;
                 float* dr = dp + (ch * oh + y) * ow;

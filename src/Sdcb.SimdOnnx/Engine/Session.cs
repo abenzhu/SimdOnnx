@@ -82,10 +82,11 @@ public sealed unsafe class InferenceSession : IDisposable
         using var par = Par.Use(Threads);
         ExecNode[] nodes = _plan.Nodes;
         CValue[] values = _plan.Values;
+        bool prof = s_profile || EngineProfile.Enabled;
         for (int i = 0; i < nodes.Length; i++)
         {
             ExecNode n = nodes[i];
-            long t0 = s_profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+            long t0 = prof ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             try { Exec(n); }
             catch (Exception ex)
             {
@@ -93,7 +94,12 @@ public sealed unsafe class InferenceSession : IDisposable
                 throw new InvalidOperationException(
                     $"node[{i}] {n.Op} '{n.Name}' in=[{string.Join(", ", n.In.Select(In))}] out=[{string.Join(", ", n.Out.Select(In))}]", ex);
             }
-            if (s_profile) _nodeTicks[i] += System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+            if (prof)
+            {
+                long dt = System.Diagnostics.Stopwatch.GetTimestamp() - t0;
+                _nodeTicks[i] += dt;
+                if (EngineProfile.Enabled) EngineProfile.Add(n, dt);
+            }
         }
     }
 

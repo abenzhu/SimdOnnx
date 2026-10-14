@@ -41,7 +41,7 @@ internal static unsafe partial class Nhwc
     internal static void For(int n, long work, Action<int> body)
     {
         if (work < 32768 || n == 1 || Par.Threads == 1) { for (int i = 0; i < n; i++) body(i); return; }
-        Parallel.For(0, n, PO, body);
+        Par.For(0, n, body);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -170,7 +170,7 @@ internal static unsafe partial class Nhwc
         float[] padVec = new float[ic * kw + Ob];   // one constant-pad kernel row (Dense512 row runs)
         Array.Fill(padVec, p.PadValue);
         if (kp.Depthwise)
-            Depthwise(src, iw, ic, dst, oh, ow, kh, kw, rm, cm, padVec, kp, add, p.Act);
+            Depthwise(src, iw, ic, dst, oh, ow, kh, kw, p.Strides[1], rm, cm, padVec, p.PadValue, kp, add, p.Act);
         else if (UseAvx512)
             Dense512(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
         else
@@ -222,28 +222,45 @@ internal static unsafe partial class Nhwc
             DenseRowPk(a, y, blk, orow, arow);
             return;
         }
-        int taps = a.Kh * a.Kw, ic = a.Ic, ow = a.Ow, oc = a.Oc, kw = a.Kw;
-        float** ptrs = stackalloc float*[Tile * taps];
-        float* wb = a.W + (long)blk * taps * ic * Ob;
+        // kh taps over kernel-row runs (kw·ic contiguous NHWC floats, weights [ky][kx·ic][16]) —
+        // see DenseRowNeon; border-crossing runs are gathered, constant-pad rows read PadVec
+        int kh = a.Kh, ic = a.Ic, ow = a.Ow, oc = a.Oc, kw = a.Kw, run = kw * ic;
+        float** ptrs = stackalloc float*[Tile * kh];
+        float* wb = a.W + (long)blk * kh * run * Ob;
         float* bb = a.Bias + blk * Ob;
         int lanes = Math.Min(Ob, oc - blk * Ob);
+        float* gather = null;
         for (int x0 = 0; x0 < ow; x0 += Tile)
         {
             int rows = Math.Min(Tile, ow - x0);
-            for (int tap = 0; tap < taps; tap++)
+            for (int ky = 0; ky < kh; ky++)
             {
-                int r = a.Rm[y * a.Kh + tap / kw];
+                int r = a.Rm[y * kh + ky];
                 for (int i = 0; i < Tile; i++)
                 {
-                    int c = a.Cm[(x0 + Math.Min(i, rows - 1)) * kw + tap % kw];
-                    ptrs[tap * Tile + i] = r < 0 || c < 0 ? a.PadVec : a.Src + ((long)r * a.Iw + c) * ic;
+                    int* cmx = a.Cm + (x0 + Math.Min(i, rows - 1)) * kw;
+                    int cx = cmx[0];
+                    float* p;
+                    if (r < 0) p = a.PadVec;
+                    else if (cx >= 0 && cmx[kw - 1] == cx + kw - 1) p = a.Src + ((long)r * a.Iw + cx) * ic;
+                    else
+                    {
+                        if (gather == null) gather = Pinned(ref t_runs, Tile * kh * run);
+                        p = gather + (ky * Tile + i) * run;
+                        for (int kx = 0; kx < kw; kx++)
+                        {
+                            int c = cmx[kx];
+                            Buffer.MemoryCopy(c < 0 ? a.PadVec : a.Src + ((long)r * a.Iw + c) * ic, p + kx * ic, ic * 4L, ic * 4L);
+                        }
+                    }
+                    ptrs[ky * Tile + i] = p;
                 }
             }
             long o = (long)x0 * oc + blk * Ob;
             float* outp = orow + o;
             float* addp = arow != null ? arow + o : null;
-            if (a.Avx) TileAvx(ptrs, rows, taps, ic, wb, bb, outp, addp, oc, lanes, a.Act);
-            else TileVec(ptrs, rows, taps, ic, wb, bb, outp, addp, oc, lanes, a.Act);
+            if (a.Avx) TileAvx(ptrs, rows, kh, run, wb, bb, outp, addp, oc, lanes, a.Act);
+            else TileVec(ptrs, rows, kh, run, wb, bb, outp, addp, oc, lanes, a.Act);
         }
     }
 
@@ -306,11 +323,20 @@ internal static unsafe partial class Nhwc
             Avx.Store(o, Act8(a, act)); Avx.Store(o + 8, Act8(b, act));
             return;
         }
-        // channel tail (e.g. the final oc=3 conv): only the valid lanes touch memory
-        float* t = stackalloc float[Ob];
-        Avx.Store(t, a); Avx.Store(t + 8, b);
-        for (int l = 0; l < lanes; l++)
-            o[l] = ActS(add != null ? t[l] + add[l] : t[l], act);
+        // channel tail (e.g. oc=8 blocks, the final oc=3 conv): only the valid lanes touch memory
+        if (lanes >= 8)
+        {
+            if (add != null) a = Avx.Add(a, Avx.LoadVector256(add));
+            Avx.Store(o, Act8(a, act));
+            if (lanes == 8) return;
+            o += 8;
+            if (add != null) add += 8;
+            lanes -= 8;
+            a = b;
+        }
+        Vector256<int> mask = Vector256.LessThan(Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7), Vector256.Create(lanes));
+        if (add != null) a = Avx.Add(a, Avx.MaskLoad(add, mask.AsSingle()));
+        Avx.MaskStore(o, mask.AsSingle(), Act8(a, act));
     }
 
     internal static void TileVec(float** ptrs, int rows, int taps, int ic, float* wb, float* bb,
@@ -402,78 +428,134 @@ internal static unsafe partial class Nhwc
         }
     }
 
+    [ThreadStatic] private static float[]? t_padRow;
+
     internal static void Depthwise(ReadOnlySpan<float> src, int iw, int c, Span<float> dst,
-        int oh, int ow, int kh, int kw, int[] rm, int[] cm, float[] padVec,
+        int oh, int ow, int kh, int kw, int sw, int[] rm, int[] cm, float[] padVec, float padValue,
         NhwcConvPlan kp, ReadOnlySpan<float> add, ActivationKind act)
     {
-        int taps = kh * kw;
-        bool hasAdd = !add.IsEmpty, avx = UseAvx;
-        int VL = Vector<float>.Count;
+        bool hasAdd = !add.IsEmpty;
+        // a whole constant-pad source row, so out-of-range kernel rows of interior pixels need no pointer table
+        float* padRow = null;
+        if (Array.IndexOf(rm, -1) >= 0)
+        {
+            padRow = Pinned(ref t_padRow, iw * c);
+            new Span<float>(padRow, iw * c).Fill(padValue);
+        }
         fixed (float* sp0 = src, dp0 = dst, ap0 = add, wp0 = kp.W, bp0 = kp.Bias, pv0 = padVec)
         fixed (int* rm0 = rm, cm0 = cm)
         {
-            float* sp = sp0, dp = dp0, ap = ap0, wp = wp0, bp = bp0, pv = pv0;
-            int* rmp = rm0, cmp = cm0;
-            For(oh, (long)oh * ow * c * taps, y =>
+            var a = new DwArgs(sp0, dp0, hasAdd ? ap0 : null, wp0, bp0, pv0, padRow, rm0, cm0, iw, c, ow, kh, kw, sw, act);
+            if (Par.Threads == 1 || (long)oh * ow * c * kh * kw < 32768)
+                for (int y = 0; y < oh; y++) DwRow(a, y);
+            else
+                Par.For(0, oh, y => DwRow(a, y));
+        }
+    }
+
+    /// <summary>Per-call depthwise constants (pointers into pinned/fixed storage).</summary>
+    internal readonly struct DwArgs(float* sp, float* dp, float* ap, float* wp, float* bp, float* pv, float* padRow,
+        int* rm, int* cm, int iw, int c, int ow, int kh, int kw, int sw, ActivationKind act)
+    {
+        public readonly float* Sp = sp, Dp = dp, Ap = ap, Wp = wp, Bp = bp, Pv = pv, PadRow = padRow;
+        public readonly int* Rm = rm, Cm = cm;
+        public readonly int Iw = iw, C = c, Ow = ow, Kh = kh, Kw = kw, Sw = sw;
+        public readonly ActivationKind Act = act;
+    }
+
+    // a static row body: pointer stores in a closure would force every captured value to be reloaded
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void DwRow(in DwArgs a, int y)
+    {
+        float* sp = a.Sp, dp = a.Dp, ap = a.Ap, wp = a.Wp, bp = a.Bp, pv = a.Pv;
+        int* cmp = a.Cm, rmy = a.Rm + y * a.Kh;
+        int iw = a.Iw, c = a.C, ow = a.Ow, kh = a.Kh, kw = a.Kw, taps = kh * kw;
+        ActivationKind act = a.Act;
+        bool avx = UseAvx, neon = UseNeon;
+        int VL = Vector<float>.Count, sw = a.Sw;
+        float** ptrs4 = stackalloc float*[taps * 4];
+        // interior groups of 4 pixels address taps from kh row bases: no per-pixel pointer table
+        bool runs = avx ? c % 8 == 0 : neon && c % 4 == 0;
+        float** rows = stackalloc float*[kh];
+        for (int ky = 0; ky < kh; ky++)
+        {
+            int r = rmy[ky];
+            rows[ky] = r >= 0 ? sp + (long)r * iw * c : a.PadRow;
+        }
+        for (int x0 = 0; x0 < ow; x0 += 4)
+        {
+            int np = Math.Min(4, ow - x0);
+            if (runs && np == 4 && Interior(cmp + x0 * kw, kw, sw))
             {
-                float** ptrs = stackalloc float*[taps];
-                for (int x = 0; x < ow; x++)
+                long ob = ((long)y * ow + x0) * c, col = (long)cmp[x0 * kw] * c;
+                float** rp = ptrs4;
+                for (int ky = 0; ky < kh; ky++) rp[ky] = rows[ky] + col;
+                if (avx) DwRunAvx(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
+                else DwRunNeon(rp, kh, kw, c, sw * c, wp, bp, dp + ob, ap == null ? null : ap + ob, act);
+                continue;
+            }
+            float** pp = ptrs4;
+            for (int px = 0; px < 4; px++)
+            {
+                int* cmx = cmp + (x0 + Math.Min(px, np - 1)) * kw;
+                for (int ky = 0; ky < kh; ky++)
                 {
-                    for (int tap = 0; tap < taps; tap++)
+                    int r = rmy[ky];
+                    float* row = sp + (long)r * iw * c;
+                    for (int kx = 0; kx < kw; kx++)
                     {
-                        int r = rmp[y * kh + tap / kw], cc = cmp[x * kw + tap % kw];
-                        ptrs[tap] = r < 0 || cc < 0 ? pv : sp + ((long)r * iw + cc) * c;
-                    }
-                    long ob = ((long)y * ow + x) * c;
-                    float* o = dp + ob;
-                    float* ad = hasAdd ? ap + ob : null;
-                    int ch = 0;
-                    if (UseNeon)
-                    {
-                        for (; ch + 4 <= c; ch += 4)
-                        {
-                            V128 acc = AdvSimd.LoadVector128(bp + ch);
-                            for (int tap = 0; tap < taps; tap++)
-                                acc = AdvSimd.FusedMultiplyAdd(acc, AdvSimd.LoadVector128(ptrs[tap] + ch), AdvSimd.LoadVector128(wp + tap * c + ch));
-                            if (ad != null) acc = AdvSimd.Add(acc, AdvSimd.LoadVector128(ad + ch));
-                            AdvSimd.Store(o + ch, Act4(acc, act));
-                        }
-                    }
-                    else if (avx)
-                    {
-                        for (; ch + 8 <= c; ch += 8)
-                        {
-                            F32x8 acc = Avx.LoadVector256(bp + ch);
-                            for (int tap = 0; tap < taps; tap++)
-                                acc = Fma.MultiplyAdd(Avx.LoadVector256(ptrs[tap] + ch), Avx.LoadVector256(wp + tap * c + ch), acc);
-                            if (ad != null) acc = Avx.Add(acc, Avx.LoadVector256(ad + ch));
-                            Avx.Store(o + ch, Act8(acc, act));
-                        }
-                    }
-                    else if (UsePacked)
-                        ch = DepthwisePixelPk(ptrs, taps, c, wp, bp, ad, o, act);
-                    else if (Vector.IsHardwareAccelerated && act is ActivationKind.None or ActivationKind.Relu)
-                    {
-                        for (; ch + VL <= c; ch += VL)
-                        {
-                            var acc = Simd.VectorLoad(bp + ch);
-                            for (int tap = 0; tap < taps; tap++)
-                                acc += Simd.VectorLoad(ptrs[tap] + ch) * Simd.VectorLoad(wp + tap * c + ch);
-                            if (ad != null) acc += Simd.VectorLoad(ad + ch);
-                            if (act == ActivationKind.Relu) acc = Vector.Max(acc, Vector<float>.Zero);
-                            Simd.VectorStore(o + ch, acc);
-                        }
-                    }
-                    for (; ch < c; ch++)
-                    {
-                        float acc = bp[ch];
-                        for (int tap = 0; tap < taps; tap++) acc += ptrs[tap][ch] * wp[tap * c + ch];
-                        if (ad != null) acc += ad[ch];
-                        o[ch] = ActS(acc, act);
+                        int cc = cmx[kx];
+                        *pp++ = r < 0 || cc < 0 ? pv : row + (long)cc * c;
                     }
                 }
-            });
+            }
+            long ob0 = ((long)y * ow + x0) * c;
+            float* ad0 = ap == null ? null : ap + ob0;
+            int done = avx ? DwBlockAvx(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act)
+                : neon ? DwBlockNeon(ptrs4, taps, c, wp, bp, dp + ob0, ad0, np, act) : 0;
+            if (done == c) continue;
+            for (int px = 0; px < np; px++)
+            {
+                float** ptrs = ptrs4 + px * taps;
+                float* o = dp + ob0 + (long)px * c;
+                float* ad = ad0 == null ? null : ad0 + (long)px * c;
+                int ch = done;
+                if (avx || neon) { }
+                else if (UsePacked)
+                    ch = DepthwisePixelPk(ptrs, taps, c, wp, bp, ad, o, act);
+                else if (Vector.IsHardwareAccelerated && act is ActivationKind.None or ActivationKind.Relu)
+                {
+                    for (; ch + VL <= c; ch += VL)
+                    {
+                        var acc = Simd.VectorLoad(bp + ch);
+                        for (int tap = 0; tap < taps; tap++)
+                            acc += Simd.VectorLoad(ptrs[tap] + ch) * Simd.VectorLoad(wp + tap * c + ch);
+                        if (ad != null) acc += Simd.VectorLoad(ad + ch);
+                        if (act == ActivationKind.Relu) acc = Vector.Max(acc, Vector<float>.Zero);
+                        Simd.VectorStore(o + ch, acc);
+                    }
+                }
+                for (; ch < c; ch++)
+                {
+                    float acc = bp[ch];
+                    for (int tap = 0; tap < taps; tap++) acc += ptrs[tap][ch] * wp[tap * c + ch];
+                    if (ad != null) acc += ad[ch];
+                    o[ch] = ActS(acc, act);
+                }
+            }
         }
+    }
+
+    /// <summary>Whether 4 pixels starting at <paramref name="cmx"/> read contiguous, in-range, stride-<paramref name="sw"/> columns.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Interior(int* cmx, int kw, int sw)
+    {
+        int c0 = cmx[0];
+        if (c0 < 0) return false;
+        for (int p = 0; p < 4; p++)
+            for (int kx = 0; kx < kw; kx++)
+                if (cmx[p * kw + kx] != c0 + p * sw + kx) return false;
+        return true;
     }
 
     // ======================== pixel-vector helpers ========================

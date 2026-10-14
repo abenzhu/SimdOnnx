@@ -146,7 +146,8 @@ internal static class GraphCompiler
                     FuseResizeAdd(nodes, values, outputValue);
             }
             if (opt.Nhwc)
-                LayoutPlanner.Run(nodes, values, bufSize, inputValue, ref outputValue, opt.PhysicalIo);
+                LayoutPlanner.Run(nodes, values, bufSize, inputValue, ref outputValue, opt.PhysicalIo,
+                    opt.PhysicalIo && !opt.LogicalOutput);
             if (opt.Nhwc && opt.MemFuse && CompileOptions.MemFusions && fuse)
             {
                 RunPasses(PassStage.Physical, nodes, values, outputValue, opt);
@@ -283,26 +284,7 @@ internal static class GraphCompiler
                     i--;
                 }
             }
-            // Conv -> Add residual (skip connections): fold same-shape addend into conv epilogue
-            for (int i = 0; i + 1 < nodes.Count; i++)
-            {
-                ExecNode a = nodes[i], b = nodes[i + 1];
-                if (a.Op != ExecOp.Conv || b.Op != ExecOp.Elementwise ||
-                    ((EwP)b.P!).Op != EwOp.Add ||
-                    ((EwP)b.P!).Act is not (ActivationKind.None or ActivationKind.Relu))
-                    continue;
-                var cp = (ConvP)a.P!;
-                if (cp.Act != ActivationKind.None || cp.Group > 1) continue; // depthwise shader has no residual path
-                int outV = a.Out[0];
-                int other = b.In[0] == outV ? b.In[1] : b.In[1] == outV ? b.In[0] : -1;
-                if (other < 0 || !SoleUse(nodes, outV, i + 1)) continue;
-                if (!values[other].Shape.SequenceEqual(values[outV].Shape)) continue;
-                cp.AddValue = other;
-                cp.Act = ((EwP)b.P!).Act;   // epilogue: +residual then activation (matches conv shader)
-                Redirect(nodes, values, b.Out[0], outV);
-                nodes.RemoveAt(i + 1);
-                i--;
-            }
+            FuseConvResidual(nodes, values, outputValue);
             FuseGelu(nodes, values);
             FuseConvTBias(nodes, values);
             CommuteActBeforeTranspose(nodes, values);
@@ -478,6 +460,64 @@ internal static class GraphCompiler
                 nodes.RemoveAt(rIdx);
                 if (relu is not null) nodes.Remove(relu);
                 ai = -1;
+            }
+        }
+
+        /// <summary>
+        /// Conv -> Add(·, residual) (skip connections): the same-shape addend folds into the conv epilogue.
+        /// Matches through zero-copy aliases (Identity / reshape views) and non-adjacent Adds, as long as
+        /// the addend is produced before the conv and the conv output has no other reader.
+        /// </summary>
+        private static void FuseConvResidual(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        {
+            int Root(int v)
+            {
+                while (values[v].AliasOf >= 0 && values[values[v].AliasOf].Buf == values[v].Buf) v = values[v].AliasOf;
+                return v;
+            }
+            int Producer(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
+            int Readers(int buf, out int only)
+            {
+                int count = 0;
+                only = -1;
+                for (int j = 0; j < nodes.Count; j++)
+                {
+                    ExecNode m = nodes[j];
+                    if (m.In.Any(iv => values[iv].Buf == buf) || m.ParamRefs().Any(iv => values[iv].Buf == buf))
+                    {
+                        count++;
+                        only = j;
+                    }
+                }
+                return count;
+            }
+            for (int bi = 0; bi < nodes.Count; bi++)
+            {
+                ExecNode b = nodes[bi];
+                if (b.Op != ExecOp.Elementwise || b.In.Length != 2 || b.P is not EwP { Op: EwOp.Add } ep ||
+                    ep.Act is not (ActivationKind.None or ActivationKind.Relu))
+                    continue;
+                for (int k = 0; k < 2; k++)
+                {
+                    int ci = Producer(Root(b.In[k]));
+                    if (ci < 0 || ci > bi || nodes[ci].Op != ExecOp.Conv || nodes[ci].P is not ConvP cp) continue;
+                    if (cp.Act != ActivationKind.None || cp.Group > 1 || cp.AddValue >= 0) continue;
+                    int outV = nodes[ci].Out[0], other = b.In[1 - k];
+                    int buf = values[outV].Buf;
+                    if (buf < 0 || buf == values[outputValue].Buf || Readers(buf, out int only) != 1 || only != bi) continue;
+                    if (!values[other].Shape.SequenceEqual(values[b.Out[0]].Shape) ||
+                        !values[outV].Shape.SequenceEqual(values[b.Out[0]].Shape)) continue;
+                    int op = Producer(Root(other));
+                    if (op >= ci) continue;
+                    cp.AddValue = other;
+                    cp.Act = ep.Act;
+                    // the conv now writes the Add's result; readers of the old Add output follow
+                    int addOut = b.Out[0];
+                    nodes[ci].Out = [addOut];
+                    nodes.RemoveAt(bi);
+                    bi--;
+                    break;
+                }
             }
         }
 

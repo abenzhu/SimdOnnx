@@ -19,7 +19,7 @@ internal static unsafe class NeonKernels
         fixed (float* xp0 = x, wp0 = w, bp0 = b, dp0 = dst)
         {
             float* xp = xp0, wp = wp0, bp = bp0, dp = dp0;
-            Parallel.For(0, tasks, PO, t =>
+            Par.For(0, tasks, t =>
             {
                 for (int r = t * per, re = Math.Min(rows, r + per); r < re; r++)
                     LayerNormRow(xp + (long)r * c, dp + (long)r * c, c, wp, bp, eps);

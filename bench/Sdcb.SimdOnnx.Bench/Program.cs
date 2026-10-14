@@ -6,6 +6,12 @@ using P = Sdcb.SimdPaddleOCR.OnnxSharp;
 // SimdCore spike: run a PP-OCR det model through the GcdrNet engine and SimdPaddleOCR,
 // on CPU and Vulkan; compare outputs (against the first engine listed), latency and memory.
 // usage: <model.onnx> <input_HxW.f32> <engines: gcdr,paddle,gcdr-vk,paddle-vk,gcdr-mtl,paddle-mtl> [threads] [iters]
+if (args[0] == "--micro")
+{
+    Environment.SetEnvironmentVariable("GCDRNET_THREADS", "1");
+    Sdcb.SimdOnnx.Bench.Micro.Run(args[1..]);
+    return;
+}
 string modelPath = args[0], inputPath = args[1];
 string[] engines = args[2].Split(',');
 int threads = args.Length > 3 ? int.Parse(args[3]) : Environment.ProcessorCount;
@@ -119,6 +125,13 @@ float[] RunGcdr(G.Engine.CompileOptions? opt = null)
             : n.Op.ToString();
         foreach (var g in s.NodeProfile().Where(x => x.n.Op == G.Engine.ExecOp.Conv).GroupBy(x => Cls(x.n)).OrderByDescending(g => g.Sum(x => x.t.Ticks)))
             Console.WriteLine($"    conv {g.Key,-14} x{g.Count(),-3} {g.Sum(x => x.t.TotalMilliseconds) / iters,7:F2}ms");
+        if (Environment.GetEnvironmentVariable("BENCH_TOP") is { } top)
+            foreach (var (i, n, t) in s.NodeProfile()
+                .Where(x => Environment.GetEnvironmentVariable("BENCH_OP") is not { } only || x.n.Op.ToString() == only)
+                .OrderByDescending(x => x.t).Take(int.Parse(top)))
+                Console.WriteLine($"      #{i,-3} {n.Op,-12} {t.TotalMilliseconds / iters,6:F3}ms " +
+                    string.Join(" ", n.In.Select(v => $"[{string.Join('x', cm.Plan.Values[v].PhysShape)}]")) + " -> " +
+                    string.Join(" ", n.Out.Select(v => $"[{string.Join('x', cm.Plan.Values[v].PhysShape)}]")) + $" {n.P}");
     }
     return s.Output.ToArray();
 }
@@ -178,6 +191,11 @@ float[] RunPaddle()
         for (int i = 0; i < snap.Length; i++)
             if (snap[i].Ticks > 0)
                 Console.WriteLine($"    {(P.OperatorId)i,-14} {snap[i].Ticks * 1000.0 / Stopwatch.Frequency / iters,7:F2}ms");
+        var conv = ((long Ticks, long Calls)[])ist.GetMethod("ConvClassProfileSnapshot", NP)!.Invoke(null, null)!;
+        string[] convNames = ["Conv1x1", "Conv3x3", "Depthwise3x3", "Stride2Conv3x3", "OtherConv"];
+        for (int i = 0; i < conv.Length && i < convNames.Length; i++)
+            if (conv[i].Ticks > 0)
+                Console.WriteLine($"    conv {convNames[i],-14} x{conv[i].Calls / iters,-3} {conv[i].Ticks * 1000.0 / Stopwatch.Frequency / iters,7:F2}ms");
         ist.GetMethod("EnableProfiling", NP)!.Invoke(null, [false]);
     }
     return o;

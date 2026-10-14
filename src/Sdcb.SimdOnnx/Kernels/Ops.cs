@@ -385,67 +385,36 @@ internal static unsafe partial class Ops
     }
 
     // ======================== elementwise ========================
-    public static void Elementwise(ReadOnlySpan<float> a, int[] aShape,
+    public static unsafe void Elementwise(ReadOnlySpan<float> a, int[] aShape,
         ReadOnlySpan<float> b, int[] bShape, Span<float> dst, int[] outShape, EwOp op,
         ActivationKind act = ActivationKind.None)
     {
-        int n = outShape.Aggregate(1, (x, y) => x * y);
+        int n = 1;
+        foreach (int d in outShape) n *= d;
         int oi = (int)op;
-        bool avx = Avx2.IsSupported && Fma.IsSupported && n >= 8192;
-        // fast path: same shape, contiguous
-        if (aShape.SequenceEqual(outShape) && bShape.SequenceEqual(outShape))
+        bool relu = act == ActivationKind.Relu;
+        bool aFull = Same(aShape, outShape), bFull = Same(bShape, outShape);
+        int aN = Count(aShape), bN = Count(bShape), last = outShape.Length == 0 ? 1 : outShape[^1];
+        fixed (float* pa = a, pb = b, pd = dst)
         {
-            if (avx) { Avx2Kernels.Ew2(a, b, dst, n, oi, act); return; }
-            VecBin(a, b, dst, n, oi); goto Done;
-        }
-        // scalar broadcast
-        if (bShape.Aggregate(1, (x, y) => x * y) == 1)
-        {
-            if (avx) { Avx2Kernels.Ew1(a, dst, n, b[0], oi, act: act); return; }
-            VecScalar(a, dst, n, b[0], oi); goto Done;
-        }
-        if (aShape.Aggregate(1, (x, y) => x * y) == 1)
-        {
-            if (avx)
+            if (aFull && bFull) Ew.Binary(pa, pb, pd, n, op, relu);
+            else if (aFull && bN == 1) Ew.Scalar(pa, pb[0], pd, n, op, rev: false, relu);
+            else if (bFull && aN == 1) Ew.Scalar(pb, pa[0], pd, n, op, rev: true, relu);
+            else if (last > 1 && aFull != bFull && Grouped(aFull ? bShape : aShape, outShape, last, out int groups))
             {
-                Avx2Kernels.Ew1(b, dst, n, a[0], oi,
-                    rev: op is EwOp.Sub or EwOp.Div, act: act);
-                return;
-            }
-            if (op is EwOp.Sub or EwOp.Div) VecScalarR(b, dst, n, a[0], oi);
-            else VecScalar(b, dst, n, a[0], oi);
-            goto Done;
-        }
-        // trailing-vector broadcast (NHWC per-channel scale/bias): one operand varies only along the last dim
-        int last = outShape[^1];
-        bool bVec = last > 1 && IsTrailingVec(bShape, last) && aShape.SequenceEqual(outShape);
-        bool aVec = !bVec && last > 1 && IsTrailingVec(aShape, last) && bShape.SequenceEqual(outShape);
-        if (bVec || aVec)
-        {
-            Nhwc.ChannelBroadcast(bVec ? a : b, bVec ? b : a, dst, last, op, aVec, act);
-            return;
-        }
-        // grouped trailing-vector broadcast (NHWC SE gate [N,1,1,C] against [N,H,W,C]): one channel
-        // vector per leading index
-        if (last > 1 && (aShape.SequenceEqual(outShape) != bShape.SequenceEqual(outShape)))
-        {
-            bool bSmall = aShape.SequenceEqual(outShape);
-            int[] vs = bSmall ? bShape : aShape;
-            int rank = outShape.Length, off = rank - vs.Length, d = 0, groups = 1;
-            int Dim(int i) => i - off >= 0 ? vs[i - off] : 1;
-            for (; d < rank - 1 && Dim(d) == outShape[d]; d++) groups *= outShape[d];
-            bool ok = Dim(rank - 1) == last && groups > 1;
-            for (int i = d; ok && i < rank - 1; i++) ok = Dim(i) == 1;
-            if (ok)
-            {
-                ReadOnlySpan<float> full = bSmall ? a : b, vec = bSmall ? b : a;
-                int block = n / groups;
+                // per-channel vector (bias / scale, or one per leading index: NHWC SE gate [N,1,1,C])
+                float* full = aFull ? pa : pb, vec = aFull ? pb : pa;
+                long rows = n / last / groups;
                 for (int g = 0; g < groups; g++)
-                    Nhwc.ChannelBroadcast(full.Slice(g * block, block), vec.Slice(g * last, last),
-                        dst.Slice(g * block, block), last, op, !bSmall, act);
-                return;
+                    Ew.Channel(full + (long)g * rows * last, vec + (long)g * last, pd + (long)g * rows * last,
+                        rows, last, op, rev: !aFull, relu);
             }
+            else goto Strided;
         }
+        if (act is not (ActivationKind.None or ActivationKind.Relu)) Activation(dst, dst, act);
+        return;
+    Strided:
+        bool avx = Avx2.IsSupported && Fma.IsSupported && n >= 8192;
         // inner-block broadcast: a full-shape, b constant over trailing dims
         if (avx && aShape.SequenceEqual(outShape))
         {
@@ -467,8 +436,31 @@ internal static unsafe partial class Ops
         }
         // general broadcast (strided)
         BroadcastLoop(a, aShape, b, bShape, dst, outShape, op);
-    Done:
-        if (act == ActivationKind.Relu) Relu(dst, dst);
+        if (act != ActivationKind.None) Activation(dst, dst, act);
+    }
+
+    private static bool Same(int[] a, int[] b) => a.AsSpan().SequenceEqual(b);
+
+    private static int Count(int[] s)
+    {
+        int n = 1;
+        foreach (int d in s) n *= d;
+        return n;
+    }
+
+    /// <summary>
+    /// <paramref name="vs"/> (right-aligned onto <paramref name="outShape"/>) is a last-axis vector,
+    /// possibly one per leading index: equal to the output on dims [0, k), 1 on [k, rank-1).
+    /// </summary>
+    private static bool Grouped(int[] vs, int[] outShape, int last, out int groups)
+    {
+        groups = 1;
+        int rank = outShape.Length, off = rank - vs.Length, d = 0;
+        int Dim(int i) => i - off >= 0 ? vs[i - off] : 1;
+        if (Dim(rank - 1) != last) return false;
+        for (; d < rank - 1 && Dim(d) == outShape[d] && Dim(d) != 1; d++) groups *= outShape[d];
+        for (int i = d; i < rank - 1; i++) if (Dim(i) != 1) return false;
+        return true;
     }
 
     private static bool IsTrailingVec(int[] s, int last) =>
@@ -553,32 +545,18 @@ internal static unsafe partial class Ops
     }
 
     // ======================== unary ========================
-    public static void Relu(ReadOnlySpan<float> src, Span<float> dst)
-    {
-        int n = src.Length;
-        if (Avx2.IsSupported && Fma.IsSupported && n >= 8192) { Avx2Kernels.Unary(src, dst, n, 0); return; }
-        int i = 0, VL = Vector<float>.Count;
-        for (; i + VL <= n; i += VL)
-            Simd.VectorStore(dst, i, Vector.Max(Simd.VectorLoad(src, i), Vector<float>.Zero));
-        for (; i < n; i++) dst[i] = MathF.Max(src[i], 0f);
-    }
-
-    public static void Sigmoid(ReadOnlySpan<float> src, Span<float> dst)
-    {
-        if (Avx2.IsSupported && Fma.IsSupported && src.Length >= 8192) { Avx2Kernels.Unary(src, dst, src.Length, 1); return; }
-        SimdMath.Sigmoid(src, dst);
-    }
+    public static void Relu(ReadOnlySpan<float> src, Span<float> dst) => Unary(src, dst, ActivationKind.Relu);
+    public static void Sigmoid(ReadOnlySpan<float> src, Span<float> dst) => Unary(src, dst, ActivationKind.Sigmoid);
+    public static void Gelu(ReadOnlySpan<float> src, Span<float> dst) => Unary(src, dst, ActivationKind.Gelu);
 
     public static void Erf(ReadOnlySpan<float> src, Span<float> dst)
     {
-        if (Avx2.IsSupported && Fma.IsSupported && src.Length >= 8192) { Avx2Kernels.Unary(src, dst, src.Length, 3); return; }
-        SimdMath.Erf(src, dst);
+        fixed (float* s = src, d = dst) Act.ApplyErf(s, d, src.Length);
     }
 
-    public static void Gelu(ReadOnlySpan<float> src, Span<float> dst)
+    private static void Unary(ReadOnlySpan<float> src, Span<float> dst, ActivationKind act)
     {
-        if (Avx2.IsSupported && Fma.IsSupported && src.Length >= 8192) { Avx2Kernels.Unary(src, dst, src.Length, 2); return; }
-        SimdMath.Gelu(src, dst);
+        fixed (float* s = src, d = dst) Act.Apply(s, d, src.Length, act);
     }
 
     // ======================== LayerNorm ========================
