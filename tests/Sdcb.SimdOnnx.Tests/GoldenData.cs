@@ -24,14 +24,63 @@ internal static class Golden
         throw new DirectoryNotFoundException("GCDRNet testdata not found (set SIMDONNX_GCDR_TESTDATA).");
     }
 
-    public static float[] F32(string tag, string name) =>
-        FromFile<float>(Path.Combine(Dir, $"{tag}_{name}.f32"));
+    /// <summary>"shadow" / "output" are the committed onnxruntime outputs; "input" / "dr_in" are
+    /// derived from {tag}_src.png exactly as Sdcb.GcdrNet's tests/GoldenDerive.cs does.</summary>
+    public static float[] F32(string tag, string name)
+    {
+        var (_, _, ph, pw, oh, ow) = Dims(tag);
+        switch (name)
+        {
+            case "input":
+            {
+                byte[] bgr = Bgr(tag);
+                int h = oh + ph, w = ow + pw;
+                var x = new float[3 * h * w];
+                for (int c = 0; c < 3; c++)
+                    for (int y = 0; y < h; y++)
+                        for (int xx = 0; xx < w; xx++)
+                            x[(c * h + y) * w + xx] = bgr[(Math.Max(y - ph, 0) * ow + Math.Max(xx - pw, 0)) * 3 + c] / 255f;
+                return x;
+            }
+            case "dr_in":
+            {
+                float[] input = F32(tag, "input"), shadow = F32(tag, "shadow");
+                int n = input.Length;
+                var d = new float[2 * n];
+                input.CopyTo(d, 0);
+                for (int i = 0; i < n; i++)
+                    d[n + i] = Math.Min(Math.Max(input[i] / Math.Max(shadow[i], 1e-6f), 0f), 1f);
+                return d;
+            }
+            default:
+                return FromFile<float>(Path.Combine(Dir, $"{tag}_{name}.f32"));
+        }
+    }
 
-    public static byte[] U8(string tag) =>
-        File.ReadAllBytes(Path.Combine(Dir, $"{tag}_final.u8"));
+    /// <summary>Expected final BGR24 output (cropped), derived from the DR-Net golden output.</summary>
+    public static byte[] U8(string tag)
+    {
+        var (_, _, ph, pw, oh, ow) = Dims(tag);
+        float[] output = F32(tag, "output");
+        int h = oh + ph, w = ow + pw;
+        var u8 = new byte[oh * ow * 3];
+        for (int c = 0; c < 3; c++)
+            for (int y = 0; y < oh; y++)
+                for (int xx = 0; xx < ow; xx++)
+                {
+                    double v = output[c * h * w + (y + ph) * w + xx + pw] * 255.0;
+                    u8[(y * ow + xx) * 3 + c] = (byte)Math.Min(Math.Max((int)v, 0), 255);
+                }
+        return u8;
+    }
 
-    public static byte[] Bgr(string tag) =>
-        File.ReadAllBytes(Path.Combine(Dir, $"{tag}_src.bgr"));
+    /// <summary>Tight BGR24 pixels of {tag}_src.png (8-bit RGB, non-interlaced).</summary>
+    public static byte[] Bgr(string tag)
+    {
+        byte[] rgb = Png.DecodeRgb8(File.ReadAllBytes(Path.Combine(Dir, $"{tag}_src.png")), out _, out _);
+        for (int i = 0; i < rgb.Length; i += 3) (rgb[i], rgb[i + 2]) = (rgb[i + 2], rgb[i]);
+        return rgb;
+    }
 
     public static int[] ShapeOf(string tag, string name)
     {

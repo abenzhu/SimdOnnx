@@ -121,16 +121,16 @@ internal static class GraphCompiler
             {
                 if (!_byName.TryGetValue(outName, out int ov))
                     throw new ArgumentException($"Tensor '{outName}' is not produced by the graph.", nameof(opt));
-                return FuseAndPlan(_nodes, _values, _bufSize, _inputValue, ov, opt);
+                return FuseAndPlan(_m, _nodes, _values, _bufSize, _inputValue, ov, opt);
             }
             if (g.Outputs.Count != 1) throw new NotSupportedException("Expected single graph output.");
             int outputValue = _byName[g.Outputs[0].Name];
 
-            return FuseAndPlan(_nodes, _values, _bufSize, _inputValue, outputValue, opt);
+            return FuseAndPlan(_m, _nodes, _values, _bufSize, _inputValue, outputValue, opt);
         }
 
         // ---------- fusion + buffer planning ----------
-        private static ExecPlan FuseAndPlan(List<ExecNode> nodes, List<CValue> values,
+        private static ExecPlan FuseAndPlan(OnnxModel model, List<ExecNode> nodes, List<CValue> values,
             List<int> bufSize, int inputValue, int outputValue, CompileOptions opt)
         {
             // fusion passes operate on the logical graph and are layout-blind;
@@ -139,7 +139,7 @@ internal static class GraphCompiler
             bool fuse = opt.Fuse && Env.Flag("NOFUSE") != "1";
             if (fuse)
             {
-                Fuse(nodes, values, outputValue, opt);
+                Fuse(model, nodes, values, outputValue, opt);
                 RunPasses(PassStage.Logical, nodes, values, outputValue, opt);
                 // NHWC-only kernels (CPU channels-last + GPU); the NCHW oracle plan keeps the plain ops
                 if (opt.Nhwc && Env.Flag("NOFUSE_UP") != "1")
@@ -191,6 +191,7 @@ internal static class GraphCompiler
                 OutputValue = outputValue,
                 Nhwc = opt.Nhwc,
                 PhysicalIo = opt.Nhwc && opt.PhysicalIo,
+                Options = opt,
             };
         }
 
@@ -218,7 +219,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Structural fusions over the exec node list (single consumer chains).</summary>
-        private static void Fuse(List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
+        private static void Fuse(OnnxModel model, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
         {
             // pass 1: Pad -> Conv  (fold reflect/constant padding into the conv)
             // pass 2: Conv -> Relu (activation epilogue)
@@ -244,7 +245,7 @@ internal static class GraphCompiler
                 }
             }
             // Relu/Sigmoid/elementwise-tail fusions
-            FuseBiasAdd(nodes, values, outputValue);
+            FuseBiasAdd(model, nodes, values, outputValue);
             FuseLayerNorm(nodes, values);
             if (!opt.Gpu) FuseGatedAct(nodes, values, outputValue);
             for (int i = 0; i + 1 < nodes.Count; i++)
@@ -254,8 +255,7 @@ internal static class GraphCompiler
                     SoleUse(nodes, a.Out[0], i + 1))
                 {
                     ((ConvP)a.P!).Act = ActivationKind.Relu;
-                    // rewrite consumers of b.Out to use a.Out
-                    Redirect(nodes, values, b.Out[0], a.Out[0]);
+                    a.Out = [b.Out[0]];   // keeps the graph output value when b produced it
                     nodes.RemoveAt(i + 1);
                     i--;
                 }
@@ -263,7 +263,7 @@ internal static class GraphCompiler
                     SoleUse(nodes, a.Out[0], i + 1))
                 {
                     ((PoolP)a.P!).FuseRelu = true;
-                    Redirect(nodes, values, b.Out[0], a.Out[0]);
+                    a.Out = [b.Out[0]];   // keeps the graph output value when b produced it
                     nodes.RemoveAt(i + 1);
                     i--;
                 }
@@ -271,7 +271,7 @@ internal static class GraphCompiler
                     SoleUse(nodes, a.Out[0], i + 1))
                 {
                     ((ResizeP)a.P!).FuseRelu = true;
-                    Redirect(nodes, values, b.Out[0], a.Out[0]);
+                    a.Out = [b.Out[0]];   // keeps the graph output value when b produced it
                     nodes.RemoveAt(i + 1);
                     i--;
                 }
@@ -279,7 +279,7 @@ internal static class GraphCompiler
                     SoleUse(nodes, a.Out[0], i + 1))
                 {
                     ((EwP)a.P!).Act = ActivationKind.Relu;
-                    Redirect(nodes, values, b.Out[0], a.Out[0]);
+                    a.Out = [b.Out[0]];   // keeps the graph output value when b produced it
                     nodes.RemoveAt(i + 1);
                     i--;
                 }
@@ -618,10 +618,33 @@ internal static class GraphCompiler
             return cv.Floats is { Length: 1 } f && MathF.Abs(f[0] - expected) < 1e-6f;
         }
 
+        /// <summary>Producer and use-count index of a node list (fusion passes: O(1) lookups
+        /// instead of a scan per candidate). Uses count node inputs plus aliasing views.</summary>
+        private sealed class UseIndex
+        {
+            private readonly Dictionary<int, ExecNode> _prod = new();
+            private readonly Dictionary<int, int> _uses = new();
+            public UseIndex(List<ExecNode> nodes, List<CValue> values)
+            {
+                foreach (ExecNode m in nodes)
+                {
+                    if (m.Out.Length == 1) _prod[m.Out[0]] = m;
+                    foreach (int v in m.In) _uses[v] = Uses(v) + 1;
+                }
+                foreach (CValue v in values)
+                    if (v.AliasOf >= 0) _uses[v.AliasOf] = Uses(v.AliasOf) + 1;
+            }
+            public ExecNode? Producer(int v) => _prod.TryGetValue(v, out ExecNode? m) ? m : null;
+            public int Uses(int v) => _uses.TryGetValue(v, out int c) ? c : 0;
+            public void SetProducer(int v, ExecNode m) => _prod[v] = m;
+            public void Unuse(int v) => _uses[v] = Uses(v) - 1;
+        }
+
         /// <summary>Conv/Gemm -> Add(per-channel const) folds into the producer's bias (the producer then
         /// writes the Add's output value directly).</summary>
-        private static void FuseBiasAdd(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        private static void FuseBiasAdd(OnnxModel model, List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
+            var ix = new UseIndex(nodes, values);
             for (int i = 0; i < nodes.Count; i++)
             {
                 ExecNode b = nodes[i];
@@ -630,10 +653,9 @@ internal static class GraphCompiler
                 {
                     int pv = b.In[k], cv = b.In[1 - k];
                     if (values[cv].Floats is not { } cf || values[pv].Buf < 0 || pv == outputValue) continue;
-                    int pi = nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == pv);
-                    if (pi < 0 || pi > i || !SoleUse(nodes, pv, i) || values.Any(v => v.AliasOf == pv)) continue;
+                    // nodes are topologically ordered: the producer precedes b; the sole use (no alias view) is b
+                    if (ix.Producer(pv) is not { } a || ix.Uses(pv) != 1) continue;
                     if (!values[b.Out[0]].Shape.SequenceEqual(values[pv].Shape)) continue;
-                    ExecNode a = nodes[pi];
                     int[] os = values[pv].Shape, s = values[cv].Shape;
                     int ch, existing;
                     if (a.P is ConvP { Act: ActivationKind.None, AddValue: < 0 } cp && os.Length == 4)
@@ -657,11 +679,15 @@ internal static class GraphCompiler
                         float[] e = values[existing].Floats!;
                         for (int c = 0; c < ch; c++) bias[c] += e[c];
                     }
+                    bias = model.Intern(values[cv].Name + "__bias|" + (existing >= 0 ? values[existing].Name : ""), bias);
                     int bv = values.Count;
                     values.Add(new CValue { Name = values[cv].Name + "__bias", Shape = [ch], DType = 1, Floats = bias });
                     if (a.P is ConvP c2) { c2.BiasValue = bv; c2.Act = ep.Act; }
                     else if (a.P is GemmP g2) { g2.BiasValue = bv; g2.Act = ep.Act; }
                     a.Out = [b.Out[0]];
+                    ix.SetProducer(b.Out[0], a);
+                    ix.Unuse(pv);
+                    ix.Unuse(cv);
                     nodes.RemoveAt(i);
                     i--;
                     break;
@@ -702,8 +728,10 @@ internal static class GraphCompiler
         /// m = mean(x); d = x - m; y = d / sqrt(mean(d·d) + eps) · gamma + beta.</summary>
         private static void FuseLayerNorm(List<ExecNode> nodes, List<CValue> values)
         {
-            int Prod(int v) => nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == v);
-            int Uses(int v) => nodes.Sum(m => m.In.Count(x => x == v)) + values.Count(x => x.AliasOf == v);
+            // index rebuilt after each (rare) fusion; Prod returns a node position like the scan did
+            var ix = new UseIndex(nodes, values);
+            int Prod(int v) => ix.Producer(v) is { } m ? nodes.IndexOf(m) : -1;
+            int Uses(int v) => ix.Uses(v);
             bool Ew(ExecNode m, EwOp op) => m.Op == ExecOp.Elementwise && m.P is EwP { Act: ActivationKind.None } e && e.Op == op && m.In.Length == 2;
             bool Const(int v) => values[v].Floats is not null;
             for (int i = 0; i < nodes.Count; i++)
@@ -747,6 +775,7 @@ internal static class GraphCompiler
                 nodes[i] = ln;
                 foreach (ExecNode d in dead) nodes.Remove(d);
                 i = nodes.IndexOf(ln);
+                ix = new UseIndex(nodes, values);
             }
         }
 
@@ -962,7 +991,7 @@ internal static class GraphCompiler
                 int to = (int)n.IntAttr("to");
                 CValue x = V(Input(0, n));
                 if (to == 1)
-                    AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 1, Floats = x.Ints!.Select(v => (float)v).ToArray() });
+                    AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 1, Floats = _m.Intern(n.Outputs[0] + "__cast", x.Ints!.Select(v => (float)v).ToArray()) });
                 else
                     AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 7, Ints = x.Ints });
                 return;
@@ -1282,8 +1311,8 @@ internal static class GraphCompiler
             int[] cs = new int[rank - 1];
             Array.Fill(cs, 1);
             cs[0] = c;
-            int sv = AddValue(new CValue { Name = n.Name + "__bn_scale", Shape = cs, DType = 1, Floats = s });
-            int tv = AddValue(new CValue { Name = n.Name + "__bn_shift", Shape = cs, DType = 1, Floats = t });
+            int sv = AddValue(new CValue { Name = n.Name + "__bn_scale", Shape = cs, DType = 1, Floats = _m.Intern(n.Name + "__bn_scale", s) });
+            int tv = AddValue(new CValue { Name = n.Name + "__bn_shift", Shape = cs, DType = 1, Floats = _m.Intern(n.Name + "__bn_shift", t) });
             int scaled = Emit(ExecOp.Elementwise, [Input(0, n), sv], ActivationValue(n.Outputs[0] + "__bn_scaled", x.Shape), new EwP { Op = EwOp.Mul }, n);
             Emit(ExecOp.Elementwise, [scaled, tv], ActivationValue(n.Outputs[0], x.Shape), new EwP { Op = EwOp.Add }, n);
         }

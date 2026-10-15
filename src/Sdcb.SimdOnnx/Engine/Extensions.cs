@@ -138,6 +138,10 @@ internal sealed class ConstKind(string name, bool fp32, Func<CValue, float[]>? p
     public static readonly ConstKind GemmNK = new("gemmnk", false, GpuPack.GemmNK);
     /// <summary>ConvTranspose [IC][OC][KH][KW] → [tap][IC][OC].</summary>
     public static readonly ConstKind ConvTW = new("convtw", false, GpuPack.ConvTranspose);
+    /// <summary>Conv → [OC padded to 128][K padded to 16], tap-major k (direct-load 8x16x16 GEMM).</summary>
+    public static readonly ConstKind CmW = new("cmw", false, GpuPack.Cm, GpuPack.CmElems);
+    /// <summary>Gemm B [K][N] → [N padded to 128][K padded to 16] (direct-load 8x16x16 GEMM).</summary>
+    public static readonly ConstKind GemmCmW = new("gemmcmw", false, GpuPack.GemmCm, GpuPack.GemmCmElems);
 }
 
 /// <summary>Const packings shared by the Vulkan and Metal backends.</summary>
@@ -164,6 +168,33 @@ internal static class GpuPack
             for (int c = 0; c < ic; c++)
                 for (int t = 0; t < taps; t++)
                     dst[o * k + t * ic + c] = src[(o * ic + c) * taps + t];
+        return dst;
+    }
+
+    internal static int Pad16(int k) => (k + 15) & ~15;
+    internal static int Pad128(int n) => (n + 127) & ~127;
+
+    public static long CmElems(CValue w) => (long)Pad128(w.Shape[0]) * Pad16(w.Shape[1] * w.Shape[2] * w.Shape[3]);
+
+    public static float[] Cm(CValue w)
+    {
+        int oc = w.Shape[0], ic = w.Shape[1], taps = w.Shape[2] * w.Shape[3], k = Pad16(taps * ic);
+        float[] src = w.Floats!, dst = new float[Pad128(oc) * k];
+        for (int o = 0; o < oc; o++)
+            for (int c = 0; c < ic; c++)
+                for (int t = 0; t < taps; t++)
+                    dst[o * k + t * ic + c] = src[(o * ic + c) * taps + t];
+        return dst;
+    }
+
+    public static long GemmCmElems(CValue b) => (long)Pad128(b.Shape[1]) * Pad16(b.Shape[0]);
+
+    public static float[] GemmCm(CValue b)
+    {
+        int k = b.Shape[0], nn = b.Shape[1], kp = Pad16(k);
+        float[] src = b.Floats!, dst = new float[Pad128(nn) * kp];
+        for (int i = 0; i < k; i++)
+            for (int j = 0; j < nn; j++) dst[j * kp + i] = src[i * nn + j];
         return dst;
     }
 

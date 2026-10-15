@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+// im2col gather for a dense kxk conv on NHWC fp16, tap-major k (after SimdPaddleOCR's im2col):
+//   A[b*M + m, k] = X[b, oy*sH + dy - pT, ox*sW + dx - pL, ci],  k = (dy*kW + dx)*Cin + ci
+// zero out of bounds and for k in [K, Kp). One invocation writes 4 consecutive k (8 B).
+// Cin % 4 == 0 keeps a group inside one tap (one vec4 load); flags bit0 = scalar gather.
+// Dispatch: x * y cover M * Kp/4 invocations (256 per group), z = batch.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer X1 { float16_t x1[]; };
+layout(set = 0, binding = 2) writeonly buffer A { uvec2 a[]; };
+
+layout(push_constant) uniform PC {
+    uint outW; uint outH; uint Cin; uint kH; uint kW;
+    uint sH; uint sW; uint pT; uint pL; uint inW; uint inH;
+    uint K; uint Kp; uint flags;
+} p;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x;
+    uint b = gl_WorkGroupID.z;
+    uint kv = p.Kp >> 2;
+    uint mImg = p.outW * p.outH;
+    if (gid >= mImg * kv) return;
+    uint k4 = (gid % kv) * 4u;
+    uint m = gid / kv;
+    uint oy = m / p.outW, ox = m - oy * p.outW;
+    uint xb = b * p.inH * p.inW;
+    vec4 v = vec4(0.0);
+    if ((p.flags & 1u) == 0u) {
+        if (k4 < p.K) {
+            uint tap = k4 / p.Cin, ci = k4 - tap * p.Cin;
+            uint dy = tap / p.kW, dx = tap - dy * p.kW;
+            int iy = int(oy * p.sH + dy) - int(p.pT);
+            int ix = int(ox * p.sW + dx) - int(p.pL);
+            if (iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW))
+                v = vec4(x[(xb + uint(iy) * p.inW + uint(ix)) * (p.Cin >> 2) + (ci >> 2)]);
+        }
+    } else {
+        for (uint i = 0u; i < 4u; i++) {
+            uint k = k4 + i;
+            if (k < p.K) {
+                uint tap = k / p.Cin, ci = k - tap * p.Cin;
+                uint dy = tap / p.kW, dx = tap - dy * p.kW;
+                int iy = int(oy * p.sH + dy) - int(p.pT);
+                int ix = int(ox * p.sW + dx) - int(p.pL);
+                if (iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW))
+                    v[i] = float(x1[(xb + uint(iy) * p.inW + uint(ix)) * p.Cin + ci]);
+            }
+        }
+    }
+    a[(b * mImg + m) * kv + (k4 >> 2)] = uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+}

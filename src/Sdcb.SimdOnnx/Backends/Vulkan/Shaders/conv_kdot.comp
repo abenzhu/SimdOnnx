@@ -1,0 +1,100 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+// Dense kxk conv as direct dot products, no im2col (after SimdPaddleOCR's convk_dot):
+// a 4 output pixels x 4 output channels tile per invocation, NHWC fp16 in/out, fp32 math.
+//   O[b, px, n] = act(sum_{tap, ci} X[b, px(tap), ci] * W[tap*cin + ci, n] + bias[n] + R[b, px, n])
+// W is k-major [K][N] (ConstKind.ConvW). Requires cin % 4 == 0 and N % 4 == 0; zero padding.
+// Dispatch: x * y cover ceil(M/4) * N/4 invocations (256 per group), z = batch.
+// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { f16vec4 w[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { vec4 bias[]; };
+layout(set = 0, binding = 3) readonly buffer Res { f16vec4 res[]; };
+layout(set = 0, binding = 4) writeonly buffer O { f16vec4 o[]; };
+
+layout(push_constant) uniform PC {
+    uint M; uint N; uint outW; uint inW; uint inH; uint cin4;
+    uint taps; uint kW; uint sH; uint sW; uint padT; uint padL; uint flags;
+} p;
+
+float ferf(float v)
+{
+    float s = v < 0.0 ? -1.0 : 1.0;
+    float ax = abs(v);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return (1.0 - poly * exp(-ax * ax)) * s;
+}
+
+vec4 actf(vec4 v, uint act)
+{
+    if (act == 1u) return max(v, vec4(0.0));
+    if (act == 2u) return 0.5 * v * (vec4(1.0) + vec4(ferf(v.x * 0.70710678), ferf(v.y * 0.70710678), ferf(v.z * 0.70710678), ferf(v.w * 0.70710678)));
+    if (act == 3u) return v * clamp(v * (1.0 / 6.0) + 0.5, vec4(0.0), vec4(1.0));
+    return v;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x;
+    uint b = gl_WorkGroupID.z;
+    uint nv = p.N >> 2;
+    uint mv = (p.M + 3u) >> 2;
+    if (gid >= mv * nv) return;
+    uint n4 = gid % nv;
+    uint m0 = (gid / nv) * 4u;
+    uint xb = b * p.inH * p.inW * p.cin4;
+    uint ob = b * p.M * nv;
+
+    int iy0[4], ix0[4];
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint m = min(m0 + i, p.M - 1u);
+        uint oy = m / p.outW, ox = m - oy * p.outW;
+        iy0[i] = int(oy * p.sH) - int(p.padT);
+        ix0[i] = int(ox * p.sW) - int(p.padL);
+    }
+
+    vec4 acc0 = vec4(0.0), acc1 = vec4(0.0), acc2 = vec4(0.0), acc3 = vec4(0.0);
+    for (uint t = 0u; t < p.taps; t++) {
+        uint ky = t / p.kW, kx = t - ky * p.kW;
+        uint px[4];
+        bool ok[4];
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            int iy = iy0[i] + int(ky), ix = ix0[i] + int(kx);
+            ok[i] = iy >= 0 && iy < int(p.inH) && ix >= 0 && ix < int(p.inW);
+            px[i] = ok[i] ? xb + (uint(iy) * p.inW + uint(ix)) * p.cin4 : 0u;
+        }
+        uint wr = t * p.cin4 * 4u * nv + n4;
+        for (uint c4 = 0u; c4 < p.cin4; c4++) {
+            vec4 a0 = ok[0] ? vec4(x[px[0] + c4]) : vec4(0.0);
+            vec4 a1 = ok[1] ? vec4(x[px[1] + c4]) : vec4(0.0);
+            vec4 a2 = ok[2] ? vec4(x[px[2] + c4]) : vec4(0.0);
+            vec4 a3 = ok[3] ? vec4(x[px[3] + c4]) : vec4(0.0);
+            uint wi = wr + c4 * 4u * nv;
+            [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                vec4 wv = vec4(w[wi + i * nv]);
+                acc0 += a0[i] * wv; acc1 += a1[i] * wv;
+                acc2 += a2[i] * wv; acc3 += a3[i] * wv;
+            }
+        }
+    }
+    if ((p.flags & 1u) != 0u) {
+        vec4 bv = bias[n4];
+        acc0 += bv; acc1 += bv; acc2 += bv; acc3 += bv;
+    }
+    uint act = (p.flags >> 4) & 7u;
+    bool hasRes = (p.flags & 2u) != 0u;
+    vec4 accs[4] = vec4[4](acc0, acc1, acc2, acc3);
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+        uint m = m0 + i;
+        if (m < p.M) {
+            uint oi = ob + m * nv + n4;
+            vec4 v = accs[i];
+            if (hasRes) v += vec4(res[oi]);
+            o[oi] = f16vec4(actf(v, act));
+        }
+    }
+}

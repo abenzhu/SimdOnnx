@@ -13,7 +13,7 @@ if not exist "%GLSLC%" (
 set "DIR=%~dp0..\Shaders"
 set "O=-O --target-env=vulkan1.1"
 for %%f in ("%DIR%\*.comp") do (
-    if not "%%~nxf"=="conv_tile.comp" if not "%%~nxf"=="conv_cm.comp" if not "%%~nxf"=="sgprobe.comp" if not "%%~nxf"=="conv_dot.comp" if not "%%~nxf"=="gemm_dot.comp" (
+    if not "%%~nxf"=="conv_tile.comp" if not "%%~nxf"=="conv_cm.comp" if not "%%~nxf"=="sgprobe.comp" if not "%%~nxf"=="conv_dot.comp" if not "%%~nxf"=="gemm_dot.comp" if not "%%~nxf"=="pw_dot.comp" if not "%%~nxf"=="conv_kdot.comp" if not "%%~nxf"=="im2col.comp" if not "%%~nxf"=="gemm_cm8.comp" (
         echo glslc %%~nxf
         "%GLSLC%" %O% "%%f" -o "%%~dpnf.spv" || exit /b 1
         "%GLSLC%" %O% -DF16 "%%f" -o "%%~dpnf_h.spv" || exit /b 1
@@ -41,6 +41,15 @@ rem a 16x32 strip per subgroup, eight stacked along M, measured fastest on the A
 "%GLSLC%" %O% -DLITE -DSG16 -DSGX=2u -DSGY=8u -DTSM=2u -DTSN=2u -DNTHR=256 "%CM%" -o "%DIR%\conv_cm_sg16_n64_h.spv" || exit /b 1
 "%GLSLC%" %O% -DLITE -DSG16 -DSGX=1u -DSGY=8u -DTSM=2u -DTSN=2u -DNTHR=128 "%CM%" -o "%DIR%\conv_cm_sg16_n32_h.spv" || exit /b 1
 "%GLSLC%" %O% -DLITE -DSG16 -DSCALARK -DSGX=1u -DSGY=8u -DTSM=2u -DTSN=2u -DNTHR=128 "%CM%" -o "%DIR%\conv_cm_sg16_n32s_h.spv" || exit /b 1
+rem SG16 direct path (Intel Xe2, after SimdPaddleOCR): direct-load 8x16x16 GEMM (128x128 /
+rem 256x64 / 512x32 tiles), small-K dot GEMM, direct kxk dot conv, im2col; fp16 storage only
+set "G8=%DIR%\gemm_cm8.comp"
+"%GLSLC%" %O% "%G8%" -o "%DIR%\gemm_cm8_h.spv" || exit /b 1
+"%GLSLC%" %O% -DSGX=2u -DSGY=8u "%G8%" -o "%DIR%\gemm_cm8_n64_h.spv" || exit /b 1
+"%GLSLC%" %O% -DSGX=1u -DSGY=16u "%G8%" -o "%DIR%\gemm_cm8_n32_h.spv" || exit /b 1
+"%GLSLC%" %O% "%DIR%\pw_dot.comp" -o "%DIR%\pw_dot_h.spv" || exit /b 1
+"%GLSLC%" %O% "%DIR%\conv_kdot.comp" -o "%DIR%\conv_kdot_h.spv" || exit /b 1
+"%GLSLC%" %O% "%DIR%\im2col.comp" -o "%DIR%\im2col_h.spv" || exit /b 1
 rem wide-wave no-coopmat GPUs (Adreno): register-tiled direct kernels, fp16 storage only
 set "CD=%DIR%\conv_dot.comp"
 "%GLSLC%" %O% -DSW=1u -DTM=4 -DTN=2 "%CD%" -o "%DIR%\conv_dot_s1_4x2_h.spv" || exit /b 1

@@ -93,6 +93,16 @@ internal static class Micro
                 long t0 = Stopwatch.GetTimestamp();
                 for (int i = 0; i < count; i++) GraphCompiler.Compile(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40)], opt);
                 Console.WriteLine($"compile avg {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / count:F3} ms");
+                long al = GC.GetTotalAllocatedBytes(true);
+                for (int i = 0; i < 20; i++) GraphCompiler.Compile(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40)], opt);
+                Console.WriteLine($"alloc/compile {(GC.GetTotalAllocatedBytes(true) - al) / 20 / 1024.0:F0} KB");
+                if (Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default is var vb && vb.GraphFor(model, s0, opt with { PhysicalIo = false, LogicalOutput = false }) is not null)
+                {
+                    al = GC.GetTotalAllocatedBytes(true);
+                    t0 = Stopwatch.GetTimestamp();
+                    for (int i = 0; i < 20; i++) vb.GraphFor(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40) + 8], opt with { PhysicalIo = false, LogicalOutput = false });
+                    Console.WriteLine($"vkgraph (compile+emit) avg {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / 20:F3} ms, alloc {(GC.GetTotalAllocatedBytes(true) - al) / 20 / 1024.0:F0} KB");
+                }
                 break;
             }
             case "plansize":

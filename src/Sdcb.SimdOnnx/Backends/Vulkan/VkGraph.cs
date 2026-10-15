@@ -56,7 +56,7 @@ internal sealed class VkGraphModel : IDisposable
     /// <summary>Backend cache recency stamp.</summary>
     internal long LastUse;
     /// <summary>Arena bytes a session needs: the plan's activations, then this graph's scratch.</summary>
-    internal ulong ArenaBytes => _scratchOff + _scratchBytes;
+    internal ulong ArenaBytes => Math.Max(_scratchOff + _scratchBytes, (_tailBytes + 255) & ~255UL);
     private readonly ulong _scratchOff;
     private ulong _scratchBytes;
 
@@ -88,12 +88,21 @@ internal sealed class VkGraphModel : IDisposable
             {
                 case ConvP cp:
                     Need(n.In[0], CK.Raw);
-                    Need(n.In[1], cp.Group > 1 ? CK.DwW : UseCoopConv(dev, f16, plan, n, cp) ? CK.ConvWT : CK.ConvW);
+                    Need(n.In[1], cp.Group > 1 ? CK.DwW
+                        : RouteM8Conv(dev, f16, plan, n, cp) is M8Route.Cm8 or M8Route.Im2col ? CK.CmW
+                        : RouteM8Conv(dev, f16, plan, n, cp) is M8Route.Dot or M8Route.KDot ? CK.ConvW
+                        : UseCoopConv(dev, f16, plan, n, cp) ? CK.ConvWT : CK.ConvW);
                     Need(cp.BiasValue, CK.F32);
                     Need(cp.AddValue, CK.Raw);
                     break;
                 case GemmP gp:
-                    Need(n.In[0], CK.Raw); Need(n.In[1], UseCoopGemm(dev, f16, plan, n, gp) && !gp.TransB ? CK.GemmNK : CK.Raw);
+                    Need(n.In[0], CK.Raw);
+                    Need(n.In[1], RouteM8Gemm(dev, f16, plan, n, gp) switch
+                    {
+                        M8Route.Cm8 => CK.GemmCmW,
+                        M8Route.Dot => CK.Raw,
+                        _ => UseCoopGemm(dev, f16, plan, n, gp) && !gp.TransB ? CK.GemmNK : CK.Raw,
+                    });
                     Need(gp.BiasValue, CK.F32);
                     break;
                 case LnP:
@@ -141,6 +150,8 @@ internal sealed class VkGraphModel : IDisposable
     private static bool UseCoopConv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
+        // SG16 direct devices never take the staged conv_cm build (see RouteM8Conv)
+        if (M8Direct(dev, f16, plan)) return false;
         if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
@@ -155,6 +166,7 @@ internal sealed class VkGraphModel : IDisposable
     private static bool UseCoopGemm(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp)
     {
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || plan.Values[n.In[1]].Floats is null || plan.Values[n.In[1]].Shape.Length != 2) return false;
+        if (M8Direct(dev, f16, plan)) return false;
         // B packed per value: only when no other node reads it (its transB could differ)
         if (plan.Nodes.Count(m => m.In.Contains(n.In[1])) != 1) return false;
         if (gp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return false;
@@ -164,6 +176,78 @@ internal sealed class VkGraphModel : IDisposable
         long m = a.ElementCount / k;
         return k % 8 == 0 && nn % 8 == 0 && (m + 127) / 128 <= 65535;
     }
+
+    /// <summary>Kernel family for a dense conv / const Gemm on 8x16x16 (SG16, Intel Xe2) devices.</summary>
+    internal enum M8Route { None, Dot, Cm8, KDot, Im2col }
+
+    /// <summary>SG16 devices route dense convs to the direct kernels of the old OCR engine
+    /// (pw_dot / gemm_cm8 / conv_kdot / im2col + gemm_cm8) instead of the shared-staged conv_cm
+    /// SG16 build, which intermittently loses the device on the Arc B580 for the OCR models
+    /// (CompileOptions.StagedCoopConv or GCDRNET_VK_SG16STAGED=1 keeps it). None = the generic shaders.</summary>
+    internal static M8Route RouteM8Conv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp) =>
+        Allowed(RouteM8ConvCore(dev, f16, plan, n, cp));
+
+    // debug: GCDRNET_VK_M8=dot,cm8,kdot,im2col limits the direct routes (others take the generic shaders)
+    private static readonly string? s_m8Routes = Environment.GetEnvironmentVariable("GCDRNET_VK_M8");
+    private static M8Route Allowed(M8Route r) =>
+        r == M8Route.None || s_m8Routes is null || s_m8Routes.Split(',').Contains(r.ToString().ToLowerInvariant()) ? r : M8Route.None;
+
+    private static M8Route RouteM8ConvCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
+    {
+        if (!M8Direct(dev, f16, plan) || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
+        if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return M8Route.None;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return M8Route.None;
+        CValue x = plan.Values[n.In[0]];
+        if (x.Shape.Length != 4) return M8Route.None;
+        int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0];
+        bool pointwise = cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && cp.Strides.All(s => s == 1) && cp.Pads.All(q => q == 0);
+        if (pointwise)
+        {
+            // small-K pointwise: the dot kernel outruns the tensor cores (old engine: cin <= 128)
+            if (ic % 4 == 0 && oc % 4 == 0 && ic <= 128) return M8Route.Dot;
+            return ic % 16 == 0 ? M8Route.Cm8 : M8Route.None;
+        }
+        if (ic % 4 != 0) return M8Route.None;
+        int k = cp.Kernel[0] * cp.Kernel[1] * ic;
+        if (oc % 4 == 0 && k <= 1024) return M8Route.KDot;
+        // im2col matrix is one binding
+        long rows = plan.Values[n.Out[0]].ElementCount / oc;
+        return (ulong)((rows + 511) / 512 * 512 * GpuPack.Pad16(k) * 2L) <= dev.MaxStorageRange ? M8Route.Im2col : M8Route.None;
+    }
+
+    internal static M8Route RouteM8Gemm(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp) =>
+        Allowed(RouteM8GemmCore(dev, f16, plan, n, gp));
+
+    private static M8Route RouteM8GemmCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp)
+    {
+        if (!M8Direct(dev, f16, plan) || gp.TransB) return M8Route.None;
+        CValue a = plan.Values[n.In[0]], b = plan.Values[n.In[1]];
+        if (b.Floats is null || b.Shape.Length != 2 || a.Buf < 0) return M8Route.None;
+        if (gp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return M8Route.None;
+        int k = a.Shape[^1], nn = b.Shape[1];
+        if (a.PhysShape[^1] != k) return M8Route.None;
+        if (k % 4 == 0 && nn % 4 == 0 && k <= 128) return M8Route.Dot;
+        return k % 16 == 0 ? M8Route.Cm8 : M8Route.None;
+    }
+
+    private static bool M8Direct(VkDevice dev, bool f16, ExecPlan plan) =>
+        f16 && dev.CoopM8 && plan.Options?.StagedCoopConv != true && Environment.GetEnvironmentVariable("GCDRNET_VK_SG16STAGED") != "1";
+
+    /// <summary>gemm_cm8 tile (rows x columns) and pipeline by output width (old engine's CmTile).</summary>
+    private static (string shader, uint bm, uint bn) Cm8Tile(uint nn) =>
+        nn <= 32 ? ("gemm_cm8_n32", 512u, 32u) : nn <= 64 ? ("gemm_cm8_n64", 256u, 64u) : ("gemm_cm8", 128u, 128u);
+
+    /// <summary>Binding of an arena value widened to <paramref name="bytes"/> (tile reads past its
+    /// end); the arena grows so the widened range stays inside it.</summary>
+    private VkBind BindPadded(int valueId, ulong bytes)
+    {
+        VkBind b = Bind(valueId);
+        if (b.Slot != VkSlot.Arena || bytes <= b.Size) return b;
+        _tailBytes = Math.Max(_tailBytes, b.Offset + bytes);
+        return new VkBind(VkSlot.Arena, b.Offset, bytes);
+    }
+
+    private ulong _tailBytes;
 
 
 
@@ -366,6 +450,55 @@ internal sealed class VkGraphModel : IDisposable
                         G(nb * ic * oh * ow / (v4 ? 4u : 1u)), name: "depthwise");
                     break;
                 }
+                M8Route m8 = RouteM8Conv(_dev, F16, _plan, n, p);
+                if (m8 != M8Route.None)
+                {
+                    uint m = nb * oh * ow, mImg = oh * ow;
+                    uint m8flags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
+                        | ((p.Act switch { ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, _ => 0u }) << 4);
+                    if (m8 == M8Route.Dot)
+                    {
+                        (uint dx, uint dy) = G2((m + 3) / 4 * (oc / 4));
+                        yield return ND("pw_dot",
+                            [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
+                            PcOf(m, oc, ic, m8flags), dx, dy, name: "pw_dot");
+                        break;
+                    }
+                    if (m8 == M8Route.KDot)
+                    {
+                        (uint dx, uint dy) = G2((mImg + 3) / 4 * (oc / 4));
+                        yield return ND("conv_kdot",
+                            [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
+                            PcOf(mImg, oc, ow, iw, ih, ic / 4, (uint)(p.Kernel[0] * p.Kernel[1]), (uint)p.Kernel[1],
+                                (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1], m8flags),
+                            dx, dy, nb, name: "conv_kdot");
+                        break;
+                    }
+                    (string g8, uint bm, uint bn) = Cm8Tile(oc);
+                    uint rowsPad = (m + bm - 1) / bm * bm;
+                    VkBind a;
+                    uint kp;
+                    if (m8 == M8Route.Im2col)
+                    {
+                        uint kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic;
+                        kp = (uint)GpuPack.Pad16((int)kr);
+                        a = Scratch((ulong)rowsPad * kp * 2);
+                        (uint ix, uint iy) = G2(mImg * (kp / 4));
+                        yield return ND("im2col", [Bind(n.In[0]), Bind(n.In[0]), a],
+                            PcOf(ow, oh, ic, (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
+                                (uint)p.Pads[0], (uint)p.Pads[1], iw, ih, kr, kp, 0u),
+                            ix, iy, nb, name: "im2col");
+                    }
+                    else
+                    {
+                        kp = ic;
+                        a = BindPadded(n.In[0], (ulong)rowsPad * kp * 2);
+                    }
+                    yield return ND(g8,
+                        [a, Bind(n.In[1], CK.CmW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
+                        PcOf(m, oc, kp, m8flags), rowsPad / bm, (oc + bn - 1) / bn, name: "gemm_cm8");
+                    break;
+                }
                 if (UseCoopConv(_dev, F16, _plan, n, p))
                 {
                     // BM = 128 rows (pixels) in every variant; BN by oc divisibility
@@ -446,6 +579,25 @@ internal sealed class VkGraphModel : IDisposable
                 if ((uint)shapeIn(0)[^1] != k) throw new NotSupportedException("Vulkan Gemm: K not innermost");
                 uint m = (uint)(V[n.In[0]].ElementCount / k);
                 uint nn = (uint)V[n.Out[0]].Shape[^1];
+                M8Route gm8 = RouteM8Gemm(_dev, F16, _plan, n, p);
+                if (gm8 != M8Route.None)
+                {
+                    uint gf = (p.BiasValue >= 0 ? 1u : 0u)
+                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                    if (gm8 == M8Route.Dot)
+                    {
+                        (uint dx, uint dy) = G2((m + 3) / 4 * (nn / 4));
+                        yield return ND("pw_dot", [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
+                            PcOf(m, nn, k, gf), dx, dy, name: "gemm_dot8");
+                        break;
+                    }
+                    (string g8, uint bm, uint bn) = Cm8Tile(nn);
+                    uint rowsPad = (m + bm - 1) / bm * bm;
+                    yield return ND(g8,
+                        [BindPadded(n.In[0], (ulong)rowsPad * k * 2), Bind(n.In[1], CK.GemmCmW), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
+                        PcOf(m, nn, k, gf), rowsPad / bm, (nn + bn - 1) / bn, name: "gemm_cm8");
+                    break;
+                }
                 if (UseCoopGemm(_dev, F16, _plan, n, p))
                 {
                     (string cm, uint bn) = nn % 128 == 0 ? ("conv_cm", 128u) : nn % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
@@ -690,6 +842,13 @@ internal sealed class VkGraphModel : IDisposable
                 ? new VkDispatch
                 {
                     Pipe = _dev.GetCoopPipeline(shader, binds.Length, pc.Length),
+                    Pc = pc, Binds = binds, Gx = gx, Gy = gy, Gz = gz, Name = $"{shader}({n.Name})",
+                }
+                : shader.StartsWith("gemm_cm8", StringComparison.Ordinal)
+                ? new VkDispatch
+                {
+                    // 8x16x16 fragments: the lane mapping needs the subgroup pinned to 16
+                    Pipe = _dev.GetPipeline(shader + "_h", binds.Length, pc.Length, 16u),
                     Pc = pc, Binds = binds, Gx = gx, Gy = gy, Gz = gz, Name = $"{shader}({n.Name})",
                 }
                 : Dispatch(n, shader, binds, pc, gx, gy, gz);

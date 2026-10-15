@@ -14,6 +14,21 @@ public sealed class OnnxModel
     internal OnnxGraphData Graph { get; }
     internal Dictionary<string, OnnxTensorData> Initializers { get; }
 
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, float[]> _derived = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The model's canonical instance of a constant derived at compile time (folded BatchNorm,
+    /// merged biases, cast shape values): every per-shape compile gets the same array for the same
+    /// contents, so packed-weight caches and GPU const pools match it by reference.
+    /// </summary>
+    internal float[] Intern(string key, float[] values)
+    {
+        float[] cur = _derived.GetOrAdd(key, values);
+        if (ReferenceEquals(cur, values) || cur.AsSpan().SequenceEqual(values)) return cur;
+        _derived[key] = values;   // shape-dependent contents: the latest wins
+        return values;
+    }
+
     public static OnnxModel Load(string path)
     {
         using FileStream fs = File.OpenRead(path);

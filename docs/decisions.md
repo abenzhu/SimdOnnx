@@ -106,3 +106,26 @@ other Vulkan test in the process.
   once a run silently fell back to the CPU; neither reproduced afterwards. Fallbacks now log one
   line to stderr. `GCDRNET_VK_QUEUE=gfx` (graphics queue instead of async compute) was tried:
   no stability difference, 2x slower, so it stays a debug knob.
+
+## 2026-10-15 — B580 device loss: the staged SG16 conv, not the runtime
+
+Reproduced with a stress loop that counts CPU fallbacks (`.rerun`-style: 15–25 x tiny+small,
+4 workers): about 1 run in 7 lost the device (also with 1 worker), the old Paddle engine 0 in 24.
+No TDR event in the system log; GPU-assisted validation over 100 images found no out-of-bounds
+access, only the known coopmat shared-memory race reports. Disabling the SG16 coopmat path
+(`GCDRNET_VK_SG16=0`) removed every loss (0 / 35) at 1.5x the time; a full-workgroup barrier in
+the staged epilogue did not help (2 / 21); disabling only the 1x1 coopmat did not either (2 / 23).
+
+Fix: on 8x16x16 (SG16) devices dense convs and const Gemms take the old OCR engine's direct
+family instead of the shared-staged `conv_cm` SG16 build — `pw_dot` (1x1 / Gemm, K <= 128),
+`gemm_cm8` (direct-load 8x16x16 GEMM, K % 16 == 0), `conv_kdot` (kxk, K <= 1024) and
+`im2col` + `gemm_cm8`. Paddle: 0 losses in 50 runs, accuracy unchanged. GcdrNet is 2x slower
+on that family (its wide 3x3 convs need the staged tensor-core conv) and was 0 / 36 corpus runs
+with the staged build, so its fused pipeline opts back in (`CompileOptions.StagedCoopConv`).
+No shape rule separates the two workloads: staged for every batch-1 conv still lost the device
+once in 50 Paddle runs; staged only for M >= 65536 was clean but costs GcdrNet 30–100%.
+Revisit with a newer Intel driver (tested 32.0.101.8135).
+
+Side findings: GcdrNet stacked its gc/dr arenas by `ExecPlan.ArenaFloats`, ignoring the graph
+scratch (now used by im2col) — it uses `VkGraphModel.ArenaBytes` now. Conv/Pool/Resize/Ew + Relu
+fusion lost the graph output value when the Relu was the last node.

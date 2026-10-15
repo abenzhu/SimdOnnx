@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+// Pointwise GEMM as direct dot products, a 4 rows x 4 columns tile per invocation:
+//   O[m, n] = act(X[m, :] . W[:, n] + bias[n] + R[m, n])
+// X fp16 [M][K] (row stride K), W fp16 k-major [K][N], fp32 math. Small-K 1x1 convs and
+// Gemms (after SimdPaddleOCR's conv1x1_dot): no shared memory, no subgroup assumptions.
+// Requires K % 4 == 0 and N % 4 == 0; the m tail is guarded. fp16 storage only.
+// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { f16vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { f16vec4 w[]; };
+layout(set = 0, binding = 2) readonly buffer Bias { vec4 bias[]; };
+layout(set = 0, binding = 3) readonly buffer Res { f16vec4 res[]; };
+layout(set = 0, binding = 4) writeonly buffer O { f16vec4 o[]; };
+
+layout(push_constant) uniform PC { uint M; uint N; uint K; uint flags; } p;
+
+float ferf(float v)
+{
+    float s = v < 0.0 ? -1.0 : 1.0;
+    float ax = abs(v);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    return (1.0 - poly * exp(-ax * ax)) * s;
+}
+
+vec4 actf(vec4 v, uint act)
+{
+    if (act == 1u) return max(v, vec4(0.0));
+    if (act == 2u) return 0.5 * v * (vec4(1.0) + vec4(ferf(v.x * 0.70710678), ferf(v.y * 0.70710678), ferf(v.z * 0.70710678), ferf(v.w * 0.70710678)));
+    if (act == 3u) return v * clamp(v * (1.0 / 6.0) + 0.5, vec4(0.0), vec4(1.0));
+    return v;
+}
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256u) + gl_GlobalInvocationID.x;
+    uint nv = p.N >> 2, kv = p.K >> 2;
+    uint mv = (p.M + 3u) >> 2;
+    if (gid >= mv * nv) return;
+    uint n4 = gid % nv;
+    uint m0 = (gid / nv) * 4u;
+    // clamped rows: reads stay inside X, stores are guarded
+    uint r1 = min(m0 + 1u, p.M - 1u), r2 = min(m0 + 2u, p.M - 1u), r3 = min(m0 + 3u, p.M - 1u);
+
+    vec4 acc0 = vec4(0.0), acc1 = vec4(0.0), acc2 = vec4(0.0), acc3 = vec4(0.0);
+    for (uint k4 = 0u; k4 < kv; k4++) {
+        vec4 a0 = vec4(x[m0 * kv + k4]);
+        vec4 a1 = vec4(x[r1 * kv + k4]);
+        vec4 a2 = vec4(x[r2 * kv + k4]);
+        vec4 a3 = vec4(x[r3 * kv + k4]);
+        uint wr = k4 * 4u * nv + n4;
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            vec4 wv = vec4(w[wr + i * nv]);
+            acc0 += a0[i] * wv; acc1 += a1[i] * wv;
+            acc2 += a2[i] * wv; acc3 += a3[i] * wv;
+        }
+    }
+    if ((p.flags & 1u) != 0u) {
+        vec4 bv = bias[n4];
+        acc0 += bv; acc1 += bv; acc2 += bv; acc3 += bv;
+    }
+    if ((p.flags & 2u) != 0u) {
+        acc0 += vec4(res[m0 * nv + n4]);
+        acc1 += vec4(res[r1 * nv + n4]);
+        acc2 += vec4(res[r2 * nv + n4]);
+        acc3 += vec4(res[r3 * nv + n4]);
+    }
+    uint act = (p.flags >> 4) & 7u;
+    o[m0 * nv + n4] = f16vec4(actf(acc0, act));
+    if (m0 + 1u < p.M) o[(m0 + 1u) * nv + n4] = f16vec4(actf(acc1, act));
+    if (m0 + 2u < p.M) o[(m0 + 2u) * nv + n4] = f16vec4(actf(acc2, act));
+    if (m0 + 3u < p.M) o[(m0 + 3u) * nv + n4] = f16vec4(actf(acc3, act));
+}

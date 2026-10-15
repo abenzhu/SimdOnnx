@@ -208,6 +208,8 @@ internal sealed class ExecPlan
     public bool Nhwc;
     /// <summary>Input/output stay in plan layout (no boundary relayout); else logical NCHW.</summary>
     public bool PhysicalIo;
+    /// <summary>The options the plan was compiled with (backend kernel choices read them).</summary>
+    public CompileOptions? Options;
 }
 
 /// <summary>Backend a plan is compiled for (fusions are restricted to what it implements).</summary>
@@ -220,8 +222,12 @@ internal enum PlanTarget { Cpu, Vulkan, Metal }
 /// <param name="OutputName">tensor to stop at instead of the graph output (nodes it does not need are dropped).</param>
 internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
     PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null, string? OutputName = null,
-    bool LogicalOutput = false, bool Fuse = true)
+    bool LogicalOutput = false, bool Fuse = true, bool StagedCoopConv = false)
 {
+    // StagedCoopConv: on 8x16x16 (SG16, Intel Xe2) devices, take the shared-staged conv_cm build
+    // for dense convs. Much faster on wide feature maps, but some workloads (the OCR models)
+    // intermittently lose the device with it on the Arc B580, so the default is the direct-load
+    // family (pw_dot / conv_kdot / gemm_cm8). Opt in only for workloads stress-tested with it.
     public bool Gpu => Target != PlanTarget.Cpu;
     /// <summary>SIMDONNX_NHWC=0 (or legacy GCDRNET_NHWC=0) forces the all-NCHW plan (A/B oracle).</summary>
     public static bool DefaultNhwc { get; } = Env.Flag("NHWC") != "0";
