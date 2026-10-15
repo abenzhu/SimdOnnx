@@ -67,7 +67,7 @@ internal sealed class LayoutPlanner
             if (values[v].Buf >= 0 && values[v].Layout is null)
                 values[v].Layout = Layout.Identity(values[v].Shape.Length);
 
-        if (Environment.GetEnvironmentVariable("GCDRNET_DUMP") == "1")
+        if (Env.Flag("DUMP") == "1")
             Console.Error.WriteLine($"[layout] dissolved {lp._dissolved} transposes, {lp._relayout.Count} relayouts");
     }
 

@@ -239,6 +239,9 @@ internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool M
 /// <summary>Engine environment switches: SIMDONNX_X, falling back to the legacy GCDRNET_X.</summary>
 internal static class Env
 {
-    public static string? Flag(string name) =>
-        Environment.GetEnvironmentVariable("SIMDONNX_" + name) ?? Environment.GetEnvironmentVariable("GCDRNET_" + name);
+    // read once per name: knobs are set before the engine starts, and compiles query them per node
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string?> s_flags = new();
+
+    public static string? Flag(string name) => s_flags.GetOrAdd(name, static n =>
+        Environment.GetEnvironmentVariable("SIMDONNX_" + n) ?? Environment.GetEnvironmentVariable("GCDRNET_" + n));
 }

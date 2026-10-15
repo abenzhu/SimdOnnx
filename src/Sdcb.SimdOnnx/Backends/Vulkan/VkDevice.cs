@@ -85,7 +85,7 @@ internal unsafe sealed class VkDevice : IDisposable
     public readonly object Sync = new();
     /// <summary>vkQueueSubmit on the single compute queue is externally synchronized.</summary>
     public readonly object QueueLock = new();
-    private readonly Dictionary<(string name, int bindings, int pcBytes, uint sg, System.Reflection.Assembly? owner), VkPipeline> _pipes = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string name, int bindings, int pcBytes, uint sg, System.Reflection.Assembly? owner), VkPipeline> _pipes = new();
 
     /// <summary>Process-wide pipeline cache: every graph/session shares one
     /// VkPipeline per (shader, binding-count, push-const-size). Set layouts carry
@@ -95,9 +95,11 @@ internal unsafe sealed class VkDevice : IDisposable
         System.Reflection.Assembly? owner = null)
     {
         var key = (name, bindings, pcBytes, requiredSubgroupSize, owner);
+        // lock-free hit (every dispatch of every graph build asks); creation stays serialized
+        if (_pipes.TryGetValue(key, out VkPipeline? p)) return p;
         lock (_pipes)
         {
-            if (_pipes.TryGetValue(key, out VkPipeline? p)) return p;
+            if (_pipes.TryGetValue(key, out p)) return p;
             p = NewPipeline(NewShaderModule(VkShaders.Load(name, owner)), bindings, pcBytes, PushDescriptors, requiredSubgroupSize);
             p.Name = name;
             p.Bindings = bindings;

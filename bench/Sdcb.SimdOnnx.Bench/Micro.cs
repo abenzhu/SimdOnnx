@@ -88,7 +88,8 @@ internal static class Micro
                 var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
                 int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
                 int count = args.Length > 3 ? int.Parse(args[3]) : 200;
-                var opt = new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true, Target: PlanTarget.Vulkan);
+                var opt = new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true, Target: PlanTarget.Vulkan,
+                    OutputName: args.Length > 4 ? args[4] : null);
                 GraphCompiler.Compile(model, s0, opt);
                 long t0 = Stopwatch.GetTimestamp();
                 for (int i = 0; i < count; i++) GraphCompiler.Compile(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40)], opt);
@@ -100,9 +101,28 @@ internal static class Micro
                 {
                     al = GC.GetTotalAllocatedBytes(true);
                     t0 = Stopwatch.GetTimestamp();
-                    for (int i = 0; i < 20; i++) vb.GraphFor(model, [s0[0], s0[1], s0[2], s0[3] + 32 * (i % 40) + 8], opt with { PhysicalIo = false, LogicalOutput = false });
+                    for (int i = 0; i < 20; i++) vb.GraphFor(model, [s0[0], s0[1], s0[2] + 32, s0[3] + 32 * (i % 40)], opt with { PhysicalIo = false, LogicalOutput = false });
                     Console.WriteLine($"vkgraph (compile+emit) avg {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / 20:F3} ms, alloc {(GC.GetTotalAllocatedBytes(true) - al) / 20 / 1024.0:F0} KB");
                 }
+                break;
+            }
+            case "vkemit":
+            {
+                // Vulkan graph emission cost alone (plan compiled once): micro vkemit <model.onnx> NxCxHxW [count] [output]
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
+                int count = args.Length > 3 ? int.Parse(args[3]) : 200;
+                var be = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.Default;
+                var opt = Sdcb.SimdOnnx.Backends.Vulkan.VkBackend.PlanOptions with { Target = PlanTarget.Vulkan, OutputName = args.Length > 4 ? args[4] : null };
+                ExecPlan plan = GraphCompiler.Compile(model, s0, opt);
+                // one live graph keeps the model's const pool (as the backend cache does)
+                var keep = new Sdcb.SimdOnnx.Backends.Vulkan.VkGraphModel(be.Dev, plan, be.F16, constKey: model);
+                long al = GC.GetTotalAllocatedBytes(true);
+                long t0 = Stopwatch.GetTimestamp();
+                for (int i = 0; i < count; i++)
+                    new Sdcb.SimdOnnx.Backends.Vulkan.VkGraphModel(be.Dev, plan, be.F16, constKey: model).Release();
+                Console.WriteLine($"emit avg {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / count:F3} ms, alloc {(GC.GetTotalAllocatedBytes(true) - al) / count / 1024.0:F0} KB, {plan.Nodes.Length} nodes");
+                keep.Release();
                 break;
             }
             case "plansize":

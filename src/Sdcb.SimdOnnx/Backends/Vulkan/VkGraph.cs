@@ -156,7 +156,7 @@ internal sealed class VkGraphModel : IDisposable
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
         long m = (long)so[0] * so[1] * so[2];
-        if (cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && Environment.GetEnvironmentVariable("GCDRNET_VK_CM1X1") == "0") return false;
+        if (cp.Kernel[0] == 1 && cp.Kernel[1] == 1 && Env.Flag("VK_CM1X1") == "0") return false;
         return so[3] % 8 == 0 && (m + 127) / 128 <= 65535;   // cin % 8 != 0 -> scalar-gather stem variant
     }
 
@@ -231,7 +231,7 @@ internal sealed class VkGraphModel : IDisposable
     }
 
     private static bool M8Direct(VkDevice dev, bool f16, ExecPlan plan) =>
-        f16 && dev.CoopM8 && plan.Options?.StagedCoopConv != true && Environment.GetEnvironmentVariable("GCDRNET_VK_SG16STAGED") != "1";
+        f16 && dev.CoopM8 && plan.Options?.StagedCoopConv != true && Env.Flag("VK_SG16STAGED") != "1";
 
     /// <summary>gemm_cm8 tile (rows x columns) and pipeline by output width (old engine's CmTile).</summary>
     private static (string shader, uint bm, uint bn) Cm8Tile(uint nn) =>

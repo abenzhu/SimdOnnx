@@ -201,13 +201,21 @@ internal static class GraphCompiler
             var live = new HashSet<int>();
             void Mark(int v) { while (v >= 0 && live.Add(v)) v = values[v].AliasOf; }
             Mark(outputValue);
+            var keep = new bool[nodes.Count];
             for (int i = nodes.Count - 1; i >= 0; i--)
             {
                 ExecNode n = nodes[i];
-                if (!n.Out.Any(live.Contains)) { nodes.RemoveAt(i); continue; }
+                foreach (int o in n.Out)
+                    if (live.Contains(o)) { keep[i] = true; break; }
+                if (!keep[i]) continue;
                 foreach (int v in n.In) Mark(v);
                 foreach (int v in n.ParamRefs()) Mark(v);
             }
+            // one compaction instead of a RemoveAt per dead node (a head cut drops the whole tail)
+            int w = 0;
+            for (int i = 0; i < nodes.Count; i++)
+                if (keep[i]) nodes[w++] = nodes[i];
+            nodes.RemoveRange(w, nodes.Count - w);
         }
 
         private static void RunPasses(PassStage stage, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
@@ -619,25 +627,41 @@ internal static class GraphCompiler
         }
 
         /// <summary>Producer and use-count index of a node list (fusion passes: O(1) lookups
-        /// instead of a scan per candidate). Uses count node inputs plus aliasing views.</summary>
+        /// instead of a scan per candidate), kept current as passes rewrite nodes. Uses count node
+        /// inputs plus aliasing views.</summary>
         private sealed class UseIndex
         {
-            private readonly Dictionary<int, ExecNode> _prod = new();
-            private readonly Dictionary<int, int> _uses = new();
+            private ExecNode?[] _prod;
+            private int[] _uses;
             public UseIndex(List<ExecNode> nodes, List<CValue> values)
             {
-                foreach (ExecNode m in nodes)
-                {
-                    if (m.Out.Length == 1) _prod[m.Out[0]] = m;
-                    foreach (int v in m.In) _uses[v] = Uses(v) + 1;
-                }
+                _prod = new ExecNode?[values.Count + 16];
+                _uses = new int[values.Count + 16];
+                foreach (ExecNode m in nodes) Add(m);
                 foreach (CValue v in values)
-                    if (v.AliasOf >= 0) _uses[v.AliasOf] = Uses(v.AliasOf) + 1;
+                    if (v.AliasOf >= 0) _uses[v.AliasOf]++;
             }
-            public ExecNode? Producer(int v) => _prod.TryGetValue(v, out ExecNode? m) ? m : null;
-            public int Uses(int v) => _uses.TryGetValue(v, out int c) ? c : 0;
-            public void SetProducer(int v, ExecNode m) => _prod[v] = m;
-            public void Unuse(int v) => _uses[v] = Uses(v) - 1;
+            private void Grow(int v)
+            {
+                if (v < _prod.Length) return;
+                Array.Resize(ref _prod, v * 2 + 16);
+                Array.Resize(ref _uses, v * 2 + 16);
+            }
+            public ExecNode? Producer(int v) => v >= 0 && v < _prod.Length ? _prod[v] : null;
+            public int Uses(int v) => v >= 0 && v < _uses.Length ? _uses[v] : 0;
+            public void SetProducer(int v, ExecNode m) { Grow(v); _prod[v] = m; }
+            public void Unuse(int v) { Grow(v); _uses[v]--; }
+            public void Add(ExecNode m)
+            {
+                if (m.Out.Length == 1) SetProducer(m.Out[0], m);
+                foreach (int v in m.In) { Grow(v); _uses[v]++; }
+            }
+            public void Remove(ExecNode m)
+            {
+                foreach (int o in m.Out)
+                    if (Producer(o) == m) _prod[o] = null;
+                foreach (int v in m.In) _uses[v]--;
+            }
         }
 
         /// <summary>Conv/Gemm -> Add(per-channel const) folds into the producer's bias (the producer then
@@ -648,7 +672,7 @@ internal static class GraphCompiler
             for (int i = 0; i < nodes.Count; i++)
             {
                 ExecNode b = nodes[i];
-                if (b.Op != ExecOp.Elementwise || b.P is not EwP { Op: EwOp.Add } ep || b.In.Length != 2) continue;
+                if (b is null || b.Op != ExecOp.Elementwise || b.P is not EwP { Op: EwOp.Add } ep || b.In.Length != 2) continue;
                 for (int k = 0; k < 2; k++)
                 {
                     int pv = b.In[k], cv = b.In[1 - k];
@@ -688,11 +712,11 @@ internal static class GraphCompiler
                     ix.SetProducer(b.Out[0], a);
                     ix.Unuse(pv);
                     ix.Unuse(cv);
-                    nodes.RemoveAt(i);
-                    i--;
+                    nodes[i] = null!;   // compacted below: one pass instead of a RemoveAt per fusion
                     break;
                 }
             }
+            nodes.RemoveAll(n => n is null);
         }
 
         /// <summary>CPU plans: Mul(x, HardSigmoid(x)) → HardSwish(x), Mul(x, Sigmoid(x)) → Swish(x); conv/gemm
@@ -728,41 +752,40 @@ internal static class GraphCompiler
         /// m = mean(x); d = x - m; y = d / sqrt(mean(d·d) + eps) · gamma + beta.</summary>
         private static void FuseLayerNorm(List<ExecNode> nodes, List<CValue> values)
         {
-            // index rebuilt after each (rare) fusion; Prod returns a node position like the scan did
             var ix = new UseIndex(nodes, values);
-            int Prod(int v) => ix.Producer(v) is { } m ? nodes.IndexOf(m) : -1;
+            var dead = new HashSet<ExecNode>();
+            ExecNode? Prod(int v) => ix.Producer(v);
             int Uses(int v) => ix.Uses(v);
-            bool Ew(ExecNode m, EwOp op) => m.Op == ExecOp.Elementwise && m.P is EwP { Act: ActivationKind.None } e && e.Op == op && m.In.Length == 2;
+            bool Ew(ExecNode? m, EwOp op) => m is not null && m.Op == ExecOp.Elementwise && m.P is EwP { Act: ActivationKind.None } e && e.Op == op && m.In.Length == 2;
             bool Const(int v) => values[v].Floats is not null;
             for (int i = 0; i < nodes.Count; i++)
             {
                 ExecNode add = nodes[i];
-                if (!Ew(add, EwOp.Add)) continue;
+                if (dead.Contains(add) || !Ew(add, EwOp.Add)) continue;
                 int mulV = add.In[0], beta = add.In[1];
                 if (!Const(beta)) (mulV, beta) = (beta, mulV);
-                int mi = Prod(mulV);
-                if (!Const(beta) || mi < 0 || !Ew(nodes[mi], EwOp.Mul) || Uses(mulV) != 1) continue;
-                ExecNode mul = nodes[mi];
-                int divV = mul.In[0], gamma = mul.In[1];
+                ExecNode? mul = Prod(mulV);
+                if (!Const(beta) || !Ew(mul, EwOp.Mul) || Uses(mulV) != 1) continue;
+                int divV = mul!.In[0], gamma = mul.In[1];
                 if (!Const(gamma)) (divV, gamma) = (gamma, divV);
-                int di = Prod(divV);
-                if (!Const(gamma) || di < 0 || !Ew(nodes[di], EwOp.Div) || Uses(divV) != 1) continue;
-                ExecNode div = nodes[di];
-                int subV = div.In[0], sqrtV = div.In[1];
-                int qi = Prod(sqrtV), si = Prod(subV);
-                if (qi < 0 || si < 0 || nodes[qi].Op != ExecOp.Sqrt || Uses(sqrtV) != 1 || !Ew(nodes[si], EwOp.Sub)) continue;
-                int epsV = nodes[qi].In[0], ei = Prod(epsV);
-                if (ei < 0 || !Ew(nodes[ei], EwOp.Add) || Uses(epsV) != 1) continue;
-                ExecNode epsAdd = nodes[ei];
-                int varV = epsAdd.In[0], epsC = epsAdd.In[1];
+                ExecNode? div = Prod(divV);
+                if (!Const(gamma) || !Ew(div, EwOp.Div) || Uses(divV) != 1) continue;
+                int subV = div!.In[0], sqrtV = div.In[1];
+                ExecNode? sqrt = Prod(sqrtV), sub = Prod(subV);
+                if (sqrt is null || sub is null || sqrt.Op != ExecOp.Sqrt || Uses(sqrtV) != 1 || !Ew(sub, EwOp.Sub)) continue;
+                int epsV = sqrt.In[0];
+                ExecNode? epsAdd = Prod(epsV);
+                if (!Ew(epsAdd, EwOp.Add) || Uses(epsV) != 1) continue;
+                int varV = epsAdd!.In[0], epsC = epsAdd.In[1];
                 if (!Const(epsC)) (varV, epsC) = (epsC, varV);
-                int vi = Prod(varV);
-                if (values[epsC].Floats is not { Length: 1 } ef || vi < 0 || nodes[vi].Op != ExecOp.ReduceMean || Uses(varV) != 1) continue;
-                int powV = nodes[vi].In[0], pi = Prod(powV);
-                if (pi < 0 || !Ew(nodes[pi], EwOp.Mul) || nodes[pi].In[0] != subV || nodes[pi].In[1] != subV || Uses(powV) != 1) continue;
-                ExecNode sub = nodes[si];
-                int x = sub.In[0], meanV = sub.In[1], ri = Prod(meanV);
-                if (ri < 0 || nodes[ri].Op != ExecOp.ReduceMean || nodes[ri].In[0] != x || Uses(meanV) != 1 || Uses(subV) != 3) continue;
+                ExecNode? vmean = Prod(varV);
+                if (values[epsC].Floats is not { Length: 1 } ef || vmean is null || vmean.Op != ExecOp.ReduceMean || Uses(varV) != 1) continue;
+                int powV = vmean.In[0];
+                ExecNode? pow = Prod(powV);
+                if (!Ew(pow, EwOp.Mul) || pow!.In[0] != subV || pow.In[1] != subV || Uses(powV) != 1) continue;
+                int x = sub.In[0], meanV = sub.In[1];
+                ExecNode? rmean = Prod(meanV);
+                if (rmean is null || rmean.Op != ExecOp.ReduceMean || rmean.In[0] != x || Uses(meanV) != 1 || Uses(subV) != 3) continue;
                 int c = values[x].Shape[^1];
                 bool PerLast(int v) => values[v].Floats!.Length == c && values[v].Shape.Length >= 1 && values[v].Shape[^1] == c;
                 if (!PerLast(gamma) || !PerLast(beta)) continue;
@@ -771,12 +794,16 @@ internal static class GraphCompiler
                     Op = ExecOp.LayerNorm, In = [x, gamma, beta], Out = add.Out,
                     P = new LnP { Eps = ef[0] }, SrcNode = add.SrcNode, Name = add.Name,
                 };
-                ExecNode[] dead = [nodes[ri], sub, nodes[pi], nodes[vi], epsAdd, nodes[qi], div, mul];
+                foreach (ExecNode d in (ExecNode[])[rmean, sub, pow, vmean, epsAdd, sqrt, div, mul, add])
+                {
+                    ix.Remove(d);
+                    dead.Add(d);
+                }
+                dead.Remove(add);
                 nodes[i] = ln;
-                foreach (ExecNode d in dead) nodes.Remove(d);
-                i = nodes.IndexOf(ln);
-                ix = new UseIndex(nodes, values);
+                ix.Add(ln);
             }
+            if (dead.Count > 0) nodes.RemoveAll(dead.Contains);
         }
 
         /// <summary>ConvTranspose -> Add(const [1,oc,1,1]) folds into the transposed conv's bias.</summary>
