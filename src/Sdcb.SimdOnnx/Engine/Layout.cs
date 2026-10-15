@@ -8,7 +8,7 @@ namespace Sdcb.SimdOnnx.Engine;
 /// <see cref="Phys"/>. Size-1 dims carry no stride, so layouts that order the
 /// non-1 dims identically are interchangeable (<see cref="Equivalent"/>).
 /// </summary>
-internal static class Layout
+public static class Layout
 {
     /// <summary>Channels-last for rank-4 [n,c,h,w]: storage [n,h,w,c].</summary>
     public static readonly int[] Nhwc = [0, 2, 3, 1];

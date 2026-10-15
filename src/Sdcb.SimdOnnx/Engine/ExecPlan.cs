@@ -1,7 +1,7 @@
 namespace Sdcb.SimdOnnx.Engine;
 
 /// <summary>Executable op set — the lowered form the session runs.</summary>
-internal enum ExecOp
+public enum ExecOp
 {
     Conv,            // NCHW conv, optional bias + fused activation
     MaxPool,         // NCHW pooling
@@ -32,15 +32,15 @@ internal enum ExecOp
     Ext,             // consumer-registered operator (ExecNode.Ext)
 }
 
-internal enum ActivationKind { None, Relu, Sigmoid, Gelu, HardSwish, Swish }
+public enum ActivationKind { None, Relu, Sigmoid, Gelu, HardSwish, Swish }
 
-internal enum PadMode { Constant, Reflect }
+public enum PadMode { Constant, Reflect }
 
-internal enum EwOp { Add, Sub, Mul, Div }
+public enum EwOp { Add, Sub, Mul, Div }
 
 // ---- per-op parameter records (resolved at compile time) ----
 
-internal sealed class ConvP
+public sealed class ConvP
 {
     public required int[] Pads;      // [top, left, bottom, right] spatial only
     public required int[] Strides;   // [sh, sw]
@@ -57,7 +57,7 @@ internal sealed class ConvP
     public PoolP? Pool;
 }
 
-internal sealed class PoolP
+public sealed class PoolP
 {
     public required int[] Kernel;
     public required int[] Strides;
@@ -66,18 +66,18 @@ internal sealed class PoolP
     public bool CountIncludePad;     // AvgPool only
 }
 
-internal sealed class EwP
+public sealed class EwP
 {
     public required EwOp Op;
     public ActivationKind Act;
 }
 
-internal sealed class LnP
+public sealed class LnP
 {
     public float Eps;
 }
 
-internal sealed class GemmP
+public sealed class GemmP
 {
     public bool TransB;             // B stored [N,K] when true (onnx transB=1)
     public int BiasValue = -1;
@@ -85,7 +85,7 @@ internal sealed class GemmP
     public object? KernelPlan;      // backend-private packed B, filled at session build
 }
 
-internal sealed class ResizeP
+public sealed class ResizeP
 {
     public required float[] Scales; // per-dim, only [.., sh, sw] used
     public bool FuseRelu;           // relu on the resized value (before the optional add)
@@ -93,12 +93,12 @@ internal sealed class ResizeP
     public bool AddRelu;            // relu on the addend
 }
 
-internal sealed class HardSigmoidP
+public sealed class HardSigmoidP
 {
     public float Alpha, Beta;
 }
 
-internal sealed class ConvTP
+public sealed class ConvTP
 {
     public required int[] Kernel;    // [kh, kw] == strides
     public int BiasValue = -1;       // [oc] const (also folded from a trailing Add([1,oc,1,1] const))
@@ -106,24 +106,24 @@ internal sealed class ConvTP
     public object? KernelPlan;
 }
 
-internal sealed class ResizeNearestP
+public sealed class ResizeNearestP
 {
     public required float[] Scales;
 }
 
-internal sealed class PadP
+public sealed class PadP
 {
     public required int[] Pads;     // [2*rank] begin..end
     public PadMode Mode = PadMode.Constant;
     public float Value;
 }
 
-internal sealed class TransposeP
+public sealed class TransposeP
 {
     public required int[] Perm;
 }
 
-internal sealed class SliceP
+public sealed class SliceP
 {
     public required int[] Starts;
     public required int[] Ends;
@@ -131,13 +131,13 @@ internal sealed class SliceP
     public required int[] Steps;
 }
 
-internal sealed class ConcatP
+public sealed class ConcatP
 {
     public int Axis;
 }
 
 /// <summary>A resolved tensor value: compile-time constant or activation.</summary>
-internal sealed class CValue
+public sealed class CValue
 {
     public int[] Shape = [];
     public int DType;            // onnx dtype: 1 float, 7 int64
@@ -170,7 +170,7 @@ internal readonly unsafe struct FBuf
 }
 
 /// <summary>One executable step: op + value ids.</summary>
-internal sealed class ExecNode
+public sealed class ExecNode
 {
     public required ExecOp Op;
     public required int[] In;    // value ids
@@ -195,7 +195,7 @@ internal sealed class ExecNode
 }
 
 /// <summary>Compiled graph ready for a session: exec nodes + buffer plan.</summary>
-internal sealed class ExecPlan
+public sealed class ExecPlan
 {
     public required ExecNode[] Nodes;
     public required CValue[] Values;
@@ -213,14 +213,14 @@ internal sealed class ExecPlan
 }
 
 /// <summary>Backend a plan is compiled for (fusions are restricted to what it implements).</summary>
-internal enum PlanTarget { Cpu, Vulkan, Metal }
+public enum PlanTarget { Cpu, Vulkan, Metal }
 
 /// <summary>Plan compilation options.</summary>
 /// <param name="MemFuse">memory fusions (conv+pool and extension memory passes; NHWC only).</param>
 /// <param name="Target">backend the plan runs on.</param>
 /// <param name="Extensions">consumer-registered operators and graph passes.</param>
 /// <param name="OutputName">tensor to stop at instead of the graph output (nodes it does not need are dropped).</param>
-internal sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
+public sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
     PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null, string? OutputName = null,
     bool LogicalOutput = false, bool Fuse = true, bool StagedCoopConv = false)
 {

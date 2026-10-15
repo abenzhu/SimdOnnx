@@ -6,19 +6,19 @@ using CK = Sdcb.SimdOnnx.Engine.ConstKind;
 namespace Sdcb.SimdOnnx.Backends.Vulkan;
 
 /// <summary>Binding slots resolved per-session: which underlying buffer.</summary>
-internal enum VkSlot : int { Arena = 0, Consts = 1, Dummy = 2, StageIn = 3, StageOut = 4, Direct = 5 }
+public enum VkSlot : int { Arena = 0, Consts = 1, Dummy = 2, StageIn = 3, StageOut = 4, Direct = 5 }
 
-internal readonly struct VkBind
+public readonly struct VkBind
 {
     public readonly VkSlot Slot;
-    public readonly VkBuffer? Buf;   // when Slot == Direct
+    internal readonly VkBuffer? Buf;   // when Slot == Direct
     public readonly ulong Offset, Size;
     public VkBind(VkSlot s, ulong off, ulong size) { Slot = s; Offset = off; Size = size; }
-    public VkBind(VkBuffer b, ulong off, ulong size) { Slot = VkSlot.Direct; Buf = b; Offset = off; Size = size; }
+    internal VkBind(VkBuffer b, ulong off, ulong size) { Slot = VkSlot.Direct; Buf = b; Offset = off; Size = size; }
 }
 
 /// <summary>One recorded compute dispatch.</summary>
-internal sealed class VkDispatch
+public sealed class VkDispatch
 {
     public required VkPipeline Pipe;
     public required VkBind[] Binds;
@@ -38,7 +38,7 @@ internal sealed class VkDispatch
 /// shader math, reductions included, is fp32); conv bias and LayerNorm params
 /// stay fp32. Const bytes therefore differ per backend and per precision.
 /// </summary>
-internal sealed class VkGraphModel : IDisposable
+public sealed class VkGraphModel : IDisposable
 {
     private readonly VkDevice _dev;
     private readonly ExecPlan _plan;
@@ -50,9 +50,9 @@ internal sealed class VkGraphModel : IDisposable
     internal readonly VkDispatch[] Dispatches;
     internal readonly ulong ConstBytes;
     /// <summary>Activations + weights stored as float16 (fp32 math in every shader).</summary>
-    internal readonly bool F16;
+    public readonly bool F16;
     /// <summary>Bytes per stored activation element.</summary>
-    internal int Es => F16 ? 2 : 4;
+    public int Es => F16 ? 2 : 4;
     /// <summary>Backend cache recency stamp.</summary>
     internal long LastUse;
     /// <summary>Arena bytes a session needs: the plan's activations, then this graph's scratch.</summary>
@@ -256,13 +256,13 @@ internal sealed class VkGraphModel : IDisposable
 
     // ---- value → bind resolution (byte offsets/sizes: all long math) ----
     /// <summary>Transient arena space past the plan's values; one region, reused by every dispatch pair.</summary>
-    internal VkBind Scratch(ulong bytes)
+    public VkBind Scratch(ulong bytes)
     {
         _scratchBytes = Math.Max(_scratchBytes, bytes);
         return new VkBind(VkSlot.Arena, _scratchOff, bytes);
     }
 
-    internal VkBind Bind(int valueId, CK? kind = null)
+    public VkBind Bind(int valueId, CK? kind = null)
     {
         kind ??= CK.Raw;
         CValue v = _plan.Values[valueId];
@@ -280,14 +280,14 @@ internal sealed class VkGraphModel : IDisposable
         throw new InvalidOperationException($"value '{v.Name}' has no GPU storage (ints must be folded)");
     }
 
-    internal static byte[] PcOf(params uint[] ints)
+    public static byte[] PcOf(params uint[] ints)
     {
         byte[] b = new byte[ints.Length * 4];
         Buffer.BlockCopy(ints, 0, b, 0, b.Length);
         return b;
     }
 
-    internal static byte[] PcOfF(uint[] ints, params float[] floats)
+    public static byte[] PcOfF(uint[] ints, params float[] floats)
     {
         byte[] b = new byte[(ints.Length + floats.Length) * 4];
         Buffer.BlockCopy(ints, 0, b, 0, ints.Length * 4);
@@ -295,12 +295,12 @@ internal sealed class VkGraphModel : IDisposable
         return b;
     }
 
-    internal static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
+    public static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
 
-    internal static uint G(uint n) => (n + 255) / 256;
+    public static uint G(uint n) => (n + 255) / 256;
 
     /// <summary>uints, one float, then more uints (push-constant blocks with a float in the middle).</summary>
-    internal static byte[] PcOf3(uint[] ints, float f, uint[] tail)
+    public static byte[] PcOf3(uint[] ints, float f, uint[] tail)
     {
         byte[] b = new byte[(ints.Length + 1 + tail.Length) * 4];
         Buffer.BlockCopy(ints, 0, b, 0, ints.Length * 4);
@@ -858,7 +858,7 @@ internal sealed class VkGraphModel : IDisposable
 
     /// <summary>A dispatch of <paramref name="shader"/> (fp16 variant on fp16 graphs) embedded in
     /// <paramref name="owner"/> (null = the core).</summary>
-    internal VkDispatch Dispatch(ExecNode n, string shader, VkBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1,
+    public VkDispatch Dispatch(ExecNode n, string shader, VkBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1,
         Assembly? owner = null) => new()
     {
         Pipe = _dev.GetPipeline(Sh(shader), binds.Length, pc.Length, owner: owner),
@@ -867,12 +867,12 @@ internal sealed class VkGraphModel : IDisposable
     };
 
     /// <summary>Binding of a value, or the 64 B zero buffer for <paramref name="valueId"/> &lt; 0.</summary>
-    internal VkBind BindOrDummy(int valueId, CK? kind = null) =>
+    public VkBind BindOrDummy(int valueId, CK? kind = null) =>
         valueId >= 0 ? Bind(valueId, kind) : new VkBind(VkSlot.Dummy, 0, 64);
 
     internal VkDevice Device => _dev;
 
-    internal void RequireNhwc(int v)
+    public void RequireNhwc(int v)
     {
         CValue cv = _plan.Values[v];
         if (cv.Shape.Length != 4 || !Engine.Layout.Equivalent(cv.Shape, cv.Layout ?? Engine.Layout.Identity(4), Engine.Layout.Nhwc))
@@ -907,7 +907,7 @@ internal sealed class VkGraphModel : IDisposable
     }
 
     /// <summary>256-thread groups for n items, split over x/y past the 65535 x-limit.</summary>
-    internal static (uint x, uint y) G2(uint n)
+    public static (uint x, uint y) G2(uint n)
     {
         uint g = G(n), gx = Math.Min(g, 65535u);
         if (gx == 0) return (0, 1); // empty tensor (e.g. a zero-length pad slice): no-op dispatch
@@ -960,6 +960,6 @@ internal sealed class VkGraphModel : IDisposable
     }
 
     /// <summary>The plan this graph was compiled from (arena offsets, I/O values).</summary>
-    internal ExecPlan Plan => _plan;
+    public ExecPlan Plan => _plan;
     public void Dispose() => Release();
 }

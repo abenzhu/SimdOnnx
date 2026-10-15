@@ -25,7 +25,7 @@ namespace Sdcb.SimdOnnx.Engine;
 /// Concat axis, relayout perms), so generic kernels address purely by
 /// <see cref="CValue.PhysShape"/>.
 /// </summary>
-internal sealed class LayoutPlanner
+public sealed class LayoutPlanner
 {
     private readonly List<ExecNode> _nodes;
     private readonly List<CValue> _values;
@@ -72,7 +72,7 @@ internal sealed class LayoutPlanner
     }
 
     /// <summary>Resolves (and caches) the layout of value <paramref name="v"/>, following aliases.</summary>
-    internal int[] L(int v)
+    public int[] L(int v)
     {
         CValue cv = _values[v];
         if (cv.Layout is not null) return cv.Layout;
@@ -123,12 +123,12 @@ internal sealed class LayoutPlanner
         return id;
     }
 
-    internal int Need(int v, int[] target) =>
+    public int Need(int v, int[] target) =>
         Layout.Equivalent(_values[v].Shape, L(v), target) ? v : Relayout(v, target);
 
-    internal void Need(ExecNode n, int k, int[] target) => n.In[k] = Need(n.In[k], target);
+    public void Need(ExecNode n, int k, int[] target) => n.In[k] = Need(n.In[k], target);
 
-    internal List<CValue> Values => _values;
+    public List<CValue> Values => _values;
 
     private static bool LastInnermost(int[] shape, int[] l)
     {

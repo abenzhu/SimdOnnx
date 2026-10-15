@@ -8,17 +8,17 @@ namespace Sdcb.SimdOnnx.Backends.Metal;
 /// factories for inference sessions and fused enhancer pipelines. Thread-safe;
 /// dispose with the process or when the backend is torn down.
 /// </summary>
-internal sealed class MetalBackend : IDisposable
+public sealed class MetalBackend : IDisposable
 {
     internal readonly MtlDevice Dev;
     private readonly Dictionary<(OnnxModel m, string shape, CompileOptions opt), MtlGraphModel> _graphs = new();
     private readonly object _gate = new();
 
     private static readonly Lazy<MetalBackend> s_default = new(() => new MetalBackend());
-    internal static MetalBackend Default => s_default.Value;
+    public static MetalBackend Default => s_default.Value;
 
-    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Metal);
-    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Metal);
+    public static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Metal);
+    public static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Metal);
 
     internal MetalBackend()
     {
@@ -79,7 +79,11 @@ internal sealed class MetalBackend : IDisposable
         => GraphFor(m, shape, physIo, ext);
 
     /// <summary>Session over the graph for <paramref name="shape"/> under explicit plan options.</summary>
-    internal MtlInferenceSession NewSession(OnnxModel m, int[] shape, CompileOptions opt)
+    /// <summary>The device's name.</summary>
+    public string DeviceName => Dev.Name;
+
+    /// <summary>A session over the graph of <paramref name="m"/> at <paramref name="shape"/> under explicit options.</summary>
+    public MtlInferenceSession NewSession(OnnxModel m, int[] shape, CompileOptions opt)
     {
         MtlGraphModel g = GraphFor(m, shape, opt);
         try { return new MtlInferenceSession(Dev, g.Plan, g); }

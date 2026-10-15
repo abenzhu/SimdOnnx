@@ -13,7 +13,7 @@ namespace Sdcb.SimdOnnx.Engine;
 /// A backend that does not implement the op must not be targeted by the fusing pass
 /// (<see cref="PassContext.Target"/>): the core never falls back node by node.
 /// </summary>
-internal abstract class ExtOp
+public abstract class ExtOp
 {
     public abstract string Name { get; }
 
@@ -46,7 +46,7 @@ internal abstract class ExtOp
 }
 
 /// <summary>When a <see cref="GraphPass"/> runs.</summary>
-internal enum PassStage
+public enum PassStage
 {
     /// <summary>Logical graph, after the built-in fusions, before layout planning.</summary>
     Logical,
@@ -55,14 +55,14 @@ internal enum PassStage
 }
 
 /// <summary>A consumer-defined rewrite over the exec node list.</summary>
-internal abstract class GraphPass
+public abstract class GraphPass
 {
     public abstract PassStage Stage { get; }
     public abstract void Run(PassContext ctx);
 }
 
 /// <summary>Registered extension operators and passes; pass via <see cref="CompileOptions.Extensions"/>.</summary>
-internal sealed class EngineExtensions
+public sealed class EngineExtensions
 {
     private readonly List<GraphPass> _passes = [];
     public IReadOnlyList<GraphPass> Passes => _passes;
@@ -70,7 +70,7 @@ internal sealed class EngineExtensions
 }
 
 /// <summary>Graph view handed to <see cref="GraphPass.Run"/>.</summary>
-internal sealed class PassContext(List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions options)
+public sealed class PassContext(List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions options)
 {
     public List<ExecNode> Nodes { get; } = nodes;
     public List<CValue> Values { get; } = values;
@@ -113,7 +113,7 @@ internal sealed class PassContext(List<ExecNode> nodes, List<CValue> values, int
 /// How a const tensor is laid out on a GPU (decided by its consumer). Built-ins cover the core
 /// shaders; extensions create their own with a <see cref="Pack"/> function. Identity is by reference.
 /// </summary>
-internal sealed class ConstKind(string name, bool fp32, Func<CValue, float[]>? pack = null, Func<CValue, long>? elems = null)
+public sealed class ConstKind(string name, bool fp32, Func<CValue, float[]>? pack = null, Func<CValue, long>? elems = null)
 {
     private static int s_next;
     /// <summary>Stable per-process id (const stores compare kind lists by it).</summary>

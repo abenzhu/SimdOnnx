@@ -16,7 +16,7 @@ public sealed class CompiledModel
     public static CompiledModel Compile(OnnxModel model, ReadOnlySpan<int> inputShape) =>
         new(GraphCompiler.Compile(model, inputShape));
 
-    internal static CompiledModel Compile(OnnxModel model, ReadOnlySpan<int> inputShape, CompileOptions options) =>
+    public static CompiledModel Compile(OnnxModel model, ReadOnlySpan<int> inputShape, CompileOptions options) =>
         new(GraphCompiler.Compile(model, inputShape, options));
 
     public InferenceSession CreateSession() => new(Plan);

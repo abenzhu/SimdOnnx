@@ -65,13 +65,18 @@ internal static unsafe partial class Nhwc
     internal static int[] Map(int outLen, int k, int stride, int pad, int inLen, PadMode mode)
     {
         int[] m = new int[outLen * k];
+        FillMap(m, outLen, k, stride, pad, inLen, mode);
+        return m;
+    }
+
+    private static void FillMap(int[] m, int outLen, int k, int stride, int pad, int inLen, PadMode mode)
+    {
         for (int o = 0; o < outLen; o++)
             for (int kk = 0; kk < k; kk++)
             {
                 int s = o * stride + kk - pad;
                 m[o * k + kk] = (uint)s < (uint)inLen ? s : mode == PadMode.Reflect ? Reflect(s, inLen) : -1;
             }
-        return m;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -190,16 +195,41 @@ internal static unsafe partial class Nhwc
             return;
         }
         int kh = p.Kernel[0], kw = p.Kernel[1];
-        int[] rm = Map(oh, kh, p.Strides[0], p.Pads[0], ih, p.PadMode);
-        int[] cm = Map(ow, kw, p.Strides[1], p.Pads[1], iw, p.PadMode);
-        float[] padVec = new float[ic * kw + Ob];   // one constant-pad kernel row (Dense512 row runs)
-        Array.Fill(padVec, p.PadValue);
-        if (kp.Depthwise)
-            Depthwise(src, ih, iw, ic, dst, oh, ow, kh, kw, p.Strides[1], rm, cm, padVec, p.PadValue, kp, add, p.Act, batch);
-        else if (UseAvx512)
-            Dense512(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
-        else
-            Dense(src, ih, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act, batch);
+        // per-run tables from the shared pools: allocating them was most of a CPU run's garbage
+        int[] rm = MapRented(oh, kh, p.Strides[0], p.Pads[0], ih, p.PadMode);
+        int[] cm = MapRented(ow, kw, p.Strides[1], p.Pads[1], iw, p.PadMode);
+        float[] padVec = PadRented(ic * kw + Ob, p.PadValue);   // one constant-pad kernel row (Dense512 row runs)
+        try
+        {
+            if (kp.Depthwise)
+                Depthwise(src, ih, iw, ic, dst, oh, ow, kh, kw, p.Strides[1], rm, cm, padVec, p.PadValue, kp, add, p.Act, batch);
+            else if (UseAvx512)
+                Dense512(src, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act);
+            else
+                Dense(src, ih, iw, ic, dst, oh, ow, oc, kh, kw, rm, cm, padVec, kp, add, p.Act, batch);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<int>.Shared.Return(rm);
+            System.Buffers.ArrayPool<int>.Shared.Return(cm);
+            System.Buffers.ArrayPool<float>.Shared.Return(padVec);
+        }
+    }
+
+    /// <summary><see cref="Map"/> into a pooled array (return it to ArrayPool&lt;int&gt;.Shared).</summary>
+    internal static int[] MapRented(int outLen, int k, int stride, int pad, int inLen, PadMode mode)
+    {
+        int[] m = System.Buffers.ArrayPool<int>.Shared.Rent(outLen * k);
+        FillMap(m, outLen, k, stride, pad, inLen, mode);
+        return m;
+    }
+
+    /// <summary>A pooled array whose first <paramref name="n"/> entries are <paramref name="value"/>.</summary>
+    internal static float[] PadRented(int n, float value)
+    {
+        float[] v = System.Buffers.ArrayPool<float>.Shared.Rent(n);
+        v.AsSpan(0, n).Fill(value);
+        return v;
     }
 
     internal static void Dense(ReadOnlySpan<float> src, int ih, int iw, int ic, Span<float> dst,

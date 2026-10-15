@@ -7,19 +7,19 @@ using CK = Sdcb.SimdOnnx.Engine.ConstKind;
 namespace Sdcb.SimdOnnx.Backends.Metal;
 
 /// <summary>Binding slots resolved per-session: which underlying buffer.</summary>
-internal enum MtlSlot : int { Arena = 0, Consts = 1, Dummy = 2, Direct = 3 }
+public enum MtlSlot : int { Arena = 0, Consts = 1, Dummy = 2, Direct = 3 }
 
-internal readonly struct MtlBind
+public readonly struct MtlBind
 {
     public readonly MtlSlot Slot;
-    public readonly MtlBuffer? Buf;   // when Slot == Direct
+    internal readonly MtlBuffer? Buf;   // when Slot == Direct
     public readonly ulong Offset, Size;
     public MtlBind(MtlSlot s, ulong off, ulong size) { Slot = s; Offset = off; Size = size; }
-    public MtlBind(MtlBuffer b, ulong off, ulong size) { Slot = MtlSlot.Direct; Buf = b; Offset = off; Size = size; }
+    internal MtlBind(MtlBuffer b, ulong off, ulong size) { Slot = MtlSlot.Direct; Buf = b; Offset = off; Size = size; }
 }
 
 /// <summary>One recorded compute dispatch.</summary>
-internal sealed class MtlDispatch
+public sealed class MtlDispatch
 {
     public required MtlPipeline Pipe;
     public required MtlBind[] Binds;
@@ -156,7 +156,7 @@ internal sealed class MtlConstStore
 /// buffers. Activations and packed weights are stored as fp16; all shader math
 /// is fp32; conv bias and LayerNorm params stay fp32.
 /// </summary>
-internal sealed class MtlGraphModel : IDisposable
+public sealed class MtlGraphModel : IDisposable
 {
     private readonly MtlDevice _dev;
     private readonly ExecPlan _plan;
@@ -170,7 +170,7 @@ internal sealed class MtlGraphModel : IDisposable
     /// <summary>Activations + weights stored as float16 (fp32 math in every shader).</summary>
     internal const bool F16 = true;
     /// <summary>Bytes per stored activation element.</summary>
-    internal int Es => 2;
+    public int Es => 2;
 
 
     /// <param name="constKey">Sharing key for the const store (the source model): graphs of the
@@ -281,7 +281,7 @@ internal sealed class MtlGraphModel : IDisposable
     internal readonly (int start, int count)[] NodeRanges;
 
     // ---- value → bind resolution (byte offsets/sizes: all long math) ----
-    internal MtlBind Bind(int valueId, CK? kind = null)
+    public MtlBind Bind(int valueId, CK? kind = null)
     {
         kind ??= CK.Raw;
         CValue v = _plan.Values[valueId];
@@ -299,14 +299,14 @@ internal sealed class MtlGraphModel : IDisposable
         throw new InvalidOperationException($"value '{v.Name}' has no GPU storage (ints must be folded)");
     }
 
-    internal static byte[] PcOf(params uint[] ints)
+    public static byte[] PcOf(params uint[] ints)
     {
         byte[] b = new byte[ints.Length * 4];
         Buffer.BlockCopy(ints, 0, b, 0, b.Length);
         return b;
     }
 
-    internal static byte[] PcOfF(uint[] ints, params float[] floats)
+    public static byte[] PcOfF(uint[] ints, params float[] floats)
     {
         byte[] b = new byte[(ints.Length + floats.Length) * 4];
         Buffer.BlockCopy(ints, 0, b, 0, ints.Length * 4);
@@ -314,9 +314,9 @@ internal sealed class MtlGraphModel : IDisposable
         return b;
     }
 
-    internal static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
+    public static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
 
-    internal static uint G(uint n) => (n + 255) / 256;
+    public static uint G(uint n) => (n + 255) / 256;
 
     /// <summary>
     /// Broadcast strides (padded rank-4, storage order of the output) of operand
@@ -680,7 +680,7 @@ internal sealed class MtlGraphModel : IDisposable
 
     /// <summary>A dispatch of kernel <paramref name="shader"/> from the MSL embedded in
     /// <paramref name="owner"/> (null = the core library).</summary>
-    internal MtlDispatch Dispatch(ExecNode n, string shader, MtlBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1,
+    public MtlDispatch Dispatch(ExecNode n, string shader, MtlBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1,
         Assembly? owner = null) => new()
     {
         Pipe = _dev.Pipe(shader, owner),
@@ -689,12 +689,12 @@ internal sealed class MtlGraphModel : IDisposable
     };
 
     /// <summary>Binding of a value, or the 64 B zero buffer for <paramref name="valueId"/> &lt; 0.</summary>
-    internal MtlBind BindOrDummy(int valueId, CK? kind = null) =>
+    public MtlBind BindOrDummy(int valueId, CK? kind = null) =>
         valueId >= 0 ? Bind(valueId, kind) : new MtlBind(MtlSlot.Dummy, 0, 64);
 
     internal MtlDevice Device => _dev;
 
-    internal void RequireNhwc(int v)
+    public void RequireNhwc(int v)
     {
         CValue cv = _plan.Values[v];
         if (cv.Shape.Length != 4 || !Engine.Layout.Equivalent(cv.Shape, cv.Layout ?? Engine.Layout.Identity(4), Engine.Layout.Nhwc))
@@ -756,6 +756,6 @@ internal sealed class MtlGraphModel : IDisposable
     }
 
     /// <summary>The plan this graph was compiled from (arena offsets, I/O values).</summary>
-    internal ExecPlan Plan => _plan;
+    public ExecPlan Plan => _plan;
     public void Dispose() => Release();
 }

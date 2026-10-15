@@ -106,6 +106,21 @@ internal static class Micro
                 }
                 break;
             }
+            case "runalloc":
+            {
+                // managed bytes allocated per CPU run at a fixed shape: micro runalloc <model.onnx> NxCxHxW [threads]
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                int[] s0 = args[2].Split('x').Select(int.Parse).ToArray();
+                var cm = new CpuModel(model, new CompileOptions(Nhwc: true, PhysicalIo: true, LogicalOutput: true));
+                using var s = new InferenceSession(cm.Plan(s0));
+                s.Threads = args.Length > 3 ? int.Parse(args[3]) : 4;
+                for (int i = 0; i < 3; i++) s.Run();
+                long al = GC.GetTotalAllocatedBytes(true);
+                long t0 = Stopwatch.GetTimestamp();
+                for (int i = 0; i < 20; i++) s.Run();
+                Console.WriteLine($"run {Stopwatch.GetElapsedTime(t0).TotalMilliseconds / 20:F2} ms, alloc {(GC.GetTotalAllocatedBytes(true) - al) / 20 / 1024.0:F0} KB per run, {s.Plan.Nodes.Length} nodes");
+                break;
+            }
             case "vkemit":
             {
                 // Vulkan graph emission cost alone (plan compiled once): micro vkemit <model.onnx> NxCxHxW [count] [output]

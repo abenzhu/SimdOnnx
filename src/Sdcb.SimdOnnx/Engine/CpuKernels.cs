@@ -9,20 +9,27 @@ namespace Sdcb.SimdOnnx.Engine;
 /// each layer once: entries are keyed by node identity and only reused when the
 /// weights (and bias) are element-for-element equal.
 /// </summary>
-internal static class CpuKernels
+public static class CpuKernels
 {
-    internal sealed class Cache
+    /// <summary>Packed-weight cache shared by the per-shape CPU plans of one model.</summary>
+    public sealed class Cache
     {
-        private readonly Dictionary<(ExecOp op, string name, int src), (float[] w, float[]? b, object kp)> _d = new();
+        private readonly Dictionary<(ExecOp op, string name, int src), (float[] w, float[]? b, Lazy<object> kp)> _d = new();
 
-        internal object GetOrPack(ExecNode n, float[] w, float[]? b, Func<object> pack)
+        /// <summary>The packed weights of <paramref name="n"/>, packed once: workers compiling the
+        /// same layer concurrently (new shapes on several threads) share one pack instead of each
+        /// keeping its own copy.</summary>
+        public object GetOrPack(ExecNode n, float[] w, float[]? b, Func<object> pack)
         {
             var key = (n.Op, n.Name, n.SrcNode);
+            Lazy<object> kp;
             lock (_d)
-                if (_d.TryGetValue(key, out var e) && Same(e.w, w) && Same(e.b, b)) return e.kp;
-            object kp = pack();
-            lock (_d) _d[key] = (w, b, kp);
-            return kp;
+            {
+                if (!_d.TryGetValue(key, out var e) || !Same(e.w, w) || !Same(e.b, b))
+                    _d[key] = e = (w, b, new Lazy<object>(pack, LazyThreadSafetyMode.ExecutionAndPublication));
+                kp = e.kp;
+            }
+            return kp.Value;
         }
 
         private static bool Same(float[]? a, float[]? b) =>

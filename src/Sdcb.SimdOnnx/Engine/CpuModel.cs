@@ -10,7 +10,7 @@ namespace Sdcb.SimdOnnx.Engine;
 /// </summary>
 internal sealed class CpuModel
 {
-    private readonly Dictionary<string, (ExecPlan plan, long used)> _plans = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (Lazy<ExecPlan> plan, long used)> _plans = new(StringComparer.Ordinal);
     private readonly CpuKernels.Cache _packs;
     private readonly int _capacity;
     private long _clock;
@@ -33,27 +33,39 @@ internal sealed class CpuModel
     internal ExecPlan Plan(ReadOnlySpan<int> shape)
     {
         string key = string.Join(",", shape.ToArray());
+        Lazy<ExecPlan> lazy;
         lock (_plans)
         {
             if (_plans.TryGetValue(key, out var e))
             {
                 _plans[key] = (e.plan, ++_clock);
-                return e.plan;
+                lazy = e.plan;
             }
-        }
-        ExecPlan plan = GraphCompiler.Compile(Model, shape, Options);
-        CpuKernels.Pack(plan, _packs);
-        lock (_plans)
-        {
-            if (_plans.TryGetValue(key, out var raced)) return raced.plan;
-            _plans[key] = (plan, ++_clock);
-            if (_plans.Count > _capacity)
+            else
             {
-                string oldest = _plans.OrderBy(kv => kv.Value.used).First().Key;
-                _plans.Remove(oldest);
+                // one compile per shape: concurrent callers of a new shape wait for the same plan
+                int[] sh = shape.ToArray();
+                lazy = new Lazy<ExecPlan>(() =>
+                {
+                    ExecPlan p = GraphCompiler.Compile(Model, sh, Options);
+                    CpuKernels.Pack(p, _packs);
+                    return p;
+                }, LazyThreadSafetyMode.ExecutionAndPublication);
+                _plans[key] = (lazy, ++_clock);
+                if (_plans.Count > _capacity)
+                {
+                    string oldest = _plans.Where(kv => kv.Key != key).OrderBy(kv => kv.Value.used).First().Key;
+                    _plans.Remove(oldest);
+                }
             }
         }
-        return plan;
+        try { return lazy.Value; }
+        catch
+        {
+            lock (_plans)
+                if (_plans.TryGetValue(key, out var cur) && cur.plan == lazy) _plans.Remove(key);
+            throw;
+        }
     }
 }
 

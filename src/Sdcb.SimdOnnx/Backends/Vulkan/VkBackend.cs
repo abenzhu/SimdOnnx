@@ -8,7 +8,7 @@ namespace Sdcb.SimdOnnx.Backends.Vulkan;
 /// Process-wide Vulkan device + per-(model,size) compiled graph cache.
 /// Constructed lazily on first Vulkan <see cref="GcdrEnhancer"/> use.
 /// </summary>
-internal sealed unsafe class VkBackend : IDisposable
+public sealed unsafe class VkBackend : IDisposable
 {
     internal readonly VkDevice Dev;
     // (model, shape, options) -> compiled graph (dispatch list; weights live in the per-model const store)
@@ -23,7 +23,7 @@ internal sealed unsafe class VkBackend : IDisposable
     /// built on the lost one (graphs, sessions, buffers) stay dead and must be re-created by callers.
     /// A failed first creation (no usable Vulkan) is cached and rethrown.
     /// </summary>
-    internal static VkBackend Default
+    public static VkBackend Default
     {
         get
         {
@@ -51,8 +51,8 @@ internal sealed unsafe class VkBackend : IDisposable
     /// Standalone sessions keep logical NCHW I/O (boundary relayouts in the plan);
     /// the fused pipeline keeps I/O physical and its glue shaders speak NHWC.
     /// </summary>
-    internal static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Vulkan);
-    internal static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Vulkan);
+    public static CompileOptions PlanOptions => new(Nhwc: true, PhysicalIo: false, Target: PlanTarget.Vulkan);
+    public static CompileOptions PipeOptions => new(Nhwc: true, PhysicalIo: true, Target: PlanTarget.Vulkan);
 
     /// <summary>fp16 activation/weight storage (needs storageBuffer16BitAccess; GCDRNET_VK_F16=0 forces fp32).</summary>
     internal bool F16 => Dev.StorageBuffer16 && Env.Flag("VK_F16") != "0";
@@ -177,7 +177,14 @@ internal sealed unsafe class VkBackend : IDisposable
     }
 
     /// <summary>Session over the graph for <paramref name="shape"/> under explicit plan options.</summary>
-    internal VkInferenceSession NewSession(OnnxModel m, int[] shape, CompileOptions opt, VkSessionBuffers? shared = null)
+    /// <summary>A session over the graph of <paramref name="m"/> at <paramref name="shape"/> under
+    /// <paramref name="options"/> (Target / NHWC are forced; extensions via <see cref="CompileOptions.Extensions"/>).</summary>
+    public VkInferenceSession NewSession(OnnxModel m, int[] shape, CompileOptions options) => NewSession(m, shape, options, null);
+
+    /// <summary>The device's name (e.g. "Intel(R) Arc(TM) B580 Graphics").</summary>
+    public string DeviceName => Dev.DeviceName;
+
+    internal VkInferenceSession NewSession(OnnxModel m, int[] shape, CompileOptions opt, VkSessionBuffers? shared)
     {
         VkGraphModel g = AcquireGraph(m, shape, opt);
         try { return new VkInferenceSession(Dev, g.Plan, g, shared); }

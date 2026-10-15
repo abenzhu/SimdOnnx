@@ -61,7 +61,7 @@ public sealed unsafe class InferenceSession : IDisposable
     /// <summary>The output tensor after <see cref="Run"/>.</summary>
     public ReadOnlySpan<float> Output => GetSpan(_outputValue);
 
-    internal Span<float> GetSpan(int valueId)
+    public Span<float> GetSpan(int valueId)
     {
         CValue v = _plan.Values[valueId];
         if (v.Buf >= 0)
@@ -70,7 +70,7 @@ public sealed unsafe class InferenceSession : IDisposable
         throw new InvalidOperationException($"Value '{v.Name}' has no float storage.");
     }
 
-    internal ReadOnlySpan<float> GetIn(int valueId)
+    public ReadOnlySpan<float> GetIn(int valueId)
     {
         if (valueId < 0) return ReadOnlySpan<float>.Empty;
         return GetSpan(valueId);

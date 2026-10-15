@@ -273,7 +273,7 @@ internal sealed class MtlLibrary : IDisposable
     public void Dispose() => ObjC.Release(H);
 }
 
-internal sealed class MtlPipeline : IDisposable
+public sealed class MtlPipeline : IDisposable
 {
     public readonly IntPtr Pso;
     public readonly string Name;
