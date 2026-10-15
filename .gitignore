@@ -5,6 +5,7 @@ obj/
 vstest*.log
 artifacts/
 .baseline-bin/
+.rerun/
 *.log
 *.f32
 build/nupkgs/

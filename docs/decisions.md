@@ -43,9 +43,11 @@ A rare DeviceLost in GcdrNet's size-switching Vulkan test (~1 in 10 full-suite r
 
 ## 2026-10-13 — Ship with Paddle Vulkan slower than the old hand-fused backend
 
-*Update 2026-10-14:* the gap is now 4–9% in the last interleaved run (noisy: 0.97–1.43 across
-runs), memory +15–23% instead of +100%; see `docs/perf.md`. The remaining gap is per-new-shape
-setup, not kernels.
+*Update 2026-10-14:* the gap was 4–9% in one interleaved run (noisy: 0.97–1.43 across
+runs), memory +15–23% instead of +100%. *Update 2026-10-15:* a re-run does not confirm the
+4–9%: three clean interleaved rounds give tiny +19–33%, small +36–50%, medium +7–13%, and 2 of
+13 new runs lost the device (re-creation then failed with `ErrorIncompatibleDriver`, CPU
+fallback). See `docs/perf.md`. The remaining gap is per-new-shape setup, not kernels.
 
 CPU met the "not slower" bar everywhere (see `docs/perf.md`); Paddle Vulkan did not (tiny +40%,
 small +20%, medium +5%), and Vulkan peak working set is higher. Rather than port the old
