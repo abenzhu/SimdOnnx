@@ -6,7 +6,7 @@ struct PcConv {
     uint oc, oh, ow;
     uint kh, kw, sh, sw;
     uint pt, pl;
-    uint flags;     // bit0 bias, bit1 reflectPad, bit2 relu, bit3 hasAdd, bit4 gelu
+    uint flags;     // bit0 bias, bit1 reflectPad, bit2 relu, bit3 hasAdd, bit4 gelu, bit5 hardswish, bit6 swish
     uint pad0;
 };
 
@@ -105,6 +105,8 @@ kernel void conv_tile(device const half* x [[buffer(0)]],
             if ((p.flags & 8u) != 0u) v += float(r[base + l]);
             if ((p.flags & 4u) != 0u) v = max(v, 0.0f);
             if ((p.flags & 16u) != 0u) v = 0.5f * v * (1.0f + ferf1(v * 0.7071067811865475f));
+            if ((p.flags & 32u) != 0u) v = fhswish1(v);
+            if ((p.flags & 64u) != 0u) v = fswish1(v);
             o[base + l] = half(v);
         }
     }
@@ -114,7 +116,7 @@ kernel void conv_tile(device const half* x [[buffer(0)]],
 struct PcDw {
     uint c, ih, iw, oh, ow;
     uint kh, kw, sh, sw, pt, pl;
-    uint flags;         // bit0 hasBias, bit1 reflect, bit2 relu, bit4 gelu
+    uint flags;         // bit0 hasBias, bit1 reflect, bit2 relu, bit4 gelu, bit5 hardswish, bit6 swish
     float padVal;
 };
 kernel void depthwise(device const half* x [[buffer(0)]],
@@ -148,6 +150,8 @@ kernel void depthwise(device const half* x [[buffer(0)]],
     }
     if ((p.flags & 4u) != 0u) acc = max(acc, 0.0f);
     if ((p.flags & 16u) != 0u) acc = 0.5f * acc * (1.0f + ferf1(acc * 0.7071067811865475f));
+    if ((p.flags & 32u) != 0u) acc = fhswish1(acc);
+    if ((p.flags & 64u) != 0u) acc = fswish1(acc);
     o[gid] = half(acc);
 }
 kernel void depthwise4(device const half4* x [[buffer(0)]],
@@ -183,6 +187,10 @@ kernel void depthwise4(device const half4* x [[buffer(0)]],
     if ((p.flags & 4u) != 0u) acc = max(acc, float4(0.0f));
     if ((p.flags & 16u) != 0u)
         for (int l = 0; l < 4; l++) acc[l] = 0.5f * acc[l] * (1.0f + ferf1(acc[l] * 0.7071067811865475f));
+    if ((p.flags & 32u) != 0u)
+        for (int l = 0; l < 4; l++) acc[l] = fhswish1(acc[l]);
+    if ((p.flags & 64u) != 0u)
+        for (int l = 0; l < 4; l++) acc[l] = fswish1(acc[l]);
     o[gid] = half4(acc);
 }
 

@@ -175,7 +175,7 @@ public sealed class VkGraphModel : IDisposable
         if (M8Direct(dev, f16, plan)) return false;
         // B packed per value: only when no other node reads it (its transB could differ)
         if (plan.Nodes.Count(m => m.In.Contains(n.In[1])) != 1) return false;
-        if (gp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return false;
+        if (gp.Act is ActivationKind.Sigmoid) return false;   // hardswish / swish: trailing unary pass
         CValue a = plan.Values[n.In[0]];
         int k = a.Shape[^1], nn = plan.Values[n.Out[0]].Shape[^1];
         if (a.PhysShape[^1] != k) return false;
@@ -234,7 +234,7 @@ public sealed class VkGraphModel : IDisposable
         if (!M8Direct(dev, f16, plan) || gp.TransB) return M8Route.None;
         CValue a = plan.Values[n.In[0]], b = plan.Values[n.In[1]];
         if (b.Floats is null || b.Shape.Length != 2 || a.Buf < 0) return M8Route.None;
-        if (gp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return M8Route.None;
+        if (gp.Act is ActivationKind.Sigmoid) return M8Route.None;
         int k = a.Shape[^1], nn = b.Shape[1];
         if (a.PhysShape[^1] != k) return M8Route.None;
         if (k % 4 == 0 && nn % 4 == 0 && k <= 128) return M8Route.Dot;
@@ -599,6 +599,8 @@ public sealed class VkGraphModel : IDisposable
             case ExecOp.Gemm:
             {
                 var p = (GemmP)n.P!;
+                // hardswish / swish run as a separate in-place pass after the switch (no gemm epilogue has them)
+                ActivationKind act = p.Act is ActivationKind.HardSwish or ActivationKind.Swish ? ActivationKind.None : p.Act;
                 uint k = (uint)V[n.In[0]].Shape[^1];
                 if ((uint)shapeIn(0)[^1] != k) throw new NotSupportedException("Vulkan Gemm: K not innermost");
                 uint m = (uint)(V[n.In[0]].ElementCount / k);
@@ -607,7 +609,7 @@ public sealed class VkGraphModel : IDisposable
                 if (gm8 != M8Route.None)
                 {
                     uint gf = (p.BiasValue >= 0 ? 1u : 0u)
-                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                        | ((act == ActivationKind.Relu ? 1u : act == ActivationKind.Gelu ? 2u : 0u) << 4);
                     if (gm8 == M8Route.Dot)
                     {
                         (uint dx, uint dy) = G2((m + 3) / 4 * (nn / 4));
@@ -626,7 +628,7 @@ public sealed class VkGraphModel : IDisposable
                 {
                     (string cm, uint bn) = nn % 128 == 0 ? ("conv_cm", 128u) : nn % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u)
-                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                        | ((act == ActivationKind.Relu ? 1u : act == ActivationKind.Gelu ? 2u : 0u) << 4);
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
                     output.Add(ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
@@ -635,8 +637,8 @@ public sealed class VkGraphModel : IDisposable
                     break;
                 }
                 uint gflags = (p.TransB ? 1u : 0u) | (p.BiasValue >= 0 ? 2u : 0u)
-                    | (p.Act == ActivationKind.Relu ? 4u : 0u)
-                    | (p.Act == ActivationKind.Gelu ? 8u : 0u);
+                    | (act == ActivationKind.Relu ? 4u : 0u)
+                    | (act == ActivationKind.Gelu ? 8u : 0u);
                 if (_dev.ConvDot && F16 && !p.TransB && k % 4 == 0 && nn % 8 == 0)
                 {
                     // 4 rows x 8 columns per invocation
@@ -860,6 +862,9 @@ public sealed class VkGraphModel : IDisposable
             default:
                 throw new NotSupportedException($"Vulkan: ExecOp {n.Op} not implemented");
         }
+        if (n.P is GemmP { Act: ActivationKind.HardSwish or ActivationKind.Swish } tail)
+            output.Add(ND("unary", [Bind(n.Out[0]), Bind(n.Out[0])],
+                PcOf((uint)nOut(), tail.Act == ActivationKind.HardSwish ? 5u : 6u), G((uint)nOut())));
 
         VkDispatch ND(string shader, VkBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1, string? name = null) =>
             shader.StartsWith("conv_cm", StringComparison.Ordinal)

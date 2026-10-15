@@ -1,7 +1,7 @@
 // Elementwise / shape kernels. All activation storage is fp16
 // (half/half4); math fp32 — see common.metal.
 
-// ---- unary: mode 0 relu, 1 sigmoid, 2 erf, 3 gelu, 4 copy ----
+// ---- unary: mode 0 relu, 1 sigmoid, 2 erf, 3 gelu, 4 copy, 5 hardswish, 6 swish ----
 struct PcUnary { uint n, mode; };
 kernel void unary(device const half* x [[buffer(0)]],
                   device half* o [[buffer(1)]],
@@ -15,6 +15,8 @@ kernel void unary(device const half* x [[buffer(0)]],
     else if (p.mode == 1u) r = 1.0f / (1.0f + fexp1(-v));
     else if (p.mode == 2u) r = ferf1(v);
     else if (p.mode == 3u) r = 0.5f * v * (1.0f + ferf1(v * 0.7071067811865475f));
+    else if (p.mode == 5u) r = v * clamp(v + 3.0f, 0.0f, 6.0f) * (1.0f / 6.0f);
+    else if (p.mode == 6u) r = v / (1.0f + fexp1(-v));
     else r = v;
     o[gid] = half(r);
 }
@@ -263,6 +265,86 @@ kernel void maxpool4(device const half4* x [[buffer(0)]],
     if (m.x == -3.4e38f) m = float4(0.0f);
     if (p.relu != 0u) m = select(m, float4(0.0f), m < float4(0.0f));
     o[gid] = half4(m);
+}
+
+// ---- avgpool / avgpool4: NHWC average pool over n images (zero padding; flags bit0 = count_include_pad) ----
+struct PcAvg {
+    uint c, ih, iw, oh, ow;
+    uint kh, kw, sh, sw, pt, pl, flags, n;
+};
+kernel void avgpool(device const half* x [[buffer(0)]],
+                    device half* o [[buffer(1)]],
+                    constant PcAvg& p [[buffer(2)]],
+                    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.c * p.oh * p.ow * max(p.n, 1u)) return;
+    uint ch = gid % p.c, px = gid / p.c;
+    uint ox = px % p.ow, oyg = px / p.ow;
+    uint img = oyg / p.oh, oy = oyg - img * p.oh, ibase = img * p.ih;
+    float s = 0.0f;
+    uint cnt = 0u;
+    for (uint ky = 0u; ky < p.kh; ky++)
+    {
+        int sy = int(oy * p.sh + ky) - int(p.pt);
+        if (uint(sy) >= p.ih) continue;
+        for (uint kx = 0u; kx < p.kw; kx++)
+        {
+            int sx = int(ox * p.sw + kx) - int(p.pl);
+            if (uint(sx) >= p.iw) continue;
+            s += float(x[((ibase + uint(sy)) * p.iw + uint(sx)) * p.c + ch]);
+            cnt++;
+        }
+    }
+    float div = (p.flags & 1u) != 0u ? float(p.kh * p.kw) : float(max(cnt, 1u));
+    o[gid] = half(s / div);
+}
+kernel void avgpool4(device const half4* x [[buffer(0)]],
+                     device half4* o [[buffer(1)]],
+                     constant PcAvg& p [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]])
+{
+    uint c4 = p.c >> 2;
+    if (gid >= c4 * p.oh * p.ow * max(p.n, 1u)) return;
+    uint ch = gid % c4, px = gid / c4;
+    uint ox = px % p.ow, oyg = px / p.ow;
+    uint img = oyg / p.oh, oy = oyg - img * p.oh, ibase = img * p.ih;
+    float4 s = float4(0.0f);
+    uint cnt = 0u;
+    for (uint ky = 0u; ky < p.kh; ky++)
+    {
+        int sy = int(oy * p.sh + ky) - int(p.pt);
+        if (uint(sy) >= p.ih) continue;
+        for (uint kx = 0u; kx < p.kw; kx++)
+        {
+            int sx = int(ox * p.sw + kx) - int(p.pl);
+            if (uint(sx) >= p.iw) continue;
+            s += float4(x[((ibase + uint(sy)) * p.iw + uint(sx)) * c4 + ch]);
+            cnt++;
+        }
+    }
+    float div = (p.flags & 1u) != 0u ? float(p.kh * p.kw) : float(max(cnt, 1u));
+    o[gid] = half4(s / div);
+}
+
+// ---- softmax: rows of `len` (the last axis); one simdgroup per row, 8 rows per threadgroup ----
+struct PcSoftmax { uint rows, len; };
+kernel void softmax(device const half* x [[buffer(0)]],
+                    device half* o [[buffer(1)]],
+                    constant PcSoftmax& p [[buffer(2)]],
+                    uint wg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_position_in_threadgroup]])
+{
+    uint lane = tid & 31u;
+    uint row = wg * 8u + (tid >> 5);
+    if (row >= p.rows) return;
+    uint base = row * p.len;
+    float m = -3.4e38f;
+    for (uint i = lane; i < p.len; i += 32u) m = max(m, float(x[base + i]));
+    m = simd_max(m);
+    float sum = 0.0f;
+    for (uint i = lane; i < p.len; i += 32u) sum += exp(float(x[base + i]) - m);
+    float inv = 1.0f / simd_sum(sum);
+    for (uint i = lane; i < p.len; i += 32u) o[base + i] = half(exp(float(x[base + i]) - m) * inv);
 }
 
 // ---- layernorm: one workgroup (256 threads) per row ----

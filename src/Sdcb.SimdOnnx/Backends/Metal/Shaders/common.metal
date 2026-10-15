@@ -25,13 +25,18 @@ static inline float fexp1(float v)
     return poly * as_type<float>((uint(int(nf)) + 127u) << 23);
 }
 
-// Conv epilogue activation: bits 4-6 (relu=1, gelu=2, sigmoid=3).
+static inline float fhswish1(float v) { return v * clamp(v + 3.0f, 0.0f, 6.0f) * (1.0f / 6.0f); }
+static inline float fswish1(float v) { return v / (1.0f + fexp1(-v)); }
+
+// Conv epilogue activation: bits 4-6 (relu=1, gelu=2, sigmoid=3, hardswish=4, swish=5).
 static inline float cact(float v, uint flags)
 {
     uint a = (flags >> 4) & 7u;
     if (a == 1u) return max(v, 0.0f);
     if (a == 2u) return 0.5f * v * (1.0f + ferf1(v * 0.7071067811865475f));
     if (a == 3u) return 1.0f / (1.0f + fexp1(-v));
+    if (a == 4u) return fhswish1(v);
+    if (a == 5u) return fswish1(v);
     return v;
 }
 

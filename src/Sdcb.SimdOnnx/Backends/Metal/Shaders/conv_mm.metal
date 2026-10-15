@@ -4,7 +4,7 @@
 // to 8 (zero-filled rows make pad k-slices contribute 0 for any gathered
 // pixel). BM = 64 output pixels x BN output channels, 8 simdgroups
 // (256 threads), fp16 storage + simdgroup fp16xfp32 MMA.
-// cflags: bit0 bias, bit1 residual, bit2 reflect pad, bits4-6 act (1 relu, 2 gelu).
+// cflags: bit0 bias, bit1 residual, bit2 reflect pad, bits4-6 act (1 relu, 2 gelu, 4 hardswish, 5 swish).
 struct PcConvMm {
     uint mDim, nDim, kDim, flags;
     uint outW, inW, inH, cin, kW;
@@ -162,16 +162,18 @@ CONV_MM_INST(32, 1)
 
 // ---- gemm: C[M,N] = A[M,K]*B + bias[N]; B [K,N] or [N,K] (transB) ----
 // tiled 64x64x16, 256 threads -> 4x4 each (fallback; MMA path uses conv_mm).
-struct PcGemm { uint m, n, k, flags; };   // bit0 transB bit1 bias bit2 relu bit3 gelu
+// threadgroup z = batch (element strides sa / sb / so; sb = 0 broadcasts B).
+struct PcGemm { uint m, n, k, flags, sa, sb, so; };   // bit0 transB bit1 bias bit2 relu bit3 gelu bit4 hardswish bit5 swish
 kernel void gemm(device const half* a [[buffer(0)]],
                  device const half* b [[buffer(1)]],
                  device const float* bs [[buffer(2)]],
                  device half* o [[buffer(3)]],
                  constant PcGemm& p [[buffer(4)]],
-                 uint2 wg [[threadgroup_position_in_grid]],
-                 uint2 tp [[thread_position_in_threadgroup]])
+                 uint3 wg [[threadgroup_position_in_grid]],
+                 uint3 tp [[thread_position_in_threadgroup]])
 {
     const uint tid = tp.x;
+    a += wg.z * p.sa; b += wg.z * p.sb; o += wg.z * p.so;
     const uint BM = 64u, BN = 64u, BK = 16u;
     threadgroup float As[BK * BM];
     threadgroup float Bs[BK * BN];
@@ -223,6 +225,8 @@ kernel void gemm(device const half* a [[buffer(0)]],
             if (hasBias) v += bs[gn];
             if ((p.flags & 4u) != 0u) v = max(v, 0.0f);
             if ((p.flags & 8u) != 0u) v = 0.5f * v * (1.0f + ferf1(v * 0.7071067811865475f));
+            if ((p.flags & 16u) != 0u) v = fhswish1(v);
+            if ((p.flags & 32u) != 0u) v = fswish1(v);
             o[gm * p.n + gn] = half(v);
         }
     }

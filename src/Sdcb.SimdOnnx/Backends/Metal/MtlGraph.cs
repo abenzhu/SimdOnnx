@@ -246,13 +246,20 @@ public sealed class MtlGraphModel : IDisposable
 
 
 
+    /// <summary>conv_mm epilogue code (common.metal cact).</summary>
+    private static uint MmAct(ActivationKind a) => a switch
+    {
+        ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 4u, ActivationKind.Swish => 5u,
+        _ => 0u,
+    };
+
     /// <summary>simdgroup-MMA conv eligibility (conv_mm): dense, output channels in
     /// 16 B quads, an epilogue it implements, M within the grid limit. cin%4!=0 uses
     /// the scalar-gather variant; constant pad must be zero.</summary>
     private static bool UseMmConv(ExecPlan plan, ExecNode n, ConvP cp)
     {
         if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return false;
+        if (cp.Act is ActivationKind.Sigmoid) return false;
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
         long m = (long)so[1] * so[2];
@@ -267,7 +274,7 @@ public sealed class MtlGraphModel : IDisposable
         if (plan.Values[n.In[1]].Floats is null || plan.Values[n.In[1]].Shape.Length != 2) return false;
         // B packed per value: only when no other node reads it (its transB could differ)
         if (plan.Nodes.Count(m => m.In.Contains(n.In[1])) != 1) return false;
-        if (gp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu)) return false;
+        if (gp.Act is ActivationKind.Sigmoid) return false;
         CValue a = plan.Values[n.In[0]];
         int k = a.Shape[^1], nn = plan.Values[n.Out[0]].Shape[^1];
         if (a.PhysShape[^1] != k) return false;
@@ -357,11 +364,12 @@ public sealed class MtlGraphModel : IDisposable
                     PcOf((uint)nOut(), 4), G((uint)nOut()));
                 break;
 
-            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu:
+            case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.HardSwish or ExecOp.Swish:
             {
                 uint mode = n.Op switch
                 {
-                    ExecOp.Relu => 0, ExecOp.Sigmoid => 1, ExecOp.Erf => 2, _ => 3,
+                    ExecOp.Relu => 0, ExecOp.Sigmoid => 1, ExecOp.Erf => 2, ExecOp.Gelu => 3,
+                    ExecOp.HardSwish => 5, _ => 6,
                 };
                 yield return ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)nOut(), mode), G((uint)nOut()));
@@ -401,7 +409,8 @@ public sealed class MtlGraphModel : IDisposable
                 {
                     // small-ic stem conv + 2x2/2 max pool (GraphCompiler.GpuSmallConv)
                     int[] ci = shapeIn(0), co = shapeOut(), cw = V[n.In[1]].Shape;
-                    if (!GraphCompiler.GpuSmallConv(p, cw, ci[3]) || p.AddValue >= 0 || ci[1] != co[1] * 2 || ci[2] != co[2] * 2)
+                    if (!GraphCompiler.GpuSmallConv(p, cw, ci[3]) || p.AddValue >= 0 || ci[1] != co[1] * 2 || ci[2] != co[2] * 2
+                        || p.Act is not (ActivationKind.None or ActivationKind.Relu))
                         throw new NotSupportedException("Metal convpool: unsupported conv");
                     uint pf = (p.BiasValue >= 0 ? 1u : 0u) | (p.PadMode == PadMode.Reflect ? 2u : 0u)
                         | (p.Act == ActivationKind.Relu ? 4u : 0u) | (pool.FuseRelu ? 8u : 0u);
@@ -427,7 +436,9 @@ public sealed class MtlGraphModel : IDisposable
                     | (p.PadMode == PadMode.Reflect ? 2u : 0u)
                     | (p.Act == ActivationKind.Relu ? 4u : 0u)
                     | (p.AddValue >= 0 ? 8u : 0u)
-                    | (p.Act == ActivationKind.Gelu ? 16u : 0u);
+                    | (p.Act == ActivationKind.Gelu ? 16u : 0u)
+                    | (p.Act == ActivationKind.HardSwish ? 32u : 0u)
+                    | (p.Act == ActivationKind.Swish ? 64u : 0u);
                 if (p.Group > 1)
                 {
                     if (p.Group != ic || oc != ic) throw new NotSupportedException("grouped non-depthwise conv");
@@ -450,7 +461,7 @@ public sealed class MtlGraphModel : IDisposable
                     uint m = oh * ow, kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic, kd = (kr + 7u) & ~7u;
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
                         | (p.PadMode == PadMode.Reflect ? 4u : 0u)
-                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                        | (MmAct(p.Act) << 4);
                     yield return ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvWT), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                         PcOf(m, oc, kd, cflags, ow, iw, ih, ic, (uint)p.Kernel[1],
@@ -481,6 +492,49 @@ public sealed class MtlGraphModel : IDisposable
                 break;
             }
 
+            case ExecOp.Softmax:
+            {
+                CValue x = V[n.In[0]];
+                uint len = (uint)x.Shape[^1];
+                if ((uint)shapeIn(0)[^1] != len) throw new NotSupportedException("Metal Softmax: last axis not innermost");
+                uint rows = (uint)(x.ElementCount / len);
+                yield return ND("softmax", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(rows, len), (rows + 7) / 8, name: "softmax");
+                break;
+            }
+
+            case ExecOp.MatMul:
+            {
+                // batched [.., M, K] x [.., K, N] on logical (identity-layout) storage; B may broadcast
+                CValue a = V[n.In[0]], b = V[n.In[1]], o = V[n.Out[0]];
+                if (a.Layout is not null && !a.Layout.SequenceEqual(Engine.Layout.Identity(a.Shape.Length)) ||
+                    b.Layout is not null && !b.Layout.SequenceEqual(Engine.Layout.Identity(b.Shape.Length)) ||
+                    o.Layout is not null && !o.Layout.SequenceEqual(Engine.Layout.Identity(o.Shape.Length)))
+                    throw new NotSupportedException("Metal MatMul: permuted layout");
+                uint m = (uint)a.Shape[^2], k = (uint)a.Shape[^1], nn = (uint)b.Shape[^1];
+                uint batch = (uint)(o.ElementCount / ((long)m * nn));
+                long aBatch = a.ElementCount / ((long)m * k), bBatch = b.ElementCount / ((long)k * nn);
+                if (aBatch != batch || (bBatch != batch && bBatch != 1))
+                    throw new NotSupportedException("Metal MatMul: batch broadcast");
+                yield return ND("gemm", [Bind(n.In[0]), Bind(n.In[1]), B(-1, CK.F32), Bind(n.Out[0])],
+                    PcOf(m, nn, k, 0u, m * k, bBatch == 1 ? 0u : k * nn, m * nn),
+                    (nn + 63) / 64, (m + 63) / 64, batch, name: "matmul");
+                break;
+            }
+
+            case ExecOp.AvgPool:
+            {
+                var p = (PoolP)n.P!;
+                RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
+                int[] si = shapeIn(0), so = shapeOut();
+                bool v4 = si[3] % 4 == 0;
+                yield return ND(v4 ? "avgpool4" : "avgpool", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
+                        (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
+                        (uint)p.Pads[0], (uint)p.Pads[1], p.CountIncludePad ? 1u : 0u, (uint)so[0]),
+                    G((uint)nOut() / (v4 ? 4u : 1u)), name: "avgpool");
+                break;
+            }
+
             case ExecOp.LayerNorm:
             {
                 var p = (LnP)n.P!;
@@ -506,7 +560,7 @@ public sealed class MtlGraphModel : IDisposable
                         : nn % 64 == 0 ? ("conv_mm_64", 64u) : ("conv_mm_32", 32u);
                     cm += "_0";
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u)
-                        | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                        | (MmAct(p.Act) << 4);
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
                     yield return ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
@@ -516,10 +570,13 @@ public sealed class MtlGraphModel : IDisposable
                 }
                 uint gflags = (p.TransB ? 1u : 0u) | (p.BiasValue >= 0 ? 2u : 0u)
                     | (p.Act == ActivationKind.Relu ? 4u : 0u)
-                    | (p.Act == ActivationKind.Gelu ? 8u : 0u);
+                    | (p.Act == ActivationKind.Gelu ? 8u : 0u)
+                    | (p.Act == ActivationKind.HardSwish ? 16u : 0u)
+                    | (p.Act == ActivationKind.Swish ? 32u : 0u);
+                if (p.Act == ActivationKind.Sigmoid) throw new NotSupportedException("Metal Gemm: sigmoid epilogue");
                 yield return ND("gemm",
                     [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
-                    PcOf(m, nn, k, gflags),
+                    PcOf(m, nn, k, gflags, 0u, 0u, 0u),
                     (nn + 63) / 64, (m + 63) / 64, name: "gemm");
                 break;
             }
