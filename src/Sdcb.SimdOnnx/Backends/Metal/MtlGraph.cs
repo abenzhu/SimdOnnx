@@ -355,6 +355,11 @@ public sealed class MtlGraphModel : IDisposable
         // all addressing on storage-order shapes
         int[] shapeIn(int k) => V[n.In[k]].PhysShape;
         int[] shapeOut() => V[n.Out[0]].PhysShape;
+        // spatial ops address [n,h,w,c] from the logical shape: NHWC-equivalent storage of a
+        // 1x1-spatial value may keep an NCHW-ordered PhysShape (same bytes, different dims)
+        int[] nhwc(int v) => V[v].Shape is [var nn, var cc, var hh, var ww] ? [nn, hh, ww, cc] : V[v].PhysShape;
+        int[] nhwcIn(int k) => nhwc(n.In[k]);
+        int[] nhwcOut() => nhwc(n.Out[0]);
         int nOut() => checked((int)V[n.Out[0]].ElementCount);
 
         switch (n.Op)
@@ -408,7 +413,7 @@ public sealed class MtlGraphModel : IDisposable
                 if (p.Pool is { } pool)
                 {
                     // small-ic stem conv + 2x2/2 max pool (GraphCompiler.GpuSmallConv)
-                    int[] ci = shapeIn(0), co = shapeOut(), cw = V[n.In[1]].Shape;
+                    int[] ci = nhwcIn(0), co = nhwcOut(), cw = V[n.In[1]].Shape;
                     if (!GraphCompiler.GpuSmallConv(p, cw, ci[3]) || p.AddValue >= 0 || ci[1] != co[1] * 2 || ci[2] != co[2] * 2
                         || p.Act is not (ActivationKind.None or ActivationKind.Relu))
                         throw new NotSupportedException("Metal convpool: unsupported conv");
@@ -423,7 +428,7 @@ public sealed class MtlGraphModel : IDisposable
                     break;
                 }
                 if (p.AddValue >= 0) RequireNhwc(p.AddValue);
-                int[] si = shapeIn(0), sw_ = V[n.In[1]].Shape, so = shapeOut();   // [1,h,w,c]
+                int[] si = nhwcIn(0), sw_ = V[n.In[1]].Shape, so = nhwcOut();   // [1,h,w,c]
                 uint ih = (uint)si[1], iw = (uint)si[2], ic = (uint)si[3];
                 uint oc = (uint)sw_[0], oh = (uint)so[1], ow = (uint)so[2];
                 if (p.PadMode == PadMode.Constant && p.PadValue != 0f)
@@ -482,7 +487,7 @@ public sealed class MtlGraphModel : IDisposable
             {
                 var p = (PoolP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = si[3] % 4 == 0;
                 yield return ND(v4 ? "maxpool4" : "maxpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
@@ -525,7 +530,7 @@ public sealed class MtlGraphModel : IDisposable
             {
                 var p = (PoolP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = si[3] % 4 == 0;
                 yield return ND(v4 ? "avgpool4" : "avgpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
@@ -587,7 +592,7 @@ public sealed class MtlGraphModel : IDisposable
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 bool hasAdd = n.In.Length > 1;
                 if (hasAdd) RequireNhwc(n.In[1]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 uint flags = (p.FuseRelu ? 1u : 0u) | (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u);
                 bool v4 = si[3] % 4 == 0;
                 yield return ND(v4 ? "bilinear4" : "bilinear", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
@@ -687,7 +692,7 @@ public sealed class MtlGraphModel : IDisposable
             case ExecOp.GlobalAvgPool:
             {
                 RequireNhwc(n.In[0]);
-                int[] si = shapeIn(0);
+                int[] si = nhwcIn(0);
                 uint c = (uint)si[3], hw = (uint)si[1] * (uint)si[2];
                 bool v4 = c % 4 == 0;
                 yield return ND(v4 ? "gap4" : "gap", [Bind(n.In[0]), Bind(n.Out[0])],
@@ -699,7 +704,7 @@ public sealed class MtlGraphModel : IDisposable
             {
                 var p = (ConvTP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 uint act = p.Act switch { ActivationKind.None => 0u, ActivationKind.Relu => 1u, ActivationKind.Sigmoid => 2u,
                     _ => throw new NotSupportedException($"Metal ConvTranspose: {p.Act}") };
                 yield return ND("convt", [Bind(n.In[0]), Bind(n.In[1], CK.ConvTW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
@@ -713,7 +718,7 @@ public sealed class MtlGraphModel : IDisposable
             {
                 var p = (ResizeNearestP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
-                int[] si = shapeIn(0), so = shapeOut();
+                int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = si[3] % 4 == 0;
                 yield return ND(v4 ? "nearest4" : "nearest", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2]], p.Scales[2], p.Scales[3]),

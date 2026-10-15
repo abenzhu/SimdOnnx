@@ -129,3 +129,36 @@ Revisit with a newer Intel driver (tested 32.0.101.8135).
 Side findings: GcdrNet stacked its gc/dr arenas by `ExecPlan.ArenaFloats`, ignoring the graph
 scratch (now used by im2col) — it uses `VkGraphModel.ArenaBytes` now. Conv/Pool/Resize/Ew + Relu
 fusion lost the graph output value when the Relu was the last node.
+
+## 2026-10-15 — Per-shape compile / emission: optimized JIT, not tier-0
+
+GcdrNet's mixed-size corpus on Vulkan was 3–5% slower than the old engine although every graph
+ran as fast. `DOTNET_TieredCompilation=0` closed the gap: the compiler, layout planner, graph
+emission and const pool run a few dozen times per process, so their tier-0 code (no inlining,
+iterator state machines) was most of a new size's cost. They carry
+`MethodImplOptions.AggressiveOptimization` now and `VkGraphModel.Emit` fills a list instead of
+yielding (corpus 37.3 → 35.6 ms vs 36.3 old). Graphs are built once per (model, shape, options)
+key: a racing warm-up and the caller share one build; `VkBackend.Prefetch` builds on
+below-normal-priority threads.
+
+## 2026-10-15 — Metal: parity with the Vulkan op set, checked on the macOS runners
+
+The Paddle macOS smoke fell back to the CPU ("ExecOp AvgPool not implemented"): the Metal
+backend had been ported from GcdrNet's needs and lacked AveragePool, Softmax, batched MatMul and
+HardSwish / Swish. Worse, its conv / gemm epilogues ignored hardswish and swish, so a plan
+carrying them (an extension pass, or now the GPU gated-act fusion) would have produced wrong
+values silently; the Vulkan generic `gemm` had the same hole (it now runs those two as a trailing
+in-place unary). `GpuOpTests` runs whole graphs on every GPU backend present — Metal on the
+`macos-26` (M1) runners — so a missing or wrong Metal kernel fails CI instead of falling back.
+
+## 2026-10-15 — Open: Paddle's CPU stages run slower next to the new Vulkan path
+
+In Paddle Vulkan runs the GPU stages (det / rec graphs) are as fast or faster than the old
+engine, but the CPU stages around them (det pre/post-processing, crop, rec preprocessing) take
+25–60% longer — only in Vulkan mode, also with 1 worker and fully warm. Ruled out: plan / graph
+compile (moved off the hot path, counted with `SIMDONNX_STATS`), GC, thread-pool minimums,
+spinning waits, CCD affinity, the staging memory type, the output copy, inline vs pooled CTC
+head. A tight loop over `Det()` alone is identical in every configuration, so it is an
+interaction of the pipeline (likely cache / memory-bandwidth contention with the driver's
+threads or the per-run command recording), not a kernel. This is most of the remaining tiny /
+small gap.

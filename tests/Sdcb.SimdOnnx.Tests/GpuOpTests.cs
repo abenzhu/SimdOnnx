@@ -75,6 +75,25 @@ public class GpuOpTests
         }
     }
 
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void OneByOneSpatial_MatchesCpu(string backend)
+    {
+        // a 1x1-spatial value may keep an NCHW-ordered physical shape: spatial ops must read
+        // [n,h,w,c] from the logical shape (the depthwise conv saw ic = 1 on Metal)
+        var rng = new Random(3);
+        int c = 24;
+        byte[] m = new OnnxBuilder().Input("x", 1, c, 6, 10)
+            .Init("Wd", Rand(rng, c, 0.5f), c, 1, 1, 1).Init("Bd", Rand(rng, c, 0.5f), c)
+            .Init("Wp", Rand(rng, 16 * c, 0.3f), 16, c, 1, 1)
+            .Node("GlobalAveragePool", ["x"], ["g"])
+            .Node("Conv", ["g", "Wd", "Bd"], ["d"], ("kernel_shape", new[] { 1, 1 }), ("group", c))
+            .Node("Relu", ["d"], ["r"])
+            .Node("Conv", ["r", "Wp"], ["y"], ("kernel_shape", new[] { 1, 1 }))
+            .Output("y").Build();
+        Check(backend, OnnxModel.Load(m), [1, c, 6, 10], "1x1 spatial");
+    }
+
     // x * HardSigmoid(x; 1/6, 0.5) (hardswish) or x * Sigmoid(x) (swish)
     private static void Act(OnnxBuilder b, string x, string y, bool hard)
     {
