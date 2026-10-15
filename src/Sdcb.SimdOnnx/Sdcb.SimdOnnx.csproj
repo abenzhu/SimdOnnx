@@ -22,6 +22,8 @@
        compile against Compatibility/Intrinsics.cs (IsSupported = false stubs) and are never taken. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
     <Compile Remove="Backends/**/*.cs" />
+    <!-- decoding kernels: the ISA tiers are separate files (the Vector<T> / scalar ones stay) -->
+    <Compile Remove="Decoding/Kernels/*Avx*.cs;Decoding/Kernels/*AdvSimd.cs;Decoding/Kernels/*PackedSimd.cs" />
     <PackageReference Include="Microsoft.Bcl.Numerics" Version="10.0.11" />
     <PackageReference Include="Microsoft.Bcl.HashCode" Version="6.0.0" />
     <PackageReference Include="System.Memory" Version="4.6.3" />
