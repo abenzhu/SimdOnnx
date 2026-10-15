@@ -27,31 +27,30 @@ recognised lines (old/new).
 | medium cpu 1w | 1084.7 | 1094.6 | 1.01 | 218.3/201.5 | 11.0/14.7 | 827.4/845.2 | 1105/1190 | 1004/1004 |
 | medium cpu 4w | 532.1 | 526.3 | **0.99** | 226.3/207.7 | 22.2/25.8 | 1051.5/1061.7 | 1172/1446 | 1004/1004 |
 | medium cpu 16w | 652.3 | 654.9 | 1.00 | 231.5/213.2 | 19.4/55.9 | 2368.7/2483.8 | 1269/1776 | 1004/1004 |
-| tiny vulkan 4w | 19.2 | 22.7 | 1.18 | 5.6/4.8 | 1.3/1.2 | 4.9/5.9 | 580/668 | 740/741 |
-| small vulkan 4w | 26.2 | 175.5 | 6.69 † | 7.5/51.2 | 1.2/25.0 | 13.0/289.5 | 660/1121 | 950/944 |
-| medium vulkan 4w | 53.8 | 58.4 | 1.09 | 22.2/16.8 | 1.3/1.2 | 24.9/31.4 | 955/1177 | 1003/1003 |
 
-† The new binary lost the Vulkan device in this run (see below) and ran on the CPU from then on.
-Clean Vulkan reruns, interleaved, 3 rounds (`docs/ab/paddle-vk/summary.txt`, median ms):
+Vulkan rows of the first run lost the device (since fixed, see decisions). Current Vulkan
+(SimdOnnx `56aa5d5`, Paddle `0c0c77f`), interleaved, 3 rounds, 4 workers (`.rerun/alt.sh`):
 
-| model | old | new | ratio |
-|---|---:|---:|---:|
-| tiny | 16.9–18.3 | 21.7–22.8 | 1.19–1.33 |
-| small | 26.4–28.4 | 37.7–41.4 | 1.36–1.50 |
-| medium | 53.8–54.5 | 58.5–60.8 | 1.07–1.13 |
+| model | old | new | ratio | det graph | rec graph | det pre / post, crop, rec pre (sum) | peak WS MB | exact |
+|---|---:|---:|---:|---|---|---|---|---|
+| tiny | 17.1–23.4 | 23.5–26.4 | 1.19 | 5.57/4.19 | 6.20/6.22 | 10.5/13.4 | 580/602 | 740/741 |
+| small | 31.7–32.6 | 34.7–35.6 | 1.09 | 8.11/6.17 | 16.0/15.5 | 9.8/12.6 | 661/725 | 950/955 |
+| medium | 52.3–55.9 | 54.1–54.9 | **1.00** | 21.4/19.1 | 26.6/26.3 | 7.9/8.9 | 953/1169 | 1003/1003 |
+
+(the old engine's tiny median wandered 17–23 ms within this session; earlier sessions measured
+small at 1.04 and medium at 0.99.)
 
 - **CPU**: at parity or faster in every configuration (small det is ~2x faster). Accuracy identical.
-- **Vulkan**: correct (accuracy equal or better) but **slower than the old hand-fused Paddle GPU
-  path**: tiny +19–33%, small +36–50%, medium +7–13% in the 2026-10-15 runs (the 2026-10-14
-  run had shown 4–9%; it does not reproduce). Stage means (det/cls/rec) are close, medium det is
-  faster; the gap is per-new-shape setup (plan compile + graph + session, ~3–8 ms each, ~150 new
-  shapes per 100 images) and the CPU stages it competes with.
-- **Vulkan stability**: 2 device losses (`VK_ERROR_DEVICE_LOST` in `vkQueueSubmit`) in 13 new
-  4-worker runs (tiny once, small once), 0 in 12 old runs. Recovery did not bring the GPU back:
-  after the loss, re-creating the device failed repeatedly (5 log lines) with `vkCreateInstance:
-  ErrorIncompatibleDriver`, so the rest of the run fell back to the CPU (results still correct).
-- **Memory**: Vulkan peak working set +15–23%; CPU +5–40%, mostly at 16 workers on medium
-  (per-shape plan cache + per-session arenas).
+  Memory: per-key packing and plans (one build shared by concurrent workers) cut medium 16w peak
+  1776 → 1388 MB, still above old (1262); medium 4w 1280 vs 1172, small 16w 812 vs 717. The live
+  heap after a full GC is ~90 MB above old: same reachable weights, but twice the allocation churn
+  per run (956 vs 510 MB) and per-shape statics.
+- **Vulkan**: device losses fixed (0 in 50 stress runs, was ~1 in 7). Every GPU stage is as fast
+  or faster than the old hand-fused path (det graph 10–25% faster). The remaining gap is the CPU
+  stages around them, 25–60% slower in Vulkan mode only (open, see decisions); medium is at
+  parity, tiny / small still behind. Accuracy equal or better. Peak working set +4–23%.
+- **Metal**: the macOS runners now run the Paddle smoke on Metal (device engaged, detected-line
+  counts equal to the CPU) and `GpuOpTests` on M1; not timed against the old engine.
 
 ## SimdGcdrNet (`Sdcb.SimdGcdrNet.Benchmark`, e2e ms)
 
@@ -66,15 +65,20 @@ Clean Vulkan reruns, interleaved, 3 rounds (`docs/ab/paddle-vk/summary.txt`, med
 
 CPU 10–22% faster, Vulkan at parity, memory unchanged; matches the previous run.
 
+Mixed-size corpus (every image a different size, so per-shape compile counts), interleaved:
+Vulkan 35.6 vs 36.3 ms per image, peak 1192 vs 1249 MB; CPU 349 vs 415 ms, peak 1145 vs 1150 MB.
+PSNR goldens identical.
+
 ## Known gaps / next steps
 
-1. **Vulkan device loss on the B580** (Paddle, 2 of 13 runs on 2026-10-15) and device re-creation
-   failing afterwards (`ErrorIncompatibleDriver`), which turns a transient loss into a CPU run.
-2. **Per-shape setup cost** on GPU (the old backend derived per-shape schedules from one prebuilt
-   graph): faster fusion passes (several are O(nodes²) with LINQ; `FuseConvResidual` done), fewer
-   allocations per compile (~1 MB), or a shape-polymorphic plan.
-3. **CPU memory at high worker counts**: per-shape plan LRU (64) × 3 plan kinds, arenas per worker.
-4. **Metal**: ported best effort (incl. the const pool), compiled but not run on Apple hardware.
+1. **Paddle Vulkan tiny / small**: CPU stages slower next to the new GPU path (see decisions);
+   candidates: Paddle's fused operators (attention, SE, concat-resize, ...) as Paddle extensions,
+   the old engine's per-vendor kernels (UHD 770 8-lane gemm, Adreno gemm_nc_d / ds, RDNA conv_dw4a).
+2. **Memory** above old on Paddle (CPU ~+9–13% peak, Vulkan +4–23%): allocation churn per run,
+   per-shape caches.
+3. **Device re-creation after a loss** still fails with `ErrorIncompatibleDriver` on the B580
+   (no longer triggered).
+4. **Metal performance** unmeasured against the old engines (correctness checked in CI).
 
 ## What closed most of the Vulkan gap (2026-10-14)
 
