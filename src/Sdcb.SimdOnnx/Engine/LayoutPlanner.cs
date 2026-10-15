@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 namespace Sdcb.SimdOnnx.Engine;
 
 /// <summary>
@@ -35,11 +36,13 @@ public sealed class LayoutPlanner
     private int _at;                                             // index of the node being planned
     private int _dissolved;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private LayoutPlanner(List<ExecNode> nodes, List<CValue> values, List<int> bufSize)
     {
         _nodes = nodes; _values = values; _bufSize = bufSize;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static void Run(List<ExecNode> nodes, List<CValue> values, List<int> bufSize,
         int inputValue, ref int outputValue, bool physicalIn, bool physicalOut)
     {
@@ -72,6 +75,7 @@ public sealed class LayoutPlanner
     }
 
     /// <summary>Resolves (and caches) the layout of value <paramref name="v"/>, following aliases.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public int[] L(int v)
     {
         CValue cv = _values[v];
@@ -103,6 +107,7 @@ public sealed class LayoutPlanner
     }
 
     /// <summary>Inserts (before the current node) a physical copy of <paramref name="v"/> in layout <paramref name="target"/>.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private int Relayout(int v, int[] target)
     {
         var key = (v, Layout.Str(target));
@@ -123,6 +128,7 @@ public sealed class LayoutPlanner
         return id;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public int Need(int v, int[] target) =>
         Layout.Equivalent(_values[v].Shape, L(v), target) ? v : Relayout(v, target);
 
@@ -130,6 +136,7 @@ public sealed class LayoutPlanner
 
     public List<CValue> Values => _values;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static bool LastInnermost(int[] shape, int[] l)
     {
         int r = shape.Length - 1;
@@ -141,6 +148,7 @@ public sealed class LayoutPlanner
 
     private void SetOut(ExecNode n, int[] l) => _values[n.Out[0]].Layout = l;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private void Plan(ExecNode n)
     {
         switch (n.Op)

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 namespace Sdcb.SimdOnnx.Engine;
 
 /// <summary>
@@ -13,6 +14,7 @@ public static class Layout
     /// <summary>Channels-last for rank-4 [n,c,h,w]: storage [n,h,w,c].</summary>
     public static readonly int[] Nhwc = [0, 2, 3, 1];
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[] Identity(int rank)
     {
         int[] l = new int[rank];
@@ -20,12 +22,14 @@ public static class Layout
         return l;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static bool IsIdentity(int[] l)
     {
         for (int i = 0; i < l.Length; i++) if (l[i] != i) return false;
         return true;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[] Phys(int[] shape, int[] l)
     {
         int[] p = new int[l.Length];
@@ -33,6 +37,7 @@ public static class Layout
         return p;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[] Inverse(int[] p)
     {
         int[] inv = new int[p.Length];
@@ -45,6 +50,7 @@ public static class Layout
     /// is x logical perm[k], so x logical d is y logical perm⁻¹[d]:
     /// L'[i] = perm⁻¹[L[i]]. Always representable — every Transpose dissolves.
     /// </summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[] Transposed(int[] l, int[] perm)
     {
         int[] inv = Inverse(perm);
@@ -54,11 +60,13 @@ public static class Layout
     }
 
     /// <summary>Same storage order for <paramref name="shape"/> (size-1 dims ignored).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static bool Equivalent(int[] shape, int[] a, int[] b) =>
         a.Where(d => shape[d] != 1).SequenceEqual(b.Where(d => shape[d] != 1));
 
     /// <summary>Physical perm relaying storage from layout <paramref name="from"/> to
     /// <paramref name="to"/>: out phys dim i = in phys dim q[i].</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[] PhysPerm(int[] from, int[] to) =>
         to.Select(d => Array.IndexOf(from, d)).ToArray();
 
@@ -70,6 +78,7 @@ public static class Layout
     /// each group's non-1 source dims sit consecutively, in logical order, in
     /// storage. Target dims are then ordered by their group's storage position.
     /// </summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[]? Reshaped(int[] src, int[] l, int[] dst)
     {
         int[] sd = Enumerable.Range(0, src.Length).Where(d => src[d] != 1).ToArray();

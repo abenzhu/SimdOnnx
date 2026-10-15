@@ -31,7 +31,7 @@ internal sealed unsafe class VkSessionBuffers : IDisposable
         {
             if (StageIn is not null) { StageIn.Unmap(); StageIn.Free(); }
             InBytes = Math.Max(inBytes, InBytes + InBytes / 2);
-            StageIn = _dev.NewStorageBuffer(InBytes, hostVisible: true, preferHost: false);
+            StageIn = _dev.NewStorageBuffer(InBytes, hostVisible: true, preferHost: Env.Flag("VK_STAGE_WC") == "0");
             InMap = (float*)StageIn.Map();
             Generation++;
         }
@@ -105,7 +105,7 @@ public sealed unsafe class VkInferenceSession : IDisposable
         else
         {
             Arena = dev.NewStorageBuffer(graph.ArenaBytes + 64, hostVisible: false);
-            _stageIn = dev.NewStorageBuffer(StageInBytes, hostVisible: true, preferHost: false);
+            _stageIn = dev.NewStorageBuffer(StageInBytes, hostVisible: true, preferHost: Env.Flag("VK_STAGE_WC") == "0");
             _stageOut = dev.NewStorageBuffer(StageOutBytes, hostVisible: true, preferHost: true);
             _stageInMap = (float*)_stageIn.Map();
             _stageOutMap = (float*)_stageOut.Map();

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 namespace Sdcb.SimdOnnx.Backends.Vulkan;
 
 /// <summary>
@@ -26,6 +27,7 @@ internal sealed class VkConstStore
 
     private readonly record struct Entry(float[] Src, int Kind, int[] Shape, VkBuffer Buf, ulong Off);
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private VkConstStore(VkDevice dev, (VkDevice, object, bool)? key)
     {
         _dev = dev;
@@ -40,6 +42,7 @@ internal sealed class VkConstStore
     }
 
     /// <summary>The pool of <paramref name="key"/> (a private one when null), with one more reference.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static VkConstStore Acquire(VkDevice dev, object? key, bool f16)
     {
         if (key is null) return new VkConstStore(dev, null);
@@ -91,6 +94,7 @@ internal sealed class VkConstStore
         return placed;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private int Find(float[] src, int kind, int[] shape)
     {
         if (_byRef.TryGetValue((src, kind), out int e) && _entries[e].Shape.AsSpan().SequenceEqual(shape)) return e;
@@ -108,6 +112,7 @@ internal sealed class VkConstStore
         return -1;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal void Release()
     {
         lock (s_shared)
@@ -124,6 +129,7 @@ internal sealed class VkConstStore
     {
         internal static readonly RefKey Instance = new();
         public bool Equals((float[] src, int kind) a, (float[] src, int kind) b) => ReferenceEquals(a.src, b.src) && a.kind == b.kind;
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         public int GetHashCode((float[] src, int kind) k) =>
             System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(k.src) * 31 + k.kind;
     }

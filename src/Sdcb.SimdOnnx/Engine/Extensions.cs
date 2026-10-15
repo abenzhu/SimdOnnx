@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Reflection;
 #if NET
 using Sdcb.SimdOnnx.Backends.Metal;
@@ -21,6 +22,7 @@ public abstract class ExtOp
     public virtual IEnumerable<int> ParamRefs(ExecNode n) => [];
 
     /// <summary>Layout pass: request input layouts and set the output's. Default: rank-4 NHWC in/out.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public virtual void PlanLayout(LayoutPlanner lp, ExecNode n)
     {
         for (int k = 0; k < n.In.Length; k++)
@@ -29,6 +31,7 @@ public abstract class ExtOp
     }
 
     /// <summary>Packs CPU weights into <see cref="ExecNode.P"/> (idempotent; plans may be shared).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public virtual void PackCpu(ExecPlan plan, ExecNode n, CpuKernels.Cache? cache) { }
 
     public abstract void RunCpu(InferenceSession s, ExecNode n);
@@ -37,9 +40,11 @@ public abstract class ExtOp
     public virtual IEnumerable<(int value, ConstKind kind)> GpuConsts(ExecNode n) => [];
 #if NET
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public virtual IEnumerable<VkDispatch> EmitVulkan(VkGraphModel g, ExecNode n) =>
         throw new NotSupportedException($"Vulkan: extension op {Name} not implemented");
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public virtual IEnumerable<MtlDispatch> EmitMetal(MtlGraphModel g, ExecNode n) =>
         throw new NotSupportedException($"Metal: extension op {Name} not implemented");
 #endif
@@ -66,6 +71,7 @@ public sealed class EngineExtensions
 {
     private readonly List<GraphPass> _passes = [];
     public IReadOnlyList<GraphPass> Passes => _passes;
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public EngineExtensions Add(GraphPass pass) { _passes.Add(pass); return this; }
 }
 
@@ -81,6 +87,7 @@ public sealed class PassContext(List<ExecNode> nodes, List<CValue> values, int o
     public int Producer(int v) => Nodes.FindIndex(m => m.Out.Contains(v));
 
     /// <summary>Readers of v's buffer (aliases and param operands included); the graph output counts as infinite.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public int Uses(int v)
     {
         int b = Values[v].Buf;
@@ -99,6 +106,7 @@ public sealed class PassContext(List<ExecNode> nodes, List<CValue> values, int o
     public bool IsNhwc4(int v) => Values[v].Shape.Length == 4 && Values[v].Layout is [0, 2, 3, 1];
 
     /// <summary>Rewrites every reader of <paramref name="oldValue"/> to read <paramref name="newValue"/>.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public void Redirect(int oldValue, int newValue)
     {
         foreach (ExecNode m in Nodes)
@@ -147,6 +155,7 @@ public sealed class ConstKind(string name, bool fp32, Func<CValue, float[]>? pac
 /// <summary>Const packings shared by the Vulkan and Metal backends.</summary>
 internal static class GpuPack
 {
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] Conv(CValue w)
     {
         int oc = w.Shape[0], ic = w.Shape[1], taps = w.Shape[2] * w.Shape[3];
@@ -160,6 +169,7 @@ internal static class GpuPack
 
     public static long ConvTElems(CValue w) => (long)w.Shape[0] * ((w.Shape[1] * w.Shape[2] * w.Shape[3] + 7) & ~7);
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] ConvT(CValue w)
     {
         int oc = w.Shape[0], ic = w.Shape[1], taps = w.Shape[2] * w.Shape[3], k = (taps * ic + 7) & ~7;
@@ -176,6 +186,7 @@ internal static class GpuPack
 
     public static long CmElems(CValue w) => (long)Pad128(w.Shape[0]) * Pad16(w.Shape[1] * w.Shape[2] * w.Shape[3]);
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] Cm(CValue w)
     {
         int oc = w.Shape[0], ic = w.Shape[1], taps = w.Shape[2] * w.Shape[3], k = Pad16(taps * ic);
@@ -189,6 +200,7 @@ internal static class GpuPack
 
     public static long GemmCmElems(CValue b) => (long)Pad128(b.Shape[1]) * Pad16(b.Shape[0]);
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] GemmCm(CValue b)
     {
         int k = b.Shape[0], nn = b.Shape[1], kp = Pad16(k);
@@ -198,6 +210,7 @@ internal static class GpuPack
         return dst;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] Dw(CValue w)
     {
         int c = w.Shape[0], taps = w.Shape[2] * w.Shape[3];
@@ -207,6 +220,7 @@ internal static class GpuPack
         return dst;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] GemmNK(CValue b)
     {
         int k = b.Shape[0], nn = b.Shape[1];
@@ -216,6 +230,7 @@ internal static class GpuPack
         return dst;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static float[] ConvTranspose(CValue w)
     {
         int ic = w.Shape[0], oc = w.Shape[1], taps = w.Shape[2] * w.Shape[3];
@@ -227,6 +242,7 @@ internal static class GpuPack
     }
 
     /// <summary>Packed host bytes + per-const offsets (64 B aligned; fp16 unless the kind is fp32).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static (ulong[] offsets, byte[] host) Build(ExecPlan plan, IReadOnlyList<(int v, ConstKind k)> need, bool f16)
     {
         ulong total = 0;
@@ -265,6 +281,7 @@ internal static class GpuPack
 /// <summary>Embedded GPU shader lookup across assemblies (the core and extension owners).</summary>
 internal static class ShaderResources
 {
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static Stream? Open(Assembly asm, string fileName)
     {
         string suffix = ".Shaders." + fileName;

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Reflection;
 using Sdcb.SimdOnnx.Engine;
@@ -13,7 +14,9 @@ public readonly struct VkBind
     public readonly VkSlot Slot;
     internal readonly VkBuffer? Buf;   // when Slot == Direct
     public readonly ulong Offset, Size;
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public VkBind(VkSlot s, ulong off, ulong size) { Slot = s; Offset = off; Size = size; }
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal VkBind(VkBuffer b, ulong off, ulong size) { Slot = VkSlot.Direct; Buf = b; Offset = off; Size = size; }
 }
 
@@ -63,6 +66,7 @@ public sealed class VkGraphModel : IDisposable
 
     /// <param name="constKey">Sharing key for the const store (the source model): graphs of the
     /// same model at other sizes reuse its uploaded weights. Null = private store.</param>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal VkGraphModel(VkDevice dev, ExecPlan plan, bool f16, object? constKey = null)
     {
         _dev = dev;
@@ -137,7 +141,7 @@ public sealed class VkGraphModel : IDisposable
         for (int i = 0; i < plan.Nodes.Length; i++)
         {
             int start = disps.Count;
-            disps.AddRange(Emit(plan.Nodes[i]));
+            Emit(plan.Nodes[i], disps);
             NodeRanges[i] = (start, disps.Count - start);
         }
         Dispatches = disps.ToArray();
@@ -147,6 +151,7 @@ public sealed class VkGraphModel : IDisposable
 
     /// <summary>Tensor-core conv eligibility (conv_cm.comp): fp16 storage on a coopmat device,
     /// dense, channel counts in 16 B quads, an epilogue it implements, M within the grid limit.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static bool UseCoopConv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
@@ -163,6 +168,7 @@ public sealed class VkGraphModel : IDisposable
 
     /// <summary>Tensor-core Gemm (a 1x1 conv over M "pixels" through conv_cm.comp): fp16 storage
     /// on a coopmat device, const B, K/N in 16 B quads, relu/gelu/none epilogue.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static bool UseCoopGemm(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp)
     {
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || plan.Values[n.In[1]].Floats is null || plan.Values[n.In[1]].Shape.Length != 2) return false;
@@ -184,14 +190,17 @@ public sealed class VkGraphModel : IDisposable
     /// (pw_dot / gemm_cm8 / conv_kdot / im2col + gemm_cm8) instead of the shared-staged conv_cm
     /// SG16 build, which intermittently loses the device on the Arc B580 for the OCR models
     /// (CompileOptions.StagedCoopConv or GCDRNET_VK_SG16STAGED=1 keeps it). None = the generic shaders.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static M8Route RouteM8Conv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp) =>
         Allowed(RouteM8ConvCore(dev, f16, plan, n, cp));
 
     // debug: GCDRNET_VK_M8=dot,cm8,kdot,im2col limits the direct routes (others take the generic shaders)
     private static readonly string? s_m8Routes = Environment.GetEnvironmentVariable("GCDRNET_VK_M8");
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route Allowed(M8Route r) =>
         r == M8Route.None || s_m8Routes is null || s_m8Routes.Split(',').Contains(r.ToString().ToLowerInvariant()) ? r : M8Route.None;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route RouteM8ConvCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
         if (!M8Direct(dev, f16, plan) || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
@@ -215,9 +224,11 @@ public sealed class VkGraphModel : IDisposable
         return (ulong)((rows + 511) / 512 * 512 * GpuPack.Pad16(k) * 2L) <= dev.MaxStorageRange ? M8Route.Im2col : M8Route.None;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static M8Route RouteM8Gemm(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp) =>
         Allowed(RouteM8GemmCore(dev, f16, plan, n, gp));
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route RouteM8GemmCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp)
     {
         if (!M8Direct(dev, f16, plan) || gp.TransB) return M8Route.None;
@@ -230,15 +241,18 @@ public sealed class VkGraphModel : IDisposable
         return k % 16 == 0 ? M8Route.Cm8 : M8Route.None;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static bool M8Direct(VkDevice dev, bool f16, ExecPlan plan) =>
         f16 && dev.CoopM8 && plan.Options?.StagedCoopConv != true && Env.Flag("VK_SG16STAGED") != "1";
 
     /// <summary>gemm_cm8 tile (rows x columns) and pipeline by output width (old engine's CmTile).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static (string shader, uint bm, uint bn) Cm8Tile(uint nn) =>
         nn <= 32 ? ("gemm_cm8_n32", 512u, 32u) : nn <= 64 ? ("gemm_cm8_n64", 256u, 64u) : ("gemm_cm8", 128u, 128u);
 
     /// <summary>Binding of an arena value widened to <paramref name="bytes"/> (tile reads past its
     /// end); the arena grows so the widened range stays inside it.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private VkBind BindPadded(int valueId, ulong bytes)
     {
         VkBind b = Bind(valueId);
@@ -256,12 +270,14 @@ public sealed class VkGraphModel : IDisposable
 
     // ---- value → bind resolution (byte offsets/sizes: all long math) ----
     /// <summary>Transient arena space past the plan's values; one region, reused by every dispatch pair.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public VkBind Scratch(ulong bytes)
     {
         _scratchBytes = Math.Max(_scratchBytes, bytes);
         return new VkBind(VkSlot.Arena, _scratchOff, bytes);
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public VkBind Bind(int valueId, CK? kind = null)
     {
         kind ??= CK.Raw;
@@ -280,6 +296,7 @@ public sealed class VkGraphModel : IDisposable
         throw new InvalidOperationException($"value '{v.Name}' has no GPU storage (ints must be folded)");
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static byte[] PcOf(params uint[] ints)
     {
         byte[] b = new byte[ints.Length * 4];
@@ -287,6 +304,7 @@ public sealed class VkGraphModel : IDisposable
         return b;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static byte[] PcOfF(uint[] ints, params float[] floats)
     {
         byte[] b = new byte[(ints.Length + floats.Length) * 4];
@@ -295,11 +313,13 @@ public sealed class VkGraphModel : IDisposable
         return b;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
 
     public static uint G(uint n) => (n + 255) / 256;
 
     /// <summary>uints, one float, then more uints (push-constant blocks with a float in the middle).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static byte[] PcOf3(uint[] ints, float f, uint[] tail)
     {
         byte[] b = new byte[(ints.Length + 1 + tail.Length) * 4];
@@ -310,6 +330,7 @@ public sealed class VkGraphModel : IDisposable
     }
 
     /// <summary>Shaders without a batch index: the value must hold one image.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private void RequireSingle(int valueId)
     {
         if (_plan.Values[valueId].PhysShape is { Length: 4 } s && s[0] != 1)
@@ -322,6 +343,7 @@ public sealed class VkGraphModel : IDisposable
     /// holds logical dim o.Layout[i]; the operand's logical dim is that minus the
     /// numpy right-alignment offset.
     /// </summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] PhysBroadcastStrides(CValue a, CValue o)
     {
         int rank = o.Shape.Length, off = rank - a.Shape.Length;
@@ -342,7 +364,9 @@ public sealed class VkGraphModel : IDisposable
 
     private string Sh(string name) => F16 ? name + "_h" : name;
 
-    private IEnumerable<VkDispatch> Emit(ExecNode n)
+    // a list, not an iterator: the body then JITs optimized (AggressiveOptimization does not reach iterator state machines)
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+    private void Emit(ExecNode n, List<VkDispatch> output)
     {
         CValue[] V = _plan.Values;
         // all addressing on storage-order shapes
@@ -358,8 +382,8 @@ public sealed class VkGraphModel : IDisposable
         switch (n.Op)
         {
             case ExecOp.Copy:
-                yield return ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOf((uint)nOut(), 4), G((uint)nOut()));
+                output.Add(ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)nOut(), 4), G((uint)nOut())));
                 break;
 
             case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu:
@@ -368,8 +392,8 @@ public sealed class VkGraphModel : IDisposable
                 {
                     ExecOp.Relu => 0, ExecOp.Sigmoid => 1, ExecOp.Erf => 2, _ => 3,
                 };
-                yield return ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOf((uint)nOut(), mode), G((uint)nOut()));
+                output.Add(ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)nOut(), mode), G((uint)nOut())));
                 break;
             }
 
@@ -386,15 +410,15 @@ public sealed class VkGraphModel : IDisposable
                 bool dense = astr.SequenceEqual(ostr) && bstr.SequenceEqual(ostr);
                 if (nOut() % 4 == 0 && dense)
                 {
-                    yield return ND("ew2v", [Bind(n.In[0]), Bind(n.In[1]), Bind(n.Out[0])],
-                        PcOf((uint)(nOut() / 4), (uint)p.Op, act), G((uint)(nOut() / 4)));
+                    output.Add(ND("ew2v", [Bind(n.In[0]), Bind(n.In[1]), Bind(n.Out[0])],
+                        PcOf((uint)(nOut() / 4), (uint)p.Op, act), G((uint)(nOut() / 4))));
                     break;
                 }
-                yield return ND("ew2", [Bind(n.In[0]), Bind(n.In[1]), Bind(n.Out[0])],
+                output.Add(ND("ew2", [Bind(n.In[0]), Bind(n.In[1]), Bind(n.Out[0])],
                     PcOf(U(nOut(), ostr[0], ostr[1], ostr[2],
                         astr[0], astr[1], astr[2], astr[3],
                         bstr[0], bstr[1], bstr[2], bstr[3], (int)p.Op, (int)act)),
-                    G((uint)nOut()));
+                    G((uint)nOut())));
                 break;
             }
 
@@ -413,11 +437,11 @@ public sealed class VkGraphModel : IDisposable
                         | (p.Act == ActivationKind.Relu ? 4u : 0u) | (pool.FuseRelu ? 8u : 0u);
                     bool k3 = _dev.ConvPoolK3 && p.Kernel[0] == 3 && p.Kernel[1] == 3;
                     string cpName = k3 ? "convpool_k3" : _dev.ConvDot && F16 && cw[0] % 8 == 0 ? "convpool_pi" : "convpool";
-                    yield return ND(cpName,
+                    output.Add(ND(cpName,
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
                         PcOfF(U(ci[3], ci[1], ci[2], cw[0], co[1], co[2], p.Kernel[0], p.Kernel[1], p.Pads[0], p.Pads[1], (int)pf),
                             p.PadMode == PadMode.Constant ? p.PadValue : 0f),
-                        G((uint)co[1] * (uint)co[2] * (uint)(cw[0] / 8)), name: "convpool");
+                        G((uint)co[1] * (uint)co[2] * (uint)(cw[0] / 8)), name: "convpool"));
                     break;
                 }
                 if (p.AddValue >= 0) RequireNhwc(p.AddValue);
@@ -443,11 +467,11 @@ public sealed class VkGraphModel : IDisposable
                     if (p.Group != ic || oc != ic) throw new NotSupportedException("grouped non-depthwise conv");
                     if (p.AddValue >= 0) throw new NotSupportedException("depthwise conv + residual");
                     bool v4 = _dev.Vec4Eltwise && ic % 4 == 0;
-                    yield return ND(v4 ? "depthwise4" : "depthwise",
+                    output.Add(ND(v4 ? "depthwise4" : "depthwise",
                         [Bind(n.In[0]), Bind(n.In[1], CK.DwW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
                         PcOf3(U((int)ic, (int)ih, (int)iw, (int)oh, (int)ow, p.Kernel[0], p.Kernel[1],
                             p.Strides[0], p.Strides[1], p.Pads[0], p.Pads[1], (int)(flags & ~8u)), p.PadValue, [nb]),
-                        G(nb * ic * oh * ow / (v4 ? 4u : 1u)), name: "depthwise");
+                        G(nb * ic * oh * ow / (v4 ? 4u : 1u)), name: "depthwise"));
                     break;
                 }
                 M8Route m8 = RouteM8Conv(_dev, F16, _plan, n, p);
@@ -459,19 +483,19 @@ public sealed class VkGraphModel : IDisposable
                     if (m8 == M8Route.Dot)
                     {
                         (uint dx, uint dy) = G2((m + 3) / 4 * (oc / 4));
-                        yield return ND("pw_dot",
+                        output.Add(ND("pw_dot",
                             [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
-                            PcOf(m, oc, ic, m8flags), dx, dy, name: "pw_dot");
+                            PcOf(m, oc, ic, m8flags), dx, dy, name: "pw_dot"));
                         break;
                     }
                     if (m8 == M8Route.KDot)
                     {
                         (uint dx, uint dy) = G2((mImg + 3) / 4 * (oc / 4));
-                        yield return ND("conv_kdot",
+                        output.Add(ND("conv_kdot",
                             [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                             PcOf(mImg, oc, ow, iw, ih, ic / 4, (uint)(p.Kernel[0] * p.Kernel[1]), (uint)p.Kernel[1],
                                 (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1], m8flags),
-                            dx, dy, nb, name: "conv_kdot");
+                            dx, dy, nb, name: "conv_kdot"));
                         break;
                     }
                     (string g8, uint bm, uint bn) = Cm8Tile(oc);
@@ -484,19 +508,19 @@ public sealed class VkGraphModel : IDisposable
                         kp = (uint)GpuPack.Pad16((int)kr);
                         a = Scratch((ulong)rowsPad * kp * 2);
                         (uint ix, uint iy) = G2(mImg * (kp / 4));
-                        yield return ND("im2col", [Bind(n.In[0]), Bind(n.In[0]), a],
+                        output.Add(ND("im2col", [Bind(n.In[0]), Bind(n.In[0]), a],
                             PcOf(ow, oh, ic, (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
                                 (uint)p.Pads[0], (uint)p.Pads[1], iw, ih, kr, kp, 0u),
-                            ix, iy, nb, name: "im2col");
+                            ix, iy, nb, name: "im2col"));
                     }
                     else
                     {
                         kp = ic;
                         a = BindPadded(n.In[0], (ulong)rowsPad * kp * 2);
                     }
-                    yield return ND(g8,
+                    output.Add(ND(g8,
                         [a, Bind(n.In[1], CK.CmW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
-                        PcOf(m, oc, kp, m8flags), rowsPad / bm, (oc + bn - 1) / bn, name: "gemm_cm8");
+                        PcOf(m, oc, kp, m8flags), rowsPad / bm, (oc + bn - 1) / bn, name: "gemm_cm8"));
                     break;
                 }
                 if (UseCoopConv(_dev, F16, _plan, n, p))
@@ -511,11 +535,11 @@ public sealed class VkGraphModel : IDisposable
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
                         | (p.PadMode == PadMode.Reflect ? 4u : 0u)
                         | ((p.Act switch { ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, _ => 0u }) << 4);
-                    yield return ND(cm,
+                    output.Add(ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvWT), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                         PcOf(m, oc, kd, cflags, ow, iw, ih, ic, (uint)p.Kernel[1],
                             (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1], kr, oh),
-                        (m + 127) / 128, (oc + bn - 1) / bn, name: "conv_cm");
+                        (m + 127) / 128, (oc + bn - 1) / bn, name: "conv_cm"));
                     break;
                 }
                 string convShader =
@@ -529,20 +553,20 @@ public sealed class VkGraphModel : IDisposable
                     uint tm = p.Strides[1] == 1 ? 4u : 2u, tn = oc % 8 == 0 ? 2u : 1u;
                     uint threads = oc / (4 * tn) * ((ow + tm - 1) / tm) * oh;
                     uint wgs = (threads + 63) / 64, gx = Math.Min(wgs, 32768u);
-                    yield return ND($"conv_dot_s{p.Strides[1]}_{tm}x{tn}",
+                    output.Add(ND($"conv_dot_s{p.Strides[1]}_{tm}x{tn}",
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                         PcOf(ic, ih, iw, oc, oh, ow, (uint)p.Kernel[0], (uint)p.Kernel[1],
                             (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1],
                             flags, 0),
-                        gx, (wgs + gx - 1) / gx, name: "conv");
+                        gx, (wgs + gx - 1) / gx, name: "conv"));
                     break;
                 }
-                yield return ND(convShader,
+                output.Add(ND(convShader,
                     [Bind(n.In[0]), Bind(n.In[1], CK.ConvW), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                     PcOf(ic, ih, iw, oc, oh, ow, (uint)p.Kernel[0], (uint)p.Kernel[1],
                         (uint)p.Strides[0], (uint)p.Strides[1], (uint)p.Pads[0], (uint)p.Pads[1],
                         flags, nb),
-                    (ow + 15) / 16, nb * ((oh + 7) / 8), (oc + 63) / 64, name: "conv");
+                    (ow + 15) / 16, nb * ((oh + 7) / 8), (oc + 63) / 64, name: "conv"));
                 break;
             }
 
@@ -552,11 +576,11 @@ public sealed class VkGraphModel : IDisposable
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
-                yield return ND(v4 ? "maxpool4" : "maxpool", [Bind(n.In[0]), Bind(n.Out[0])],
+                output.Add(ND(v4 ? "maxpool4" : "maxpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
                         (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
                         (uint)p.Pads[0], (uint)p.Pads[1], p.FuseRelu ? 1u : 0u, (uint)so[0]),
-                    G((uint)so[0] * (uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "maxpool");
+                    G((uint)so[0] * (uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "maxpool"));
                 break;
             }
 
@@ -566,9 +590,9 @@ public sealed class VkGraphModel : IDisposable
                 uint len = (uint)V[n.In[0]].Shape[^1];
                 if ((uint)shapeIn(0)[^1] != len) throw new NotSupportedException("Vulkan LayerNorm: last dim not innermost");
                 uint rows = (uint)(V[n.In[0]].ElementCount / len);
-                yield return ND("layernorm",
+                output.Add(ND("layernorm",
                     [Bind(n.In[0]), Bind(n.In[1], CK.F32), Bind(n.In[2], CK.F32), Bind(n.Out[0])],
-                    PcOfF([len], p.Eps), rows, name: "layernorm");
+                    PcOfF([len], p.Eps), rows, name: "layernorm"));
                 break;
             }
 
@@ -587,15 +611,15 @@ public sealed class VkGraphModel : IDisposable
                     if (gm8 == M8Route.Dot)
                     {
                         (uint dx, uint dy) = G2((m + 3) / 4 * (nn / 4));
-                        yield return ND("pw_dot", [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
-                            PcOf(m, nn, k, gf), dx, dy, name: "gemm_dot8");
+                        output.Add(ND("pw_dot", [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
+                            PcOf(m, nn, k, gf), dx, dy, name: "gemm_dot8"));
                         break;
                     }
                     (string g8, uint bm, uint bn) = Cm8Tile(nn);
                     uint rowsPad = (m + bm - 1) / bm * bm;
-                    yield return ND(g8,
+                    output.Add(ND(g8,
                         [BindPadded(n.In[0], (ulong)rowsPad * k * 2), Bind(n.In[1], CK.GemmCmW), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
-                        PcOf(m, nn, k, gf), rowsPad / bm, (nn + bn - 1) / bn, name: "gemm_cm8");
+                        PcOf(m, nn, k, gf), rowsPad / bm, (nn + bn - 1) / bn, name: "gemm_cm8"));
                     break;
                 }
                 if (UseCoopGemm(_dev, F16, _plan, n, p))
@@ -604,10 +628,10 @@ public sealed class VkGraphModel : IDisposable
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u)
                         | ((p.Act == ActivationKind.Relu ? 1u : p.Act == ActivationKind.Gelu ? 2u : 0u) << 4);
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
-                    yield return ND(cm,
+                    output.Add(ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
                         PcOf(m, nn, k, cflags, m, m, 1u, k, 1u, 1u, 1u, 0u, 0u, k, 1u),
-                        (m + 127) / 128, (nn + bn - 1) / bn, name: "gemm_cm");
+                        (m + 127) / 128, (nn + bn - 1) / bn, name: "gemm_cm"));
                     break;
                 }
                 uint gflags = (p.TransB ? 1u : 0u) | (p.BiasValue >= 0 ? 2u : 0u)
@@ -618,15 +642,15 @@ public sealed class VkGraphModel : IDisposable
                     // 4 rows x 8 columns per invocation
                     uint gth = nn / 8 * ((m + 3) / 4);
                     uint gwg = (gth + 63) / 64, ggx = Math.Min(gwg, 32768u);
-                    yield return ND("gemm_dot",
+                    output.Add(ND("gemm_dot",
                         [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
-                        PcOf(m, nn, k, gflags), ggx, (gwg + ggx - 1) / ggx, name: "gemm");
+                        PcOf(m, nn, k, gflags), ggx, (gwg + ggx - 1) / ggx, name: "gemm"));
                     break;
                 }
-                yield return ND("gemm",
+                output.Add(ND("gemm",
                     [Bind(n.In[0]), Bind(n.In[1]), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
                     PcOf(m, nn, k, gflags, 0u, 0u, 0u),
-                    (nn + 63) / 64, (m + 63) / 64, name: "gemm");
+                    (nn + 63) / 64, (m + 63) / 64, name: "gemm"));
                 break;
             }
 
@@ -640,10 +664,10 @@ public sealed class VkGraphModel : IDisposable
                 int[] si = nhwcIn(0), so = nhwcOut();
                 uint flags = (p.FuseRelu ? 1u : 0u) | (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u);
                 bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
-                yield return ND(v4 ? "bilinear4" : "bilinear", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
+                output.Add(ND(v4 ? "bilinear4" : "bilinear", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
                     PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2], flags],
                         p.Scales[2], p.Scales[3]),
-                    G((uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "bilinear");
+                    G((uint)so[1] * (uint)so[2] * (uint)so[3] / (v4 ? 4u : 1u)), name: "bilinear"));
                 break;
             }
 
@@ -657,11 +681,11 @@ public sealed class VkGraphModel : IDisposable
                 int[] id4 = shapeIn(0), od4 = shapeOut();
                 int[] pb4 = new int[4];
                 for (int d = 0; d < 4; d++) pb4[d] = p.Pads[l[d]];
-                yield return ND("pad", [Bind(n.In[0]), Bind(n.Out[0])],
+                output.Add(ND("pad", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOfF(U(id4[0], id4[1], id4[2], id4[3], od4[0], od4[1], od4[2], od4[3],
                         pb4[0], pb4[1], pb4[2], pb4[3], p.Mode == PadMode.Reflect ? 1 : 0),
                         p.Value),
-                    G((uint)V[n.Out[0]].ElementCount));
+                    G((uint)V[n.Out[0]].ElementCount)));
                 break;
             }
 
@@ -677,7 +701,7 @@ public sealed class VkGraphModel : IDisposable
                 for (int k = 0; k < 5; k++) pc[1 + k] = (uint)ostr[k];
                 for (int k = 0; k < 6; k++) pc[6 + k] = (uint)istr[perm6[k]];
                 (uint tx, uint ty) = G2((uint)nOut());
-                yield return ND("transpose", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty);
+                output.Add(ND("transpose", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty));
                 break;
             }
 
@@ -698,7 +722,7 @@ public sealed class VkGraphModel : IDisposable
                     pc[12 + p.Axes[i] + shift] = (uint)p.Steps[i];
                 }
                 (uint tx, uint ty) = G2((uint)nOut());
-                yield return ND("slice", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty);
+                output.Add(ND("slice", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(pc), tx, ty));
                 break;
             }
 
@@ -717,9 +741,9 @@ public sealed class VkGraphModel : IDisposable
                     int cnt = checked((int)V[iv].ElementCount);
                     if (cnt > 0)
                     {
-                        yield return ND("concat_ax", [Bind(iv), Bind(n.Out[0])],
+                        output.Add(ND("concat_ax", [Bind(iv), Bind(n.Out[0])],
                             PcOf((uint)cnt, (uint)inner, (uint)ishape[axis], (uint)dstAxis, (uint)axisOff),
-                            G((uint)cnt));
+                            G((uint)cnt)));
                     }
                     axisOff += ishape[axis];
                 }
@@ -729,8 +753,8 @@ public sealed class VkGraphModel : IDisposable
             case ExecOp.HardSigmoid:
             {
                 var p = (HardSigmoidP)n.P!;
-                yield return ND("hsig", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOfF([(uint)nOut()], p.Alpha, p.Beta), G((uint)nOut()));
+                output.Add(ND("hsig", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOfF([(uint)nOut()], p.Alpha, p.Beta), G((uint)nOut())));
                 break;
             }
 
@@ -741,15 +765,15 @@ public sealed class VkGraphModel : IDisposable
                 uint hw = (uint)si[1] * (uint)si[2], c = (uint)si[3], cg = (c + 63) / 64;
                 if (hw <= 512)
                 {
-                    yield return ND("gap", [Bind(n.In[0]), Bind(n.Out[0])], PcOfF([c, hw], 1f / hw), cg, (uint)si[0]);
+                    output.Add(ND("gap", [Bind(n.In[0]), Bind(n.Out[0])], PcOfF([c, hw], 1f / hw), cg, (uint)si[0]));
                     break;
                 }
                 // large planes: one workgroup per image starves the GPU; reduce pixel chunks in parallel
                 uint chunks = Math.Min((hw + 255) / 256, 1024u), per = (hw + chunks - 1) / chunks;
                 chunks = (hw + per - 1) / per;
                 VkBind part = Scratch((ulong)si[0] * chunks * c * 4);
-                yield return ND("gap_part", [Bind(n.In[0]), part], PcOf(c, hw, per), cg, chunks, (uint)si[0]);
-                yield return ND("gap_sum", [part, Bind(n.Out[0])], PcOfF([c, chunks], 1f / hw), cg, (uint)si[0]);
+                output.Add(ND("gap_part", [Bind(n.In[0]), part], PcOf(c, hw, per), cg, chunks, (uint)si[0]));
+                output.Add(ND("gap_sum", [part, Bind(n.Out[0])], PcOfF([c, chunks], 1f / hw), cg, (uint)si[0]));
                 break;
             }
 
@@ -761,10 +785,10 @@ public sealed class VkGraphModel : IDisposable
                 int[] si = nhwcIn(0), so = nhwcOut();
                 uint act = p.Act switch { ActivationKind.None => 0u, ActivationKind.Relu => 1u, ActivationKind.Sigmoid => 2u,
                     _ => throw new NotSupportedException($"Vulkan ConvTranspose: {p.Act}") };
-                yield return ND("convt", [Bind(n.In[0]), Bind(n.In[1], CK.ConvTW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
+                output.Add(ND("convt", [Bind(n.In[0]), Bind(n.In[1], CK.ConvTW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[3], (uint)p.Kernel[0], (uint)p.Kernel[1],
                         (p.BiasValue >= 0 ? 1u : 0u) | act << 1),
-                    G((uint)nOut()));
+                    G((uint)nOut())));
                 break;
             }
 
@@ -774,15 +798,15 @@ public sealed class VkGraphModel : IDisposable
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 RequireSingle(n.In[0]);
                 int[] si = nhwcIn(0), so = nhwcOut();
-                yield return ND("nearest", [Bind(n.In[0]), Bind(n.Out[0])],
+                output.Add(ND("nearest", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2]], p.Scales[2], p.Scales[3]),
-                    G((uint)nOut()));
+                    G((uint)nOut())));
                 break;
             }
 
             case ExecOp.HardSwish or ExecOp.Swish:
-                yield return ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOf((uint)nOut(), n.Op == ExecOp.HardSwish ? 5u : 6u), G((uint)nOut()));
+                output.Add(ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)nOut(), n.Op == ExecOp.HardSwish ? 5u : 6u), G((uint)nOut())));
                 break;
 
             case ExecOp.Softmax:
@@ -792,8 +816,8 @@ public sealed class VkGraphModel : IDisposable
                 if ((uint)shapeIn(0)[^1] != len) throw new NotSupportedException("Vulkan Softmax: last axis not innermost");
                 uint rows = (uint)(x.ElementCount / len);
                 uint gx = Math.Min(rows, 65535u);
-                yield return ND("softmax", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(rows, len),
-                    gx, (rows + gx - 1) / gx, name: "softmax");
+                output.Add(ND("softmax", [Bind(n.In[0]), Bind(n.Out[0])], PcOf(rows, len),
+                    gx, (rows + gx - 1) / gx, name: "softmax"));
                 break;
             }
 
@@ -802,11 +826,11 @@ public sealed class VkGraphModel : IDisposable
                 var p = (PoolP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 int[] si = nhwcIn(0), so = nhwcOut();
-                yield return ND("avgpool", [Bind(n.In[0]), Bind(n.Out[0])],
+                output.Add(ND("avgpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
                         (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
                         (uint)p.Pads[0], (uint)p.Pads[1], p.CountIncludePad ? 1u : 0u, (uint)so[0]),
-                    G((uint)nOut()), name: "avgpool");
+                    G((uint)nOut()), name: "avgpool"));
                 break;
             }
 
@@ -823,14 +847,14 @@ public sealed class VkGraphModel : IDisposable
                 long aBatch = a.ElementCount / ((long)m * k), bBatch = b.ElementCount / ((long)k * nn);
                 if (aBatch != batch || (bBatch != batch && bBatch != 1))
                     throw new NotSupportedException("Vulkan MatMul: batch broadcast");
-                yield return ND("gemm", [Bind(n.In[0]), Bind(n.In[1]), B(-1, CK.F32), Bind(n.Out[0])],
+                output.Add(ND("gemm", [Bind(n.In[0]), Bind(n.In[1]), B(-1, CK.F32), Bind(n.Out[0])],
                     PcOf(m, nn, k, 0u, m * k, bBatch == 1 ? 0u : k * nn, m * nn),
-                    (nn + 63) / 64, (m + 63) / 64, batch, name: "matmul");
+                    (nn + 63) / 64, (m + 63) / 64, batch, name: "matmul"));
                 break;
             }
 
             case ExecOp.Ext:
-                foreach (VkDispatch d in n.Ext!.EmitVulkan(this, n)) yield return d;
+                output.AddRange(n.Ext!.EmitVulkan(this, n));
                 break;
 
             default:
@@ -858,6 +882,7 @@ public sealed class VkGraphModel : IDisposable
 
     /// <summary>A dispatch of <paramref name="shader"/> (fp16 variant on fp16 graphs) embedded in
     /// <paramref name="owner"/> (null = the core).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public VkDispatch Dispatch(ExecNode n, string shader, VkBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1,
         Assembly? owner = null) => new()
     {
@@ -867,11 +892,13 @@ public sealed class VkGraphModel : IDisposable
     };
 
     /// <summary>Binding of a value, or the 64 B zero buffer for <paramref name="valueId"/> &lt; 0.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public VkBind BindOrDummy(int valueId, CK? kind = null) =>
         valueId >= 0 ? Bind(valueId, kind) : new VkBind(VkSlot.Dummy, 0, 64);
 
     internal VkDevice Device => _dev;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public void RequireNhwc(int v)
     {
         CValue cv = _plan.Values[v];
@@ -883,6 +910,7 @@ public sealed class VkGraphModel : IDisposable
     private const int MaxRank = 6;
 
     /// <summary>Right-aligned rank-6 view (leading 1s) for the generic slice / transpose shaders.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] PadR(int[] s)
     {
         if (s.Length > MaxRank) throw new NotSupportedException($"Vulkan: rank {s.Length} > {MaxRank}");
@@ -891,6 +919,7 @@ public sealed class VkGraphModel : IDisposable
         return r;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] StridesR(int[] shape6)
     {
         int[] s = new int[MaxRank]; s[MaxRank - 1] = 1;
@@ -898,6 +927,7 @@ public sealed class VkGraphModel : IDisposable
         return s;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] PermuteToR(int[] perm, int rank)
     {
         int shift = MaxRank - rank;
@@ -907,6 +937,7 @@ public sealed class VkGraphModel : IDisposable
     }
 
     /// <summary>256-thread groups for n items, split over x/y past the 65535 x-limit.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static (uint x, uint y) G2(uint n)
     {
         uint g = G(n), gx = Math.Min(g, 65535u);
@@ -914,6 +945,7 @@ public sealed class VkGraphModel : IDisposable
         return (gx, (g + gx - 1) / gx);
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] Pad4(int[] s)
     {
         if (s.Length == 4) return s;
@@ -922,6 +954,7 @@ public sealed class VkGraphModel : IDisposable
         return r;
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] Strides(int[] shape4)
     {
         int[] s = new int[4]; s[3] = 1;
@@ -930,6 +963,7 @@ public sealed class VkGraphModel : IDisposable
     }
 
     // lift an original-rank perm into padded rank-4 (leading dims map to themselves)
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static int[] PermuteTo4(int[] perm, int rank)
     {
         int shift = 4 - rank;
@@ -939,12 +973,14 @@ public sealed class VkGraphModel : IDisposable
     }
 
     /// <summary>Sessions hold a reference so cache eviction can't free live const/dummy buffers.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public void Acquire()
     {
         if (Interlocked.Increment(ref _refs) <= 1)
             throw new ObjectDisposedException(nameof(VkGraphModel), "const buffers already freed");
     }
     /// <summary>Acquire unless already freed (no resurrection; for racing cache readers).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public bool TryAcquire()
     {
         while (true)
@@ -954,6 +990,7 @@ public sealed class VkGraphModel : IDisposable
             if (Interlocked.CompareExchange(ref _refs, r + 1, r) == r) return true;
         }
     }
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public void Release()
     {
         if (Interlocked.Decrement(ref _refs) == 0) _store.Release();

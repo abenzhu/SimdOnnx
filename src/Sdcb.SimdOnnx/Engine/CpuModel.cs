@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Sdcb.SimdOnnx.Onnx;
 
@@ -17,6 +18,7 @@ internal sealed class CpuModel
 
     /// <param name="packs">Packed-weight cache to share with other CPU models of the same graph
     /// (e.g. a head-truncated variant); null = private.</param>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal CpuModel(OnnxModel model, CompileOptions? options = null, int capacity = 64, CpuKernels.Cache? packs = null)
     {
         Model = model;
@@ -30,6 +32,7 @@ internal sealed class CpuModel
     internal CpuKernels.Cache Packs => _packs;
 
     /// <summary>The packed plan for <paramref name="shape"/> (compiled on first use).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal ExecPlan Plan(ReadOnlySpan<int> shape)
     {
         string key = string.Join(",", shape.ToArray());
@@ -90,6 +93,7 @@ internal sealed unsafe class CpuRunner : IDisposable
     internal ReadOnlySpan<float> Output => Session.Output;
     internal long ArenaBytes => _arenaBytes;
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal void Reshape(ReadOnlySpan<int> shape)
     {
         if (_session is { } s && s.InputShape.AsSpan().SequenceEqual(shape)) return;
@@ -105,6 +109,7 @@ internal sealed unsafe class CpuRunner : IDisposable
         _session = new InferenceSession(plan, _arena);
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal void Run()
     {
         InferenceSession s = Session;
@@ -112,6 +117,7 @@ internal sealed unsafe class CpuRunner : IDisposable
         s.Run();
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private void Free()
     {
         _session = null;

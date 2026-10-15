@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Sdcb.SimdOnnx.Kernels;
 
 namespace Sdcb.SimdOnnx.Engine;
@@ -19,6 +20,7 @@ public static class CpuKernels
         /// <summary>The packed weights of <paramref name="n"/>, packed once: workers compiling the
         /// same layer concurrently (new shapes on several threads) share one pack instead of each
         /// keeping its own copy.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         public object GetOrPack(ExecNode n, float[] w, float[]? b, Func<object> pack)
         {
             var key = (n.Op, n.Name, n.SrcNode);
@@ -32,11 +34,13 @@ public static class CpuKernels
             return kp.Value;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static bool Same(float[]? a, float[]? b) =>
             ReferenceEquals(a, b) || (a is not null && b is not null && a.AsSpan().SequenceEqual(b));
     }
 
     /// <summary>Fills missing kernel plans of an NHWC plan (idempotent; plans may be shared).</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static void Pack(ExecPlan plan, Cache? cache)
     {
         if (!plan.Nhwc) return;
@@ -81,6 +85,7 @@ public static class CpuKernels
         }
     }
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static object Get(Cache? cache, ExecNode n, float[] w, float[]? b, Func<object> pack) =>
         cache is null ? pack() : cache.GetOrPack(n, w, b, pack);
 }

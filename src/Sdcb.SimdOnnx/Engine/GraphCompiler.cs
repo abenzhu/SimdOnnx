@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Sdcb.SimdOnnx.Onnx;
 
 namespace Sdcb.SimdOnnx.Engine;
@@ -10,9 +11,11 @@ namespace Sdcb.SimdOnnx.Engine;
 /// </summary>
 internal static class GraphCompiler
 {
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static ExecPlan Compile(OnnxModel model, ReadOnlySpan<int> inputShape) =>
         Compile(model, inputShape, CompileOptions.Default);
 
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static ExecPlan Compile(OnnxModel model, ReadOnlySpan<int> inputShape, CompileOptions opt)
     {
         var c = new Compiler(model);
@@ -21,6 +24,7 @@ internal static class GraphCompiler
 
     /// <summary>Vulkan small-conv shaders (uphead skip recompute, convpool): dense stride-1
     /// conv, ic &lt; 8, oc a multiple of 8 (&lt;= 128), weights fit the 16 KB staging.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     internal static bool GpuSmallConv(ConvP cp, int[] wShape, int ic) =>
         cp.Group == 1 && ic < 8 && wShape.Length == 4 && wShape[0] % 8 == 0 && wShape[0] <= 128
         && (long)wShape[0] * ic * wShape[2] * wShape[3] <= 4096
@@ -38,6 +42,7 @@ internal static class GraphCompiler
 
         public Compiler(OnnxModel m) => _m = m;
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private int AddValue(CValue v)
         {
             int id = _values.Count;
@@ -46,6 +51,7 @@ internal static class GraphCompiler
             return id;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private int NewBuf(int size)
         {
             int id = _bufSize.Count;
@@ -55,6 +61,7 @@ internal static class GraphCompiler
 
         private CValue V(int id) => _values[id];
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private int Input(int i, OnnxNodeData n)
         {
             string name = n.Inputs[i];
@@ -64,6 +71,7 @@ internal static class GraphCompiler
             return id;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private int[] Inputs(OnnxNodeData n, int skip = 0)
         {
             int[] ids = new int[n.Inputs.Count - skip];
@@ -72,6 +80,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Int list given as input <paramref name="i"/> (newer opsets) or as attribute <paramref name="attr"/> (older); null if neither.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private long[]? IntsArg(OnnxNodeData n, int i, string attr)
         {
             if (n.Inputs.Count > i && n.Inputs[i].Length > 0) return V(Input(i, n)).Ints;
@@ -81,6 +90,7 @@ internal static class GraphCompiler
 
         private int _curNi;   // onnx node index currently being emitted (for SrcNode)
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private int Emit(ExecOp op, int[] ins, CValue output, object? p, OnnxNodeData n)
         {
             int outId = AddValue(output);
@@ -88,6 +98,7 @@ internal static class GraphCompiler
             return outId;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         public ExecPlan Run(ReadOnlySpan<int> inputShape, CompileOptions opt)
         {
             OnnxGraphData g = _m.Graph;
@@ -130,6 +141,7 @@ internal static class GraphCompiler
         }
 
         // ---------- fusion + buffer planning ----------
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static ExecPlan FuseAndPlan(OnnxModel model, List<ExecNode> nodes, List<CValue> values,
             List<int> bufSize, int inputValue, int outputValue, CompileOptions opt)
         {
@@ -196,6 +208,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Drops nodes that do not contribute to the output (heads cut at an inner tensor).</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void Prune(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             var live = new HashSet<int>();
@@ -218,6 +231,7 @@ internal static class GraphCompiler
             nodes.RemoveRange(w, nodes.Count - w);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void RunPasses(PassStage stage, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
         {
             if (opt.Extensions is not { } ext) return;
@@ -227,6 +241,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Structural fusions over the exec node list (single consumer chains).</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void Fuse(OnnxModel model, List<ExecNode> nodes, List<CValue> values, int outputValue, CompileOptions opt)
         {
             // pass 1: Pad -> Conv  (fold reflect/constant padding into the conv)
@@ -302,6 +317,7 @@ internal static class GraphCompiler
         // act(T(x)) == T(act(x)) for elementwise unary act: move a sole-consumer
         // act node in front of its transpose producer so producer fusions (e.g.
         // Gemm->Gelu) can see it.
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void CommuteActBeforeTranspose(List<ExecNode> nodes, List<CValue> values)
         {
             for (int g = 0; g < nodes.Count; g++)
@@ -329,6 +345,7 @@ internal static class GraphCompiler
         // reshape/squeeze Buf-aliases count as uses of the producer's buffer) and
         // adjacency-independent. Retargets the act's output buffer onto the
         // producer's so downstream aliases keep their shape metadata.
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseLateAct(List<ExecNode> nodes, List<CValue> values)
         {
             for (int i = 0; i < nodes.Count; i++)
@@ -406,6 +423,7 @@ internal static class GraphCompiler
         /// the full-resolution conv output is never stored. GPU plans only get it for small-ic stem
         /// convs (<see cref="GpuSmallConv"/>, staged weights).
         /// </summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseMemory(List<ExecNode> nodes, List<CValue> values, int outputValue, bool gpu)
         {
             var ctx = new PassContext(nodes, values, outputValue, new CompileOptions(true));
@@ -433,6 +451,7 @@ internal static class GraphCompiler
         /// Resize -> Add(., [Relu](skip)) becomes a Resize with an addend (In[1]) in NHWC plans, so
         /// the full-resolution resize output is never stored. The fused node takes the Add's position.
         /// </summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseResizeAdd(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             var ctx = new PassContext(nodes, values, outputValue, new CompileOptions(true));
@@ -476,6 +495,7 @@ internal static class GraphCompiler
         /// Matches through zero-copy aliases (Identity / reshape views) and non-adjacent Adds, as long as
         /// the addend is produced before the conv and the conv output has no other reader.
         /// </summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseConvResidual(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             int Root(int v)
@@ -541,6 +561,7 @@ internal static class GraphCompiler
             nodes.RemoveRange(w, nodes.Count - w);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         internal static void Redirect(List<ExecNode> nodes, List<CValue> values, int oldValue, int newValue)
         {
             foreach (ExecNode m in nodes)
@@ -551,6 +572,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>True when value `v`'s only consumer is node index `useIdx`, once.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         internal static bool SoleUse(List<ExecNode> nodes, int v, int useIdx)
         {
             int count = 0;
@@ -564,6 +586,7 @@ internal static class GraphCompiler
             return count == 1;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static bool PadsOnlySpatial(int[] pads, int rank)
         {
             if (pads.Length != 2 * rank) return false;
@@ -571,6 +594,7 @@ internal static class GraphCompiler
             return true;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseGelu(List<ExecNode> nodes, List<CValue> values)
         {
             bool IsEw(ExecNode m, EwOp op) => m.Op == ExecOp.Elementwise && ((EwP)m.P!).Op == op && m.In.Length == 2;
@@ -620,6 +644,7 @@ internal static class GraphCompiler
             }
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static bool IsScalarConst(List<CValue> values, int v, float expected)
         {
             CValue cv = values[v];
@@ -633,6 +658,7 @@ internal static class GraphCompiler
         {
             private ExecNode?[] _prod;
             private int[] _uses;
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             public UseIndex(List<ExecNode> nodes, List<CValue> values)
             {
                 _prod = new ExecNode?[values.Count + 16];
@@ -641,6 +667,7 @@ internal static class GraphCompiler
                 foreach (CValue v in values)
                     if (v.AliasOf >= 0) _uses[v.AliasOf]++;
             }
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             private void Grow(int v)
             {
                 if (v < _prod.Length) return;
@@ -649,13 +676,17 @@ internal static class GraphCompiler
             }
             public ExecNode? Producer(int v) => v >= 0 && v < _prod.Length ? _prod[v] : null;
             public int Uses(int v) => v >= 0 && v < _uses.Length ? _uses[v] : 0;
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             public void SetProducer(int v, ExecNode m) { Grow(v); _prod[v] = m; }
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             public void Unuse(int v) { Grow(v); _uses[v]--; }
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             public void Add(ExecNode m)
             {
                 if (m.Out.Length == 1) SetProducer(m.Out[0], m);
                 foreach (int v in m.In) { Grow(v); _uses[v]++; }
             }
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
             public void Remove(ExecNode m)
             {
                 foreach (int o in m.Out)
@@ -666,6 +697,7 @@ internal static class GraphCompiler
 
         /// <summary>Conv/Gemm -> Add(per-channel const) folds into the producer's bias (the producer then
         /// writes the Add's output value directly).</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseBiasAdd(OnnxModel model, List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             var ix = new UseIndex(nodes, values);
@@ -721,6 +753,7 @@ internal static class GraphCompiler
 
         /// <summary>CPU plans: Mul(x, HardSigmoid(x)) → HardSwish(x), Mul(x, Sigmoid(x)) → Swish(x); conv/gemm
         /// epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             for (int i = 0; i < nodes.Count; i++)
@@ -750,6 +783,7 @@ internal static class GraphCompiler
 
         /// <summary>paddle2onnx's decomposed layer norm over the last axis:
         /// m = mean(x); d = x - m; y = d / sqrt(mean(d·d) + eps) · gamma + beta.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseLayerNorm(List<ExecNode> nodes, List<CValue> values)
         {
             var ix = new UseIndex(nodes, values);
@@ -807,6 +841,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>ConvTranspose -> Add(const [1,oc,1,1]) folds into the transposed conv's bias.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void FuseConvTBias(List<ExecNode> nodes, List<CValue> values)
         {
             for (int i = 0; i + 1 < nodes.Count; i++)
@@ -827,6 +862,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Lifetime-based arena packing (def-order, free-list reuse).</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static void PlanArena(List<ExecNode> nodes, List<CValue> values,
             List<int> bufSize, int inputValue, int outputValue,
             out int[] offsets, out int arenaFloats)
@@ -965,6 +1001,7 @@ internal static class GraphCompiler
               "Min", "Max", "Equal", "Less", "Where", "ConstantOfShape", "Expand",
               "Identity", "Tile" };
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitNode(OnnxNodeData n)
         {
             string op = n.OpType;
@@ -1064,6 +1101,7 @@ internal static class GraphCompiler
         }
 
         // ---------- int evaluation ----------
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EvalInt(OnnxNodeData n)
         {
             string op = n.OpType;
@@ -1192,6 +1230,7 @@ internal static class GraphCompiler
         }
 
         // ---------- float ops ----------
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private CValue ActivationValue(string name, int[] shape)
         {
             int elems = 1;
@@ -1199,12 +1238,14 @@ internal static class GraphCompiler
             return new CValue { Name = name, Shape = shape, DType = 1, Buf = NewBuf(elems) };
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void Alias(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
             AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 1, Buf = x.Buf, Floats = x.Floats, Ints = x.Ints, AliasOf = x.Buf >= 0 ? Input(0, n) : -1 });
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitPad(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1223,6 +1264,7 @@ internal static class GraphCompiler
                 new PadP { Pads = pads.Select(p => (int)p).ToArray(), Mode = mode, Value = val }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitConv(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1254,6 +1296,7 @@ internal static class GraphCompiler
                 }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitPool(OnnxNodeData n, bool avg = false)
         {
             CValue x = V(Input(0, n));
@@ -1273,6 +1316,7 @@ internal static class GraphCompiler
                 new PoolP { Kernel = kernel, Strides = strides, Pads = pads, CountIncludePad = avg && n.IntAttr("count_include_pad", 0) != 0 }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static int[] SameUpperPads(int[] inSp, int[] k, int[] s, int[] d)
         {
             int r = k.Length;
@@ -1287,6 +1331,7 @@ internal static class GraphCompiler
             return pads;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitGlobalAvg(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1302,6 +1347,7 @@ internal static class GraphCompiler
             Emit(ExecOp.GlobalAvgPool, [Input(0, n)], ActivationValue(n.Outputs[0], [x.Shape[0], x.Shape[1], 1, 1]), null, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitReduceMean(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1320,6 +1366,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>Inference BatchNormalization (not folded into a conv) as a per-channel affine: x·s + t.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitBatchNorm(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1345,6 +1392,7 @@ internal static class GraphCompiler
         }
 
         /// <summary>MatMul: a constant 2-D B lowers to <see cref="ExecOp.Gemm"/>, activation × activation to <see cref="ExecOp.MatMul"/>.</summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitMatMul(OnnxNodeData n)
         {
             CValue a = V(Input(0, n)), b = V(Input(1, n));
@@ -1364,6 +1412,7 @@ internal static class GraphCompiler
             Emit(ExecOp.MatMul, [Input(0, n), Input(1, n)], ActivationValue(n.Outputs[0], shape), null, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitSoftmax(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1374,6 +1423,7 @@ internal static class GraphCompiler
             Emit(ExecOp.Softmax, [Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), null, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitPow(OnnxNodeData n)
         {
             CValue e = V(Input(1, n));
@@ -1383,6 +1433,7 @@ internal static class GraphCompiler
             Emit(ExecOp.Elementwise, [Input(0, n), Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), new EwP { Op = EwOp.Mul }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitConvTranspose(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1401,12 +1452,14 @@ internal static class GraphCompiler
                 new ConvTP { Kernel = k, BiasValue = biasV }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitUnary(OnnxNodeData n, ExecOp op)
         {
             CValue x = V(Input(0, n));
             Emit(op, [Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), null, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitLayerNorm(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1419,6 +1472,7 @@ internal static class GraphCompiler
                 ActivationValue(n.Outputs[0], x.Shape), new LnP { Eps = eps }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitGemm(OnnxNodeData n)
         {
             CValue a = V(Input(0, n));
@@ -1436,6 +1490,7 @@ internal static class GraphCompiler
                 new GemmP { TransB = transB, BiasValue = biasV }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitResize(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1472,6 +1527,7 @@ internal static class GraphCompiler
                 new ResizeP { Scales = scales }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitTranspose(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1482,6 +1538,7 @@ internal static class GraphCompiler
                 new TransposeP { Perm = perm }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitSlice(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1496,6 +1553,7 @@ internal static class GraphCompiler
                     Axes = axes.Select(a => (int)a).ToArray(), Steps = stepI }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitConcat(OnnxNodeData n)
         {
             int axis = (int)n.IntAttr("axis");
@@ -1508,6 +1566,7 @@ internal static class GraphCompiler
                 new ConcatP { Axis = axis }, n);
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitSplit(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1542,6 +1601,7 @@ internal static class GraphCompiler
             }
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitReshape(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1552,6 +1612,7 @@ internal static class GraphCompiler
             AddValue(new CValue { Name = n.Outputs[0], Shape = shape, DType = 1, Buf = x.Buf, Floats = x.Floats, AliasOf = x.Buf >= 0 ? Input(0, n) : -1 });
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitSqueeze(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1567,6 +1628,7 @@ internal static class GraphCompiler
             AddValue(new CValue { Name = n.Outputs[0], Shape = shape, DType = 1, Buf = x.Buf, Floats = x.Floats, AliasOf = x.Buf >= 0 ? Input(0, n) : -1 });
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitUnsqueeze(OnnxNodeData n)
         {
             CValue x = V(Input(0, n));
@@ -1576,6 +1638,7 @@ internal static class GraphCompiler
             AddValue(new CValue { Name = n.Outputs[0], Shape = dims.ToArray(), DType = 1, Buf = x.Buf, Floats = x.Floats, AliasOf = x.Buf >= 0 ? Input(0, n) : -1 });
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitElementwise(OnnxNodeData n, string op)
         {
             int a = Input(0, n), b = Input(1, n);
@@ -1586,6 +1649,7 @@ internal static class GraphCompiler
         }
 
         // ---------- helpers ----------
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static int[] BroadcastShape(int[] a, int[] b)
         {
             int rank = Math.Max(a.Length, b.Length);
@@ -1601,6 +1665,7 @@ internal static class GraphCompiler
             return r;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         internal static int[] ResolveReshape(int[] inShape, long[] spec, bool allowZero, int inElems)
         {
             int[] shape = new int[spec.Length];
@@ -1616,6 +1681,7 @@ internal static class GraphCompiler
             return shape;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         internal static void SliceBounds(int[] inShape, long[] starts, long[] ends,
             long[] axes, long[] steps, out int[] outShape, out int[] stOut, out int[] enOut, out int[] stepOut)
         {
@@ -1650,6 +1716,7 @@ internal static class GraphCompiler
             }
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static long[] IntConcat(long[][] inputs, int[][] shapes, int axis, int[] outShape)
         {
             // small tensors only — generic n-d concat
@@ -1679,6 +1746,7 @@ internal static class GraphCompiler
             return dst;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private static long[] IntSlice(long[] src, int[] inShape, int[] axes, int[] starts, int[] steps, int[] outShape)
         {
             int rank = inShape.Length;
@@ -1701,6 +1769,7 @@ internal static class GraphCompiler
             return dst;
         }
 
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         internal static int[] Strides(int[] shape)
         {
             int[] s = new int[shape.Length];

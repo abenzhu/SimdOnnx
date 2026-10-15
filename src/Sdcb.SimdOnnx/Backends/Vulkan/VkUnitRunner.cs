@@ -127,7 +127,7 @@ internal sealed unsafe class VkUnitRunner : IDisposable
         {
             if (_stIn is not null) { _stIn.Unmap(); _stIn.Free(); }
             _inBytes = Math.Max(inB, _inBytes + _inBytes / 2);
-            _stIn = _dev.NewStorageBuffer(_inBytes, hostVisible: true, preferHost: false);
+            _stIn = _dev.NewStorageBuffer(_inBytes, hostVisible: true, preferHost: Env.Flag("VK_STAGE_WC") == "0");
             _inMap = (float*)_stIn.Map();
         }
         if (outB > _outBytes)
