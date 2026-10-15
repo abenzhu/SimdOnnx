@@ -270,7 +270,7 @@ internal static class GraphCompiler
             // Relu/Sigmoid/elementwise-tail fusions
             FuseBiasAdd(model, nodes, values, outputValue);
             FuseLayerNorm(nodes, values);
-            if (!opt.Gpu) FuseGatedAct(nodes, values, outputValue);
+            FuseGatedAct(nodes, values, outputValue, swish: !opt.Gpu);
             for (int i = 0; i + 1 < nodes.Count; i++)
             {
                 ExecNode a = nodes[i], b = nodes[i + 1];
@@ -751,10 +751,10 @@ internal static class GraphCompiler
             nodes.RemoveAll(n => n is null);
         }
 
-        /// <summary>CPU plans: Mul(x, HardSigmoid(x)) → HardSwish(x), Mul(x, Sigmoid(x)) → Swish(x); conv/gemm
-        /// epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
+        /// <summary>Mul(x, HardSigmoid(x)) → HardSwish(x) and (CPU plans: no GPU conv has a swish epilogue)
+        /// Mul(x, Sigmoid(x)) → Swish(x); conv/gemm epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
         [MethodImpl(MethodImplCompat.AggressiveOptimization)]
-        private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue, bool swish)
         {
             for (int i = 0; i < nodes.Count; i++)
             {
@@ -768,7 +768,7 @@ internal static class GraphCompiler
                         || values.Any(v => v.AliasOf == g)) continue;
                     ExecNode gate = nodes[gi];
                     ExecOp op;
-                    if (gate.Op == ExecOp.Sigmoid) op = ExecOp.Swish;
+                    if (gate.Op == ExecOp.Sigmoid && swish) op = ExecOp.Swish;
                     else if (gate.Op == ExecOp.HardSigmoid && gate.P is HardSigmoidP hp
                         && MathF.Abs(hp.Alpha - 1f / 6f) < 1e-6f && hp.Beta == 0.5f) op = ExecOp.HardSwish;
                     else continue;
