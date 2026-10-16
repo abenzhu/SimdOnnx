@@ -222,8 +222,11 @@ public enum PlanTarget { Cpu, Vulkan, Metal }
 /// <param name="OutputName">tensor to stop at instead of the graph output (nodes it does not need are dropped).</param>
 public sealed record CompileOptions(bool Nhwc, bool PhysicalIo = false, bool MemFuse = true,
     PlanTarget Target = PlanTarget.Cpu, EngineExtensions? Extensions = null, string? OutputName = null,
-    bool LogicalOutput = false, bool Fuse = true, bool StagedCoopConv = false)
+    bool LogicalOutput = false, bool Fuse = true, bool StagedCoopConv = false, bool? Vec4Eltwise = null)
 {
+    // Vec4Eltwise: GPU maxpool / bilinear / depthwise take 4 channels per invocation when c % 4 == 0.
+    // null = the device default (VkDevice.Vec4Eltwise: integrated and Intel GPUs); true everywhere
+    // matches the old OCR engine, which used the vec4 kernels on every device.
     // StagedCoopConv: on 8x16x16 (SG16, Intel Xe2) devices, take the shared-staged conv_cm build
     // for dense convs. Much faster on wide feature maps, but some workloads (the OCR models)
     // intermittently lose the device with it on the Arc B580, so the default is the direct-load

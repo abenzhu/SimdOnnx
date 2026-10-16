@@ -391,6 +391,9 @@ public sealed class VkGraphModel : IDisposable
 
     private string Sh(string name) => F16 ? name + "_h" : name;
 
+    /// <summary>4-channel memory-bound kernels: the plan's choice, else the device default.</summary>
+    private bool Vec4 => _plan.Options?.Vec4Eltwise ?? _dev.Vec4Eltwise;
+
     // a list, not an iterator: the body then JITs optimized (AggressiveOptimization does not reach iterator state machines)
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private void Emit(ExecNode n, List<VkDispatch> output)
@@ -493,7 +496,7 @@ public sealed class VkGraphModel : IDisposable
                 {
                     if (p.Group != ic || oc != ic) throw new NotSupportedException("grouped non-depthwise conv");
                     if (p.AddValue >= 0) throw new NotSupportedException("depthwise conv + residual");
-                    bool v4 = _dev.Vec4Eltwise && ic % 4 == 0;
+                    bool v4 = Vec4 && ic % 4 == 0;
                     output.Add(ND(v4 ? "depthwise4" : "depthwise",
                         [Bind(n.In[0]), Bind(n.In[1], CK.DwW), B(p.BiasValue, CK.F32), Bind(n.Out[0])],
                         PcOf3(U((int)ic, (int)ih, (int)iw, (int)oh, (int)ow, p.Kernel[0], p.Kernel[1],
@@ -602,7 +605,7 @@ public sealed class VkGraphModel : IDisposable
                 var p = (PoolP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 int[] si = nhwcIn(0), so = nhwcOut();
-                bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
+                bool v4 = Vec4 && si[3] % 4 == 0;
                 output.Add(ND(v4 ? "maxpool4" : "maxpool", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
                         (uint)p.Kernel[0], (uint)p.Kernel[1], (uint)p.Strides[0], (uint)p.Strides[1],
@@ -692,7 +695,7 @@ public sealed class VkGraphModel : IDisposable
                 if (hasAdd) RequireNhwc(n.In[1]);
                 int[] si = nhwcIn(0), so = nhwcOut();
                 uint flags = (p.FuseRelu ? 1u : 0u) | (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u);
-                bool v4 = _dev.Vec4Eltwise && si[3] % 4 == 0;
+                bool v4 = Vec4 && si[3] % 4 == 0;
                 output.Add(ND(v4 ? "bilinear4" : "bilinear", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
                     PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2], flags],
                         p.Scales[2], p.Scales[3]),
