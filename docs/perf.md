@@ -29,26 +29,32 @@ recognised lines (old/new).
 | medium cpu 16w | 652.3 | 654.9 | 1.00 | 231.5/213.2 | 19.4/55.9 | 2368.7/2483.8 | 1269/1776 | 1004/1004 |
 
 Vulkan rows of the first run lost the device (since fixed, see decisions). Current Vulkan
-(SimdOnnx `56aa5d5`, Paddle `0c0c77f`), interleaved, 3 rounds, 4 workers (`.rerun/alt.sh`):
+(SimdOnnx `be3ef34`, Paddle with `Sdcb.SimdOnnx.Imaging` preprocessing), interleaved, 3–5 rounds,
+4 workers (`.rerun/alt.sh`; this machine's old-engine tiny median alone wanders 17–24 ms, so
+tiny / small ratios move by ±5% between sessions):
 
-| model | old | new | ratio | det graph | rec graph | det pre / post, crop, rec pre (sum) | peak WS MB | exact |
-|---|---:|---:|---:|---|---|---|---|---|
-| tiny | 17.1–23.4 | 23.5–26.4 | 1.19 | 5.57/4.19 | 6.20/6.22 | 10.5/13.4 | 580/602 | 740/741 |
-| small | 31.7–32.6 | 34.7–35.6 | 1.09 | 8.11/6.17 | 16.0/15.5 | 9.8/12.6 | 661/725 | 950/955 |
-| medium | 52.3–55.9 | 54.1–54.9 | **1.00** | 21.4/19.1 | 26.6/26.3 | 7.9/8.9 | 953/1169 | 1003/1003 |
+| model | ratio | peak WS MB (old/new) | exact |
+|---|---:|---|---|
+| tiny | 0.94–0.98 | 581/599 | 740/741 |
+| small | 1.00 (0.98 with every shape warm) | 661/715 | 950/955 |
+| medium | 0.99 | 956/981 | 1003/1003 |
 
-(the old engine's tiny median wandered 17–23 ms within this session; earlier sessions measured
-small at 1.04 and medium at 0.99.)
+What closed it (2026-10-16): preprocessing through `ImageTensor` (det 2.2 → 1.2 ms, rec 1.8 → 1.0 ms
+per image, same bits); per-shape compile about half the time and allocations; GPU const packing
+outside the GC heap (medium peak 1195 → 976 MB). With all shapes compiled ahead (`--warmup 100`)
+small runs 0.98x with every stage at parity or faster: what is left at `--warmup 2` is first-seen
+shape compiles overlapping the CPU stages.
 
 - **CPU**: at parity or faster in every configuration (small det is ~2x faster). Accuracy identical.
   Memory: per-key packing and plans (one build shared by concurrent workers) cut medium 16w peak
   1776 → 1388 MB, still above old (1262); medium 4w 1280 vs 1172, small 16w 812 vs 717. The live
   heap after a full GC is ~90 MB above old: same reachable weights, but twice the allocation churn
   per run (956 vs 510 MB) and per-shape statics.
-- **Vulkan**: device losses fixed (0 in 50 stress runs, was ~1 in 7). Every GPU stage is as fast
-  or faster than the old hand-fused path (det graph 10–25% faster). The remaining gap is the CPU
-  stages around them, 25–60% slower in Vulkan mode only (open, see decisions); medium is at
-  parity, tiny / small still behind. Accuracy equal or better. Peak working set +4–23%.
+- **Vulkan**: device losses fixed (0 in 50 stress runs, was ~1 in 7). At parity or faster on all
+  three models; accuracy equal or better. Peak working set +3% (tiny, medium) / +8% (small): the
+  managed heap and GC commit are now at or below old, the rest is native (about 16 MB fixed plus
+  8 MB per worker; not the const pool's memory type, the session staging slack or the cached
+  command buffers — each ruled out by experiment).
 - **Metal**: the macOS runners now run the Paddle smoke on Metal (device engaged, detected-line
   counts equal to the CPU) and `GpuOpTests` on M1; not timed against the old engine.
 
@@ -71,14 +77,16 @@ PSNR goldens identical.
 
 ## Known gaps / next steps
 
-1. **Paddle Vulkan tiny / small**: CPU stages slower next to the new GPU path (see decisions);
-   candidates: Paddle's fused operators (attention, SE, concat-resize, ...) as Paddle extensions,
-   the old engine's per-vendor kernels (UHD 770 8-lane gemm, Adreno gemm_nc_d / ds, RDNA conv_dw4a).
-2. **Memory** above old on Paddle (CPU ~+9–13% peak, Vulkan +4–23%): allocation churn per run,
-   per-shape caches.
-3. **Device re-creation after a loss** still fails with `ErrorIncompatibleDriver` on the B580
+1. **Paddle Vulkan native memory** +8% peak on small (+3% tiny / medium): unattributed native
+   growth during the run (~16 MB + ~8 MB per worker).
+2. **Paddle CPU memory** ~+9–13% peak: allocation churn per run, per-shape caches.
+3. **Untested devices**: the RTX 3080 Ti / Radeon 880M / Adreno 750 / UHD 770 routings ported from the
+   old engine (small-K `pw_dot`, Adreno `pw_dot` / `conv_kdot`, vec4 memory-bound kernels on every
+   device for Paddle) are emulated on the B580 only; the 880M direct-load `sg32d` GEMM and Paddle's
+   fused attention / SE kernels are not ported.
+4. **Device re-creation after a loss** still fails with `ErrorIncompatibleDriver` on the B580
    (no longer triggered).
-4. **Metal performance** unmeasured against the old engines (correctness checked in CI).
+5. **Metal performance** unmeasured against the old engines (correctness checked in CI).
 
 ## What closed most of the Vulkan gap (2026-10-14)
 

@@ -155,14 +155,24 @@ values silently; the Vulkan generic `gemm` had the same hole (it now runs those 
 in-place unary). `GpuOpTests` runs whole graphs on every GPU backend present — Metal on the
 `macos-26` (M1) runners — so a missing or wrong Metal kernel fails CI instead of falling back.
 
-## 2026-10-15 — Open: Paddle's CPU stages run slower next to the new Vulkan path
+## 2026-10-16 — Paddle's "slower CPU stages" in Vulkan mode: preprocessing and per-shape compiles
 
-In Paddle Vulkan runs the GPU stages (det / rec graphs) are as fast or faster than the old
-engine, but the CPU stages around them (det pre/post-processing, crop, rec preprocessing) take
-25–60% longer — only in Vulkan mode, also with 1 worker and fully warm. Ruled out: plan / graph
-compile (moved off the hot path, counted with `SIMDONNX_STATS`), GC, thread-pool minimums,
-spinning waits, CCD affinity, the staging memory type, the output copy, inline vs pooled CTC
-head. A tight loop over `Det()` alone is identical in every configuration, so it is an
-interaction of the pipeline (likely cache / memory-bandwidth contention with the driver's
-threads or the per-run command recording), not a kernel. This is most of the remaining tiny /
-small gap.
+The 2026-10-15 open item resolved into two causes. (1) Paddle's own resize + normalize was slower
+in that process than the same arithmetic in `Sdcb.SimdOnnx.Imaging.ImageTensor` (one fused
+3-channel write per pixel, ArrayPool scratch instead of per-session workspaces): det preprocessing
+2.2 → 1.2 ms, rec 1.8 → 1.0 ms per image, bit-identical output. (2) Every first-seen input shape
+compiles a plan and a Vulkan graph on the prefetch threads; that CPU work and its allocations
+(~1 MB per graph, GCs pause every thread) overlapped the crop / det post-processing. Compile time
+and allocations were halved (no RemoveAt / Insert in passes, no LINQ closures per node,
+allocation-free layout helpers, bias folds cached per source arrays) with plans proven identical
+(`bench --micro planhash`); with every shape compiled ahead, small runs 0.98x the old engine and
+every CPU stage matches it. Rec-width bucketing would remove most compiles but costs accuracy
+(rejected earlier), so first-seen shapes still cost ~1.2 ms of background CPU each.
+
+## 2026-10-16 — GPU constants are packed outside the GC heap
+
+Packing a model's weights for the GPU (tap-major, coopmat tiles, fp16) produced a float[] per
+const plus a byte[] per upload chunk — 200 MB of large-object garbage for Paddle medium, which
+the GC kept committed (+130 MB working set). Core packings now write into a reused native scratch
+and the upload bytes live in native memory freed after the copy; extensions keep the
+`Func<CValue, float[]>` packing API. Medium peak 1195 → 976 MB (old engine 956).
