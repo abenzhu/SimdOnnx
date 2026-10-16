@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using Sdcb.SimdOnnx.Engine;
 namespace Sdcb.SimdOnnx.Backends.Vulkan;
 
 /// <summary>
@@ -65,7 +66,7 @@ internal sealed class VkConstStore
     /// <paramref name="pack"/> receives the missing item indices and returns their offsets and host bytes.
     /// </summary>
     internal (VkBuffer buf, ulong off)[] Place(IReadOnlyList<(float[] src, int kind, int[] shape)> items,
-        Func<int[], (ulong[] offsets, byte[] host)> pack)
+        Func<int[], (ulong[] offsets, HostBytes host)> pack)
     {
         var placed = new (VkBuffer buf, ulong off)[items.Count];
         lock (_entries)
@@ -79,10 +80,14 @@ internal sealed class VkConstStore
             }
             if (missing.Count == 0) return placed;
             var (offs, host) = pack(missing.ToArray());
-            VkBuffer chunk = _dev.NewStorageBuffer((ulong)host.LongLength, hostVisible: _dev.CoherentDeviceLocal);
-            unsafe { fixed (byte* hp = host) _dev.Upload(chunk, hp, (ulong)host.LongLength); }
+            VkBuffer chunk;
+            using (host)
+            {
+                chunk = _dev.NewStorageBuffer(host.Length, hostVisible: _dev.CoherentDeviceLocal);
+                unsafe { _dev.Upload(chunk, host.Ptr, host.Length); }
+            }
             _chunks.Add(chunk);
-            Bytes += (ulong)host.LongLength;
+            Bytes += host.Length;
             for (int j = 0; j < missing.Count; j++)
             {
                 var (src, kind, shape) = items[missing[j]];

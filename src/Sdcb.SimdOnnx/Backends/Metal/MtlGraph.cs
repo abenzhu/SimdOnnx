@@ -83,7 +83,7 @@ internal sealed class MtlConstStore
 
     /// <summary>Buffer + byte offset of every item, uploading the missing ones as a new chunk.</summary>
     internal (MtlBuffer buf, ulong off)[] Place(IReadOnlyList<(float[] src, int kind, int[] shape)> items,
-        Func<int[], (ulong[] offsets, byte[] host)> pack)
+        Func<int[], (ulong[] offsets, HostBytes host)> pack)
     {
         var placed = new (MtlBuffer buf, ulong off)[items.Count];
         lock (_entries)
@@ -98,9 +98,10 @@ internal sealed class MtlConstStore
             if (missing.Count == 0) return placed;
             var (offs, host) = pack(missing.ToArray());
             MtlBuffer chunk;
-            unsafe { fixed (byte* hp = host) chunk = _dev.NewBuffer(hp, (nuint)host.Length); }
+            using (host)
+                unsafe { chunk = _dev.NewBuffer(host.Ptr, (nuint)host.Length); }
             _chunks.Add(chunk);
-            Bytes += (ulong)host.LongLength;
+            Bytes += host.Length;
             for (int j = 0; j < missing.Count; j++)
             {
                 var (src, kind, shape) = items[missing[j]];
