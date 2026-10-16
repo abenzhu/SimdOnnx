@@ -62,7 +62,51 @@ public class VkRouteTests
         Check(OnnxModel.Load(model), [1, t, k], route == "gemm_dot8" ? "pw_dot" : route, rng);
     }
 
-    private static void Check(OnnxModel m, int[] shape, string route, Random rng)
+    [SkippableTheory]
+    // the wide-subgroup no-coopmat routing (Adreno) emulated on this device:
+    // n, ic, oc, k, stride, pad, hardswish, expected dispatch prefix
+    [InlineData(1, 64, 96, 1, 1, 0, false, "pw_dot")]       // every 1x1 (any K, any size)
+    [InlineData(2, 256, 64, 1, 1, 0, true, "pw_dot")]
+    [InlineData(1, 32, 48, 3, 1, 1, false, "conv_dot_s1")]  // conv_dot's own case
+    [InlineData(1, 32, 48, 3, 2, 1, false, "conv_dot_s2")]
+    [InlineData(2, 32, 48, 3, 1, 1, false, "conv_kdot")]    // batched
+    [InlineData(1, 32, 48, 3, 1, 1, true, "conv_kdot")]     // hardswish epilogue
+    [InlineData(1, 16, 24, 5, 2, 2, false, "conv_kdot")]    // other kernel sizes
+    [InlineData(1, 8, 32, 7, 1, 3, true, "conv_kdot")]
+    public void WideDot_MatchesCpu(int n, int ic, int oc, int k, int stride, int pad, bool hswish, string route)
+    {
+        VkBackend? be = s_wideDot.Value;
+        Skip.If(be is null || !be.F16, "needs a Vulkan device with fp16 storage");
+        var rng = new Random(ic * 17 + oc + k);
+        var b = new OnnxBuilder().Input("x", n, ic, 11, 19)
+            .Init("W", Rand(rng, oc * ic * k * k, 0.3f), oc, ic, k, k)
+            .Init("B", Rand(rng, oc, 0.5f), oc)
+            .Node("Conv", ["x", "W", "B"], [hswish ? "c" : "y"],
+                ("kernel_shape", new[] { k, k }), ("pads", new[] { pad, pad, pad, pad }), ("strides", new[] { stride, stride }));
+        if (hswish)
+            b.Node("HardSigmoid", ["c"], ["g"], ("alpha", 1f / 6f), ("beta", 0.5f)).Node("Mul", ["c", "g"], ["y"]);
+        OnnxModel m = OnnxModel.Load(b.Output("y").Build());
+        int[] shape = [n, ic, 11, 19];
+        Assert.Contains(be!.GraphFor(m, shape).Dispatches, d => d.Name.StartsWith(route, StringComparison.Ordinal));
+        Check(m, shape, route, rng, be);
+    }
+
+    // a private device with the wide-subgroup flags (no coopmat, ConvDot): flipping them on the
+    // shared default device would re-route graphs other tests compile concurrently
+    private static readonly Lazy<VkBackend?> s_wideDot = new(() =>
+    {
+        try
+        {
+            var be = new VkBackend();
+            be.Dev.CoopMat16 = false;
+            be.Dev.CoopM8 = false;
+            be.Dev.ConvDot = true;
+            return be;
+        }
+        catch { return null; }
+    });
+
+    private static void Check(OnnxModel m, int[] shape, string route, Random rng, VkBackend? backend = null)
     {
         using var cpu = new InferenceSession(GraphCompiler.Compile(m, shape));
         float[] input = Rand(rng, cpu.Input.Length, 2f);
@@ -70,7 +114,7 @@ public class VkRouteTests
         cpu.Run();
         float[] want = cpu.Output.ToArray();
 
-        VkBackend be = VkBackend.Default;
+        VkBackend be = backend ?? VkBackend.Default;
         using var gpu = be.NewSession(m, shape);
         input.CopyTo(gpu.Input);
         gpu.Run();
@@ -88,7 +132,7 @@ public class VkRouteTests
         }
         Assert.True(maxd <= tol, $"{route}: max |gpu-cpu| {maxd} (tol {tol}) at {at}: gpu={got[at]} cpu={want[at]}");
         // numbers first: they still hold when a knob moves the routing
-        if (be.Dev.CoopM8 && be.F16)
+        if (backend is null && be.Dev.CoopM8 && be.F16)
         {
             VkGraphModel g = be.GraphFor(m, shape);
             Assert.Contains(g.Dispatches, d => d.Name.StartsWith(route + "(", StringComparison.Ordinal)

@@ -203,7 +203,8 @@ public sealed class VkGraphModel : IDisposable
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route RouteM8ConvCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
-        if (!M8Direct(dev, f16, plan)) return SmallDotConv(dev, f16, plan, n, cp) ? M8Route.Dot : M8Route.None;
+        if (!M8Direct(dev, f16, plan))
+            return SmallDotConv(dev, f16, plan, n, cp) ? M8Route.Dot : WideDotConv(dev, f16, plan, n, cp) ? M8Route.KDot : M8Route.None;
         if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
         if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return M8Route.None;
         if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return M8Route.None;
@@ -265,7 +266,28 @@ public sealed class VkGraphModel : IDisposable
         if (x.Shape.Length != 4) return false;
         int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0];
         long m = plan.Values[n.Out[0]].ElementCount / oc;
+        // wide-subgroup no-coopmat devices (Adreno): every 1x1 conv, the tiled GEMM is load-bound there
+        if (dev.ConvDot && plan.Options?.StagedCoopConv != true && Env.Flag("VK_SMALLDOT") != "0")
+            return ic % 4 == 0 && oc % 4 == 0;
         return ic % 4 == 0 && oc % 4 == 0 && ic <= 128 && m * oc <= SmallDotLimit(dev, plan);
+    }
+
+    /// <summary>Dense kxk convs on wide-subgroup no-coopmat devices (<see cref="VkDevice.ConvDot"/>,
+    /// Adreno) that conv_dot does not take (other kernel sizes, batches, hardswish): conv_kdot, as the
+    /// old OCR engine ran its convk_dot there instead of the shared-staged conv_tile.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+    private static bool WideDotConv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
+    {
+        if (!dev.ConvDot || !f16 || plan.Options?.StagedCoopConv == true || Env.Flag("VK_SMALLDOT") == "0") return false;
+        if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
+        if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return false;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
+        CValue x = plan.Values[n.In[0]];
+        if (x.Shape.Length != 4) return false;
+        int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0], nb = plan.Values[n.Out[0]].Shape[0];
+        if (ic % 4 != 0 || oc % 4 != 0) return false;
+        bool k33 = cp.Kernel[0] == 3 && cp.Kernel[1] == 3 && cp.Strides[0] == cp.Strides[1] && cp.Strides[0] is 1 or 2;
+        return !(k33 && nb == 1 && cp.Act != ActivationKind.HardSwish);   // conv_dot's own case
     }
 
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
