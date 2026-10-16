@@ -28,12 +28,12 @@ namespace Sdcb.SimdOnnx.Engine;
 /// </summary>
 public sealed class LayoutPlanner
 {
-    private readonly List<ExecNode> _nodes;
+    private readonly List<ExecNode> _nodes;                      // planned output, in order
     private readonly List<CValue> _values;
     private readonly List<int> _bufSize;
     private readonly Dictionary<int, int[]> _perm = [];          // dissolved transpose → logical perm
     private readonly Dictionary<(int v, string l), int> _relayout = [];
-    private int _at;                                             // index of the node being planned
+    private bool _drop;                                          // the node being planned dissolved
     private int _dissolved;
 
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
@@ -46,12 +46,20 @@ public sealed class LayoutPlanner
     public static void Run(List<ExecNode> nodes, List<CValue> values, List<int> bufSize,
         int inputValue, ref int outputValue, bool physicalIn, bool physicalOut)
     {
+        // streamed: relayouts land before the node being planned, dissolved transposes are dropped
+        // (one pass, no Insert / RemoveAt shifting the list)
+        ExecNode[] input = nodes.ToArray();
+        nodes.Clear();
         var lp = new LayoutPlanner(nodes, values, bufSize);
         CValue inV = values[inputValue];
         inV.Layout = physicalIn && inV.Shape.Length == 4 ? Layout.Nhwc : Layout.Identity(inV.Shape.Length);
 
-        for (lp._at = 0; lp._at < nodes.Count; lp._at++)
-            lp.Plan(nodes[lp._at]);
+        foreach (ExecNode n in input)
+        {
+            lp._drop = false;
+            lp.Plan(n);
+            if (!lp._drop) nodes.Add(n);
+        }
 
         lp.L(outputValue);
         if (!physicalOut)
@@ -59,10 +67,7 @@ public sealed class LayoutPlanner
             CValue ov = values[outputValue];
             int[] id = Layout.Identity(ov.Shape.Length);
             if (!Layout.Equivalent(ov.Shape, ov.Layout!, id))
-            {
-                lp._at = nodes.Count;
                 outputValue = lp.Relayout(outputValue, id);
-            }
         }
         // dead aliases (never consumed): identity layout so dumps never see null.
         // Resolving them could insert relayout nodes for values nobody reads.
@@ -106,7 +111,7 @@ public sealed class LayoutPlanner
         return cv.Layout = r;
     }
 
-    /// <summary>Inserts (before the current node) a physical copy of <paramref name="v"/> in layout <paramref name="target"/>.</summary>
+    /// <summary>Appends (before the current node) a physical copy of <paramref name="v"/> in layout <paramref name="target"/>.</summary>
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private int Relayout(int v, int[] target)
     {
@@ -118,7 +123,7 @@ public sealed class LayoutPlanner
         _bufSize.Add(checked((int)src.ElementCount));
         int id = _values.Count;
         _values.Add(new CValue { Name = src.Name + "@relayout", Shape = src.Shape, DType = 1, Buf = buf, Layout = target });
-        _nodes.Insert(_at++, new ExecNode
+        _nodes.Add(new ExecNode
         {
             Op = ExecOp.Transpose, In = [v], Out = [id],
             P = new TransposeP { Perm = Layout.PhysPerm(from, target) },
@@ -162,7 +167,7 @@ public sealed class LayoutPlanner
                 _values[o].Layout = null;
                 _perm[o] = ((TransposeP)n.P!).Perm;
                 L(o);
-                _nodes.RemoveAt(_at--);
+                _drop = true;
                 _dissolved++;
                 break;
             }

@@ -102,6 +102,13 @@ internal static class GraphCompiler
         public ExecPlan Run(ReadOnlySpan<int> inputShape, CompileOptions opt)
         {
             OnnxGraphData g = _m.Graph;
+            // sized up front: the emitters grow these one node / value at a time
+            _values.Capacity = g.Initializers.Count + 2 * g.Nodes.Count + 16;
+            _nodes.Capacity = g.Nodes.Count + 16;
+            _bufSize.Capacity = g.Nodes.Count + 16;
+#if !NETSTANDARD2_0
+            _byName.EnsureCapacity(g.Initializers.Count + 2 * g.Nodes.Count + 16);
+#endif
             foreach (OnnxTensorData t in g.Initializers)
             {
                 int[] dims = t.DimsArray();
@@ -351,6 +358,7 @@ internal static class GraphCompiler
             for (int i = 0; i < nodes.Count; i++)
             {
                 ExecNode a = nodes[i];
+                if (a is null) continue;   // fused away (compacted below)
                 bool can = a.P switch
                 {
                     ConvP c => c.Act == ActivationKind.None,
@@ -367,7 +375,11 @@ internal static class GraphCompiler
 
                 int u = -1, uses = 0;
                 for (int j = 0; j < nodes.Count && uses <= 1; j++)
-                    if (j != i && nodes[j].In.Any(iv => values[iv].Buf == ob)) { u = j; uses++; }
+                {
+                    if (j == i || nodes[j] is not { } m) continue;
+                    foreach (int iv in m.In)
+                        if (values[iv].Buf == ob) { u = j; uses++; break; }
+                }
                 if (uses != 1) continue;
                 ExecNode b = nodes[u];
                 if (b.In.Length != 1 || values[b.In[0]].Buf != ob) continue;
@@ -412,9 +424,9 @@ internal static class GraphCompiler
                 {
                     Redirect(nodes, values, b.Out[0], a.Out[0]);
                 }
-                nodes.RemoveAt(u);
-                if (u < i) i--;
+                nodes[u] = null!;   // one compaction instead of a RemoveAt per fusion
             }
+            nodes.RemoveAll(n => n is null);
         }
 
         /// <summary>
@@ -565,8 +577,11 @@ internal static class GraphCompiler
         internal static void Redirect(List<ExecNode> nodes, List<CValue> values, int oldValue, int newValue)
         {
             foreach (ExecNode m in nodes)
+            {
+                if (m is null) continue;   // a pass's fused-away slot
                 for (int i = 0; i < m.In.Length; i++)
                     if (m.In[i] == oldValue) m.In[i] = newValue;
+            }
             if (values[oldValue].Name.Length != 0 && values[newValue].Name.Length == 0)
                 values[newValue].Name = values[oldValue].Name;
         }
@@ -729,13 +744,14 @@ internal static class GraphCompiler
                         existing = gp.BiasValue;
                     }
                     else continue;
-                    float[] bias = (float[])cf.Clone();
-                    if (existing >= 0)
+                    float[]? prior = existing >= 0 ? values[existing].Floats! : null;
+                    float[] bias = model.Derive(values[cv].Name + "__bias|" + (existing >= 0 ? values[existing].Name : ""), cf, prior, () =>
                     {
-                        float[] e = values[existing].Floats!;
-                        for (int c = 0; c < ch; c++) bias[c] += e[c];
-                    }
-                    bias = model.Intern(values[cv].Name + "__bias|" + (existing >= 0 ? values[existing].Name : ""), bias);
+                        float[] sum = (float[])cf.Clone();
+                        if (prior is not null)
+                            for (int c = 0; c < ch; c++) sum[c] += prior[c];
+                        return sum;
+                    });
                     int bv = values.Count;
                     values.Add(new CValue { Name = values[cv].Name + "__bias", Shape = [ch], DType = 1, Floats = bias });
                     if (a.P is ConvP c2) { c2.BiasValue = bv; c2.Act = ep.Act; }
@@ -751,6 +767,13 @@ internal static class GraphCompiler
             nodes.RemoveAll(n => n is null);
         }
 
+        private static bool IsAliased(List<CValue> values, int v)
+        {
+            foreach (CValue c in values)
+                if (c.AliasOf == v) return true;
+            return false;
+        }
+
         /// <summary>Mul(x, HardSigmoid(x)) → HardSwish(x) and (CPU plans: no GPU conv has a swish epilogue)
         /// Mul(x, Sigmoid(x)) → Swish(x); conv/gemm epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
         [MethodImpl(MethodImplCompat.AggressiveOptimization)]
@@ -763,15 +786,17 @@ internal static class GraphCompiler
                 for (int k = 0; k < 2; k++)
                 {
                     int x = mul.In[k], g = mul.In[1 - k];
-                    int gi = nodes.FindIndex(m => m.Out.Length == 1 && m.Out[0] == g);
-                    if (gi < 0 || gi > i || nodes[gi].In[0] != x || g == outputValue || !SoleUse(nodes, g, i)
-                        || values.Any(v => v.AliasOf == g)) continue;
+                    // the gate's producer precedes the mul (topological order)
+                    int gi = i - 1;
+                    while (gi >= 0 && !(nodes[gi].Out.Length == 1 && nodes[gi].Out[0] == g)) gi--;
+                    if (gi < 0) continue;
                     ExecNode gate = nodes[gi];
                     ExecOp op;
                     if (gate.Op == ExecOp.Sigmoid && swish) op = ExecOp.Swish;
                     else if (gate.Op == ExecOp.HardSigmoid && gate.P is HardSigmoidP hp
                         && MathF.Abs(hp.Alpha - 1f / 6f) < 1e-6f && hp.Beta == 0.5f) op = ExecOp.HardSwish;
                     else continue;
+                    if (gate.In[0] != x || g == outputValue || !SoleUse(nodes, g, i) || IsAliased(values, g)) continue;
                     if (!values[mul.Out[0]].Shape.SequenceEqual(values[x].Shape)) continue;
                     nodes[i] = new ExecNode { Op = op, In = [x], Out = mul.Out, P = null, SrcNode = mul.SrcNode, Name = mul.Name };
                     nodes.RemoveAt(gi);
@@ -1001,6 +1026,13 @@ internal static class GraphCompiler
               "Min", "Max", "Equal", "Less", "Where", "ConstantOfShape", "Expand",
               "Identity", "Tile" };
 
+        private bool AllInputsInt(OnnxNodeData n)
+        {
+            foreach (string s in n.Inputs)
+                if (s.Length != 0 && !V(_byName[s]).IsInt) return false;
+            return true;
+        }
+
         [MethodImpl(MethodImplCompat.AggressiveOptimization)]
         private void EmitNode(OnnxNodeData n)
         {
@@ -1043,8 +1075,7 @@ internal static class GraphCompiler
 
             // int-only evaluation: if every present input is a const int tensor
             // and the op is elementwise/shape math, evaluate now.
-            bool allInt = n.Inputs.All(s => s.Length == 0 || (V(_byName[s]).IsInt));
-            if (allInt && IntOps.Contains(op))
+            if (IntOps.Contains(op) && AllInputsInt(n))
             {
                 EvalInt(n);
                 return;

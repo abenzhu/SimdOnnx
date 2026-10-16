@@ -61,8 +61,18 @@ public static class Layout
 
     /// <summary>Same storage order for <paramref name="shape"/> (size-1 dims ignored).</summary>
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
-    public static bool Equivalent(int[] shape, int[] a, int[] b) =>
-        a.Where(d => shape[d] != 1).SequenceEqual(b.Where(d => shape[d] != 1));
+    public static bool Equivalent(int[] shape, int[] a, int[] b)
+    {
+        // the non-1 dims in the same order (allocation-free: runs per plan node)
+        int i = 0, j = 0;
+        while (true)
+        {
+            while (i < a.Length && shape[a[i]] == 1) i++;
+            while (j < b.Length && shape[b[j]] == 1) j++;
+            if (i == a.Length || j == b.Length) return i == a.Length && j == b.Length;
+            if (a[i++] != b[j++]) return false;
+        }
+    }
 
     /// <summary>Physical perm relaying storage from layout <paramref name="from"/> to
     /// <paramref name="to"/>: out phys dim i = in phys dim q[i].</summary>
@@ -81,29 +91,36 @@ public static class Layout
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     public static int[]? Reshaped(int[] src, int[] l, int[] dst)
     {
-        int[] sd = Enumerable.Range(0, src.Length).Where(d => src[d] != 1).ToArray();
-        int[] td = Enumerable.Range(0, dst.Length).Where(d => dst[d] != 1).ToArray();
+        // allocation-free apart from the result (runs per alias resolution in every compile)
+        Span<int> sd = stackalloc int[src.Length], td = stackalloc int[dst.Length];
+        int ns = 0, nt = 0;
+        for (int d = 0; d < src.Length; d++) if (src[d] != 1) sd[ns++] = d;
+        for (int d = 0; d < dst.Length; d++) if (dst[d] != 1) td[nt++] = d;
         // storage rank of each non-1 source dim
-        int[] rank = new int[src.Length];
+        Span<int> rank = stackalloc int[src.Length];
+        rank.Clear();
         int r = 0;
         foreach (int d in l) if (src[d] != 1) rank[d] = r++;
 
-        double[] key = new double[dst.Length];
+        Span<double> key = stackalloc double[dst.Length];
+        key.Clear();
         int i = 0, j = 0;
-        while (i < sd.Length || j < td.Length)
+        while (i < ns || j < nt)
         {
-            if (i >= sd.Length || j >= td.Length) return null;   // element count mismatch
-            var gs = new List<int> { sd[i] }; long ps = src[sd[i++]];
-            var gt = new List<int> { td[j] }; long pt = dst[td[j++]];
+            if (i >= ns || j >= nt) return null;   // element count mismatch
+            // a group: source dims sd[i0..i) <-> target dims td[j0..j) with equal products
+            int i0 = i, j0 = j;
+            long ps = src[sd[i++]], pt = dst[td[j++]];
             while (ps != pt)
             {
-                if (ps < pt) { if (i >= sd.Length) return null; gs.Add(sd[i]); ps *= src[sd[i++]]; }
-                else { if (j >= td.Length) return null; gt.Add(td[j]); pt *= dst[td[j++]]; }
+                if (ps < pt) { if (i >= ns) return null; ps *= src[sd[i++]]; }
+                else { if (j >= nt) return null; pt *= dst[td[j++]]; }
             }
-            for (int k = 1; k < gs.Count; k++)
-                if (rank[gs[k]] != rank[gs[k - 1]] + 1) return null;
-            for (int k = 0; k < gt.Count; k++)
-                key[gt[k]] = rank[gs[0]] + k / (double)(gt.Count + 1);
+            for (int k = i0 + 1; k < i; k++)
+                if (rank[sd[k]] != rank[sd[k - 1]] + 1) return null;
+            int gt = j - j0;
+            for (int k = 0; k < gt; k++)
+                key[td[j0 + k]] = rank[sd[i0]] + k / (double)(gt + 1);
         }
         // size-1 target dims ride right behind their logical predecessor (or lead),
         // so an identity source yields an identity target
@@ -113,7 +130,15 @@ public static class Layout
             if (dst[e] != 1) prev = key[e];
             else key[e] = prev + 1e-3 * (e + 1) / (dst.Length + 1);
         }
-        return Enumerable.Range(0, dst.Length).OrderBy(e => key[e]).ThenBy(e => e).ToArray();
+        // order by key, then index (stable insertion sort; ranks are tiny)
+        int[] o = new int[dst.Length];
+        for (int e = 0; e < dst.Length; e++)
+        {
+            int p = e;
+            while (p > 0 && key[o[p - 1]] > key[e]) { o[p] = o[p - 1]; p--; }
+            o[p] = e;
+        }
+        return o;
     }
 
     public static string Str(int[]? l) => l is null ? "-" : "[" + string.Join(',', l) + "]";

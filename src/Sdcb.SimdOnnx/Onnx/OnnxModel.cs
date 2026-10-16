@@ -21,6 +21,22 @@ public sealed class OnnxModel
     /// merged biases, cast shape values): every per-shape compile gets the same array for the same
     /// contents, so packed-weight caches and GPU const pools match it by reference.
     /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (float[] A, float[]? B, float[] Result)> _derivedFrom = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// A constant computed from source arrays <paramref name="a"/> / <paramref name="b"/>, built once
+    /// per distinct pair: initializers are the same arrays in every compile, so a later compile gets
+    /// the earlier result without recomputing or comparing it; sources that are rebuilt per shape
+    /// (folded shape-dependent constants) are new arrays and miss.
+    /// </summary>
+    internal float[] Derive(string key, float[] a, float[]? b, Func<float[]> make)
+    {
+        if (_derivedFrom.TryGetValue(key, out var hit) && ReferenceEquals(hit.A, a) && ReferenceEquals(hit.B, b)) return hit.Result;
+        float[] r = Intern(key, make());
+        _derivedFrom[key] = (a, b, r);
+        return r;
+    }
+
     internal float[] Intern(string key, float[] values)
     {
         float[] cur = _derived.GetOrAdd(key, values);

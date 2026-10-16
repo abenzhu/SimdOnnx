@@ -183,6 +183,22 @@ public sealed class ExecNode
     /// <summary>Value ids read through op params rather than <see cref="In"/> (bias / residual operands).</summary>
     public IEnumerable<int> ParamRefs()
     {
+        // core params without an iterator (compile passes call this per node); extensions as before
+        if (Ext is null)
+            return P switch
+            {
+                ConvP { BiasValue: >= 0, AddValue: >= 0 } c => [c.BiasValue, c.AddValue],
+                ConvP { BiasValue: >= 0 } c => [c.BiasValue],
+                ConvP { AddValue: >= 0 } c => [c.AddValue],
+                GemmP { BiasValue: >= 0 } g => [g.BiasValue],
+                ConvTP { BiasValue: >= 0 } t => [t.BiasValue],
+                _ => Array.Empty<int>(),
+            };
+        return ParamRefsWithExt();
+    }
+
+    private IEnumerable<int> ParamRefsWithExt()
+    {
         switch (P)
         {
             case ConvP c: if (c.BiasValue >= 0) yield return c.BiasValue; if (c.AddValue >= 0) yield return c.AddValue; break;

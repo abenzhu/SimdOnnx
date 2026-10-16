@@ -106,6 +106,48 @@ internal static class Micro
                 }
                 break;
             }
+            case "planhash":
+            {
+                // fingerprint of compiled plans (nodes, params, layouts, arena), to prove compiler
+                // refactors plan-neutral: micro planhash <model.onnx> NxCxHxW[,NxCxHxW...]
+                var model = Sdcb.SimdOnnx.Onnx.OnnxModel.Load(args[1]);
+                foreach (string sh in args[2].Split(','))
+                {
+                    int[] s0 = sh.Split('x').Select(int.Parse).ToArray();
+                    foreach (PlanTarget target in new[] { PlanTarget.Cpu, PlanTarget.Vulkan, PlanTarget.Metal })
+                        foreach (bool phys in new[] { false, true })
+                        {
+                            var opt = new CompileOptions(Nhwc: true, PhysicalIo: phys, LogicalOutput: phys, Target: target);
+                            ExecPlan p = GraphCompiler.Compile(model, s0, opt);
+                            var sb = new System.Text.StringBuilder();
+                            string A(int[]? a) => a is null ? "-" : string.Join(",", a);
+                            foreach (ExecNode n in p.Nodes)
+                            {
+                                sb.Append(n.Op).Append('|').Append(A(n.In)).Append('|').Append(A(n.Out)).Append('|');
+                                if (n.P is not null)
+                                    foreach (var f in n.P.GetType().GetFields())
+                                    {
+                                        object? v = f.GetValue(n.P);
+                                        sb.Append(f.Name).Append('=').Append(v switch
+                                        {
+                                            int[] ia => A(ia), float[] fa => string.Join(",", fa), long[] la => string.Join(",", la),
+                                            PoolP pp => $"pool({A(pp.Kernel)};{A(pp.Strides)};{A(pp.Pads)};{pp.FuseRelu})",
+                                            _ => v?.ToString(),
+                                        }).Append(';');
+                                    }
+                                sb.Append(';');
+                            }
+                            foreach (CValue v in p.Values)
+                                sb.Append(A(v.Shape)).Append('|').Append(v.Buf).Append('|').Append(A(v.Layout)).Append('|').Append(v.AliasOf)
+                                    .Append('|').Append(v.Floats?.Length ?? -1).Append('|').Append(v.Floats is { Length: > 0 } fl ? fl.Sum() : 0).Append(';');
+                            sb.Append(A(p.BufSize)).Append('|').Append(A(p.BufOffset)).Append('|').Append(p.ArenaFloats)
+                                .Append('|').Append(p.InputValue).Append('|').Append(p.OutputValue);
+                            byte[] h = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
+                            Console.WriteLine($"{sh} {target} phys={phys} nodes={p.Nodes.Length} {Convert.ToHexString(h)[..16]}");
+                        }
+                }
+                break;
+            }
             case "runalloc":
             {
                 // managed bytes allocated per CPU run at a fixed shape: micro runalloc <model.onnx> NxCxHxW [threads]
