@@ -71,6 +71,10 @@ Consumers pin `Sdcb.SimdOnnx` exactly and restore it from the ProGet test feed t
 `nuget.config` with package-source mapping (only `Sdcb.SimdOnnx` comes from ProGet). Before
 merging to main: publish the engine to nuget.org and delete the ProGet source.
 
+Push with `--no-symbols`: the test feed accepts overwrites, and `dotnet nuget push` sends the
+`.snupkg` next to the `.nupkg` to the same endpoint, which replaced 0.1.0-preview.4 with its symbols
+package (pdbs only, no assemblies) on the first upload.
+
 ## 2026-10-14 — GPU consts pooled per model, not per identical const list
 
 The const store used to be shared only between graphs whose const lists matched exactly; the
