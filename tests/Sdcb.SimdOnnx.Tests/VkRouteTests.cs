@@ -76,12 +76,6 @@ public class VkRouteTests
         gpu.Run();
         float[] got = gpu.Output.ToArray();
 
-        if (be.Dev.CoopM8 && be.F16)
-        {
-            VkGraphModel g = be.GraphFor(m, shape);
-            Assert.Contains(g.Dispatches, d => d.Name.StartsWith(route + "(", StringComparison.Ordinal)
-                || d.Name.StartsWith(route + "_", StringComparison.Ordinal) && route == "im2col");
-        }
         Assert.Equal(want.Length, got.Length);
         float scale = want.Max(Math.Abs);
         float tol = 0.01f * scale + 0.02f;   // fp16 storage of inputs / weights / outputs
@@ -93,6 +87,13 @@ public class VkRouteTests
             if (d > maxd) { maxd = d; at = i; }
         }
         Assert.True(maxd <= tol, $"{route}: max |gpu-cpu| {maxd} (tol {tol}) at {at}: gpu={got[at]} cpu={want[at]}");
+        // numbers first: they still hold when a knob moves the routing
+        if (be.Dev.CoopM8 && be.F16)
+        {
+            VkGraphModel g = be.GraphFor(m, shape);
+            Assert.Contains(g.Dispatches, d => d.Name.StartsWith(route + "(", StringComparison.Ordinal)
+                || d.Name.StartsWith(route + "_", StringComparison.Ordinal) && route == "im2col");
+        }
     }
 
     private static float[] Rand(Random rng, int n, float scale) =>

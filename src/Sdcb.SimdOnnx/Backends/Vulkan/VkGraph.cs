@@ -203,7 +203,8 @@ public sealed class VkGraphModel : IDisposable
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route RouteM8ConvCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
     {
-        if (!M8Direct(dev, f16, plan) || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
+        if (!M8Direct(dev, f16, plan)) return SmallDotConv(dev, f16, plan, n, cp) ? M8Route.Dot : M8Route.None;
+        if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
         if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return M8Route.None;
         if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return M8Route.None;
         CValue x = plan.Values[n.In[0]];
@@ -231,14 +232,40 @@ public sealed class VkGraphModel : IDisposable
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private static M8Route RouteM8GemmCore(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, GemmP gp)
     {
-        if (!M8Direct(dev, f16, plan) || gp.TransB) return M8Route.None;
+        bool direct = M8Direct(dev, f16, plan);
+        if (!f16 || gp.TransB) return M8Route.None;
         CValue a = plan.Values[n.In[0]], b = plan.Values[n.In[1]];
         if (b.Floats is null || b.Shape.Length != 2 || a.Buf < 0) return M8Route.None;
         if (gp.Act is ActivationKind.Sigmoid) return M8Route.None;
         int k = a.Shape[^1], nn = b.Shape[1];
         if (a.PhysShape[^1] != k) return M8Route.None;
-        if (k % 4 == 0 && nn % 4 == 0 && k <= 128) return M8Route.Dot;
-        return k % 16 == 0 ? M8Route.Cm8 : M8Route.None;
+        if (k % 4 == 0 && nn % 4 == 0 && k <= 128
+            && (direct || a.ElementCount / k * nn <= SmallDotLimit(dev, plan))) return M8Route.Dot;
+        return direct && k % 16 == 0 ? M8Route.Cm8 : M8Route.None;
+    }
+
+    /// <summary>Largest M x N the small-K dot kernel takes on devices off the SG16 direct family
+    /// (old OCR engine): 32-lane coopmat devices 2^18 (lite: 2^16, a quarter), no coopmat 2^16 —
+    /// past that the tensor-core / tiled GEMM wins. Plans that opt into the staged coopmat build
+    /// (<see cref="CompileOptions.StagedCoopConv"/>, GcdrNet) keep their routing. SIMDONNX_VK_SMALLDOT=0 disables.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+    private static long SmallDotLimit(VkDevice dev, ExecPlan plan) =>
+        Env.Flag("VK_SMALLDOT") == "0" || plan.Options?.StagedCoopConv == true ? 0
+            : dev.CoopMat16 && !dev.CoopLite ? 1L << 18 : 1L << 16;
+
+    /// <summary>Small-K pointwise conv (cin &lt;= 128) through pw_dot on devices off the SG16
+    /// direct family, within <see cref="SmallDotLimit"/>.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+    private static bool SmallDotConv(VkDevice dev, bool f16, ExecPlan plan, ExecNode n, ConvP cp)
+    {
+        if (!f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
+        if (cp.Kernel[0] != 1 || cp.Kernel[1] != 1 || cp.Strides.Any(s => s != 1) || cp.Pads.Any(q => q != 0)) return false;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
+        CValue x = plan.Values[n.In[0]];
+        if (x.Shape.Length != 4) return false;
+        int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0];
+        long m = plan.Values[n.Out[0]].ElementCount / oc;
+        return ic % 4 == 0 && oc % 4 == 0 && ic <= 128 && m * oc <= SmallDotLimit(dev, plan);
     }
 
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
