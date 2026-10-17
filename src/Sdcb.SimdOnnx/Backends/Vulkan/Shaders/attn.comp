@@ -1,0 +1,77 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// Scaled dot-product attention over strided q / k / v views (any layout, a packed qkv tensor
+// included): o[n,h,t,:] = sum_s softmax_s(scale * q[n,h,t,:] . k[n,h,s,:]) v[n,h,s,:].
+// One invocation per query row (online softmax, fp32), workgroup = 64 queries of one (n, h);
+// k / v rows are staged through shared tiles (16 KB). Head sizes up to DMAX.
+// Strides / bases are in elements: per operand (base, sn, sh, st, sd); output likewise.
+#ifndef DMAX
+#define DMAX 32
+#endif
+#if DMAX > 32
+#define TILE 32u
+#else
+#define TILE 64u
+#endif
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Q { ET q[]; };
+layout(set = 0, binding = 1) readonly buffer K { ET k[]; };
+layout(set = 0, binding = 2) readonly buffer V { ET v[]; };
+layout(set = 0, binding = 3) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC {
+    uint T, S, D, DV, H;
+    uint qb, qn, qh, qt, qd;
+    uint kb, kn, kh, ks, kd;
+    uint vb, vn, vh, vs, vd;
+    uint ob, on, oh, ot, od;
+    float scale;
+} p;
+
+shared float kt[TILE * DMAX];
+shared float vt[TILE * DMAX];
+
+void main()
+{
+    uint lid = gl_LocalInvocationID.x, t = gl_GlobalInvocationID.x;
+    uint nh = gl_WorkGroupID.y, n = nh / p.H, h = nh % p.H;
+    bool valid = t < p.T;
+    float qr[DMAX], acc[DMAX];
+    uint qo = p.qb + n * p.qn + h * p.qh + (valid ? t : 0u) * p.qt;
+    for (uint d = 0u; d < DMAX; d++)
+    {
+        qr[d] = valid && d < p.D ? float(q[qo + d * p.qd]) * p.scale : 0.0;
+        acc[d] = 0.0;
+    }
+    uint ko = p.kb + n * p.kn + h * p.kh, vo = p.vb + n * p.vn + h * p.vh;
+    float m = -3.402823e38, l = 0.0;
+    for (uint s0 = 0u; s0 < p.S; s0 += TILE)
+    {
+        uint cnt = min(TILE, p.S - s0);
+        barrier();
+        for (uint e = lid; e < TILE * DMAX; e += 64u)
+        {
+            uint j = e / DMAX, d = e % DMAX;
+            bool in_ = j < cnt;
+            kt[e] = in_ && d < p.D ? float(k[ko + (s0 + j) * p.ks + d * p.kd]) : 0.0;
+            vt[e] = in_ && d < p.DV ? float(v[vo + (s0 + j) * p.vs + d * p.vd]) : 0.0;
+        }
+        barrier();
+        for (uint j = 0u; j < cnt; j++)
+        {
+            float sc = 0.0;
+            for (uint d = 0u; d < DMAX; d++) sc += qr[d] * kt[j * DMAX + d];
+            float mn = max(m, sc);
+            float corr = exp(m - mn), e = exp(sc - mn);
+            l = l * corr + e;
+            for (uint d = 0u; d < DMAX; d++) acc[d] = acc[d] * corr + e * vt[j * DMAX + d];
+            m = mn;
+        }
+    }
+    if (!valid) return;
+    float il = 1.0 / l;
+    uint oo = p.ob + n * p.on + h * p.oh + t * p.ot;
+    for (uint d = 0u; d < DMAX; d++) if (d < p.DV) o[oo + d * p.od] = ET(acc[d] * il);
+}

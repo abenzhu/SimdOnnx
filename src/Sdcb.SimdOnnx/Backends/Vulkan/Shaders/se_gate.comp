@@ -1,0 +1,48 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// Squeeze-excitation gate, one workgroup per image, after gap_part's fp32 per-chunk channel sums:
+// mean -> h = act1(W1 mean + b1) -> s = gate(W2 h + b2) + offset, written [img * c + ch].
+// W1 [r][c], W2 [c][r], biases fp32 (dummy when flags lacks them).
+// flags: bit0 b1, bit1 b2, bit2 relu on h, bit3 hard gate clamp(alpha z + beta, 0, 1) (else sigmoid).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer P { float part[]; };
+layout(set = 0, binding = 1) readonly buffer W1 { float w1[]; };
+layout(set = 0, binding = 2) readonly buffer B1 { float b1[]; };
+layout(set = 0, binding = 3) readonly buffer W2 { float w2[]; };
+layout(set = 0, binding = 4) readonly buffer B2 { float b2[]; };
+layout(set = 0, binding = 5) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint c, r, chunks, flags; float inv, alpha, beta, offset; } p;
+
+shared float mean[2048];
+shared float hid[1024];
+
+void main()
+{
+    uint lid = gl_LocalInvocationID.x, img = gl_WorkGroupID.x;
+    for (uint ch = lid; ch < p.c; ch += 256u)
+    {
+        float s = 0.0;
+        for (uint k = 0u; k < p.chunks; k++) s += part[(img * p.chunks + k) * p.c + ch];
+        mean[ch] = s * p.inv;
+    }
+    barrier();
+    for (uint j = lid; j < p.r; j += 256u)
+    {
+        float s = (p.flags & 1u) != 0u ? b1[j] : 0.0;
+        uint row = j * p.c;
+        for (uint k = 0u; k < p.c; k++) s += w1[row + k] * mean[k];
+        hid[j] = (p.flags & 4u) != 0u ? max(s, 0.0) : s;
+    }
+    barrier();
+    for (uint ch = lid; ch < p.c; ch += 256u)
+    {
+        float z = (p.flags & 2u) != 0u ? b2[ch] : 0.0;
+        uint row = ch * p.r;
+        for (uint j = 0u; j < p.r; j++) z += w2[row + j] * hid[j];
+        float g = (p.flags & 8u) != 0u ? clamp(p.alpha * z + p.beta, 0.0, 1.0) : 1.0 / (1.0 + exp(-z));
+        o[img * p.c + ch] = ET(g + p.offset);
+    }
+}

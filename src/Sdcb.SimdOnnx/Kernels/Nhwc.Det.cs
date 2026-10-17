@@ -165,19 +165,74 @@ internal static unsafe partial class Nhwc
 
     /// <summary>Nearest resize, asymmetric coordinates, floor rounding: src = floor(dst / scale).</summary>
     public static void ResizeNearest(ReadOnlySpan<float> src, int ih, int iw, int c,
-        Span<float> dst, int oh, int ow, float sy, float sx)
+        Span<float> dst, int oh, int ow, float sy, float sx, ReadOnlySpan<float> add = default, bool addRelu = false)
     {
+        if (!add.IsEmpty && add.Length != dst.Length)
+            throw new NotSupportedException($"resize addend has {add.Length} elems, expected {dst.Length}.");
         int[] xs = new int[ow];
         for (int x = 0; x < ow; x++) xs[x] = Math.Min((int)MathF.Floor(x / sx), iw - 1);
-        fixed (float* sp0 = src, dp0 = dst)
+        bool hasAdd = !add.IsEmpty, v = V128;
+        fixed (float* sp0 = src, dp0 = dst, ap0 = add)
         {
-            float* sp = sp0, dp = dp0;
+            float* sp = sp0, dp = dp0, ap = ap0;
             For(oh, (long)oh * ow * c, y =>
             {
                 int ys = Math.Min((int)MathF.Floor(y / sy), ih - 1);
                 float* srow = sp + (long)ys * iw * c, orow = dp + (long)y * ow * c;
-                for (int x = 0; x < ow; x++) Copy(srow + (long)xs[x] * c, orow + (long)x * c, c);
+                if (!hasAdd)
+                {
+                    for (int x = 0; x < ow; x++) Copy(srow + (long)xs[x] * c, orow + (long)x * c, c);
+                    return;
+                }
+                // FPN top-down merge: out = up(x) + [relu](lateral)
+                float* arow = ap + (long)y * ow * c;
+                for (int x = 0; x < ow; x++)
+                {
+                    float* s = srow + (long)xs[x] * c, a = arow + (long)x * c, o = orow + (long)x * c;
+                    int ch = 0;
+                    if (v)
+                        for (; ch + 4 <= c; ch += 4)
+                        {
+                            V4 av = Vector128.Load(a + ch);
+                            if (addRelu) av = Vector128.Max(av, V4.Zero);
+                            (Vector128.Load(s + ch) + av).Store(o + ch);
+                        }
+                    for (; ch < c; ch++) o[ch] = s[ch] + (addRelu ? MathF.Max(a[ch], 0f) : a[ch]);
+                }
             });
+        }
+    }
+
+    /// <summary>
+    /// Squeeze-excitation gate of one image (<see cref="ExecOp.ChannelGate"/>): channel means of the NHWC
+    /// image (<paramref name="nhwc"/>) or of its NCHW planes, then the two small fully connected layers.
+    /// </summary>
+    public static void ChannelGate(ReadOnlySpan<float> src, int hw, int c, bool nhwc, ReadOnlySpan<float> w1,
+        ReadOnlySpan<float> b1, ReadOnlySpan<float> w2, ReadOnlySpan<float> b2, int r, ChannelGateP p, Span<float> dst)
+    {
+        float[] mean = new float[c], hid = new float[r];
+        if (nhwc) GlobalAvgPool(src, hw, c, mean);
+        else
+            for (int ch = 0; ch < c; ch++)
+            {
+                float s = 0;
+                foreach (float f in src.Slice(ch * hw, hw)) s += f;
+                mean[ch] = s / hw;
+            }
+        for (int j = 0; j < r; j++)
+        {
+            float s = b1.IsEmpty ? 0f : b1[j];
+            ReadOnlySpan<float> row = w1.Slice(j * c, c);
+            for (int k = 0; k < c; k++) s += row[k] * mean[k];
+            hid[j] = p.Act1 == ActivationKind.Relu ? MathF.Max(s, 0f) : s;
+        }
+        for (int ch = 0; ch < c; ch++)
+        {
+            float z = b2.IsEmpty ? 0f : b2[ch];
+            ReadOnlySpan<float> row = w2.Slice(ch * r, r);
+            for (int j = 0; j < r; j++) z += row[j] * hid[j];
+            float g = p.Hard ? Math.Clamp(z * p.Alpha + p.Beta, 0f, 1f) : 1f / (1f + MathF.Exp(-z));
+            dst[ch] = g + p.Offset;
         }
     }
 

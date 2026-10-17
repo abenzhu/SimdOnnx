@@ -13,7 +13,7 @@
 // A fp16 [M][K] rows (1x1 conv input / im2col matrix / Gemm A), W fp16 [Npad][K] (rows padded
 // to 128), K % 16 == 0. A rows past M up to the tile end are read (the binding covers them;
 // their outputs are masked). Tile: (SGY * TSM * 8) x (SGX * TSN * 16), NTHR = SGX*SGY*16.
-// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish)
+// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish, 4 swish)
 #ifndef TSM
 #define TSM 4u
 #endif
@@ -59,6 +59,7 @@ float actf(float v, uint act)
     if (act == 1u) return max(v, 0.0);
     if (act == 2u) return 0.5 * v * (1.0 + ferf(v * 0.7071067811865475));
     if (act == 3u) return v * clamp(v * (1.0 / 6.0) + 0.5, 0.0, 1.0);
+    if (act == 4u) return v / (1.0 + exp(-v));
     return v;
 }
 

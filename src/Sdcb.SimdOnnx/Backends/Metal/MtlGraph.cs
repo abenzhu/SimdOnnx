@@ -211,6 +211,10 @@ public sealed class MtlGraphModel : IDisposable
                 case LnP:
                     Need(n.In[0], CK.Raw); Need(n.In[1], CK.F32); Need(n.In[2], CK.F32);
                     break;
+                case ChannelGateP gp:
+                    Need(n.In[1], CK.F32); Need(n.In[2], CK.F32);
+                    Need(gp.B1, CK.F32); Need(gp.B2, CK.F32);
+                    break;
                 case ConvTP tp:
                     Need(n.In[1], CK.ConvTW);
                     Need(tp.BiasValue, CK.F32);
@@ -325,6 +329,22 @@ public sealed class MtlGraphModel : IDisposable
     public static uint[] U(params int[] v) { uint[] u = new uint[v.Length]; for (int i = 0; i < v.Length; i++) u[i] = (uint)v[i]; return u; }
 
     public static uint G(uint n) => (n + 255) / 256;
+
+    /// <summary>(base, n, h, t, d) element offsets of a strided attention operand (see <see cref="AttentionP"/>).</summary>
+    internal static uint[] StridedView(CValue v, int[] dims, int fix, int fixIndex)
+    {
+        int[] l = v.Layout ?? Engine.Layout.Identity(v.Shape.Length), ps = v.PhysShape;
+        long Stride(int axis)
+        {
+            long s = 1;
+            for (int j = ps.Length - 1; j >= 0 && l[j] != axis; j--) s *= ps[j];
+            return s;
+        }
+        uint[] r = new uint[5];
+        for (int j = 0; j < 4; j++) r[1 + j] = dims[j] < 0 ? 0u : (uint)Stride(dims[j]);
+        r[0] = fix < 0 ? 0u : (uint)(fixIndex * Stride(fix));
+        return r;
+    }
 
     /// <summary>
     /// Broadcast strides (padded rank-4, storage order of the output) of operand
@@ -719,11 +739,44 @@ public sealed class MtlGraphModel : IDisposable
             {
                 var p = (ResizeNearestP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
+                bool hasAdd = n.In.Length > 1;
+                if (hasAdd) RequireNhwc(n.In[1]);
                 int[] si = nhwcIn(0), so = nhwcOut();
                 bool v4 = si[3] % 4 == 0;
-                yield return ND(v4 ? "nearest4" : "nearest", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2]], p.Scales[2], p.Scales[3]),
+                yield return ND(v4 ? "nearest4" : "nearest", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
+                    PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
+                        (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u)], p.Scales[2], p.Scales[3]),
                     G((uint)nOut() / (v4 ? 4u : 1u)), name: "nearest");
+                break;
+            }
+
+            case ExecOp.ChannelGate:
+            {
+                var p = (ChannelGateP)n.P!;
+                RequireNhwc(n.In[0]);
+                int[] si = nhwcIn(0);
+                uint hw = (uint)si[1] * (uint)si[2], c = (uint)si[3], r = (uint)V[n.In[1]].Shape[0];
+                uint gflags = (p.B1 >= 0 ? 1u : 0u) | (p.B2 >= 0 ? 2u : 0u) | (p.Act1 == ActivationKind.Relu ? 4u : 0u) | (p.Hard ? 8u : 0u);
+                yield return ND("se_gate",
+                    [Bind(n.In[0]), Bind(n.In[1], CK.F32), B(p.B1, CK.F32), Bind(n.In[2], CK.F32), B(p.B2, CK.F32), Bind(n.Out[0])],
+                    PcOfF([c, r, hw, gflags], 1f / hw, p.Alpha, p.Beta, p.Offset), (uint)si[0], name: "se_gate");
+                break;
+            }
+
+            case ExecOp.Attention:
+            {
+                var p = (AttentionP)n.P!;
+                CValue o = V[n.Out[0]];
+                int rank = o.Shape.Length;
+                int[] oDims = rank == 4 ? [0, 1, 2, 3] : [-1, 0, 1, 2];
+                uint T = (uint)o.Shape[^2], DV = (uint)o.Shape[^1], H = (uint)o.Shape[^3], N = rank == 4 ? (uint)o.Shape[0] : 1u;
+                uint S = (uint)V[n.In[1]].Shape[p.Dims[1][2]], D = (uint)V[n.In[0]].Shape[p.Dims[0][3]];
+                var pc = new List<uint> { T, S, D, DV, H };
+                for (int i = 0; i < 3; i++) pc.AddRange(StridedView(V[n.In[i]], p.Dims[i], p.FixAxis[i], p.FixIndex[i]));
+                pc.AddRange(StridedView(o, oDims, -1, 0));
+                yield return ND(D <= 32 && DV <= 32 ? "attn" : "attn_d64",
+                    [Bind(n.In[0]), Bind(n.In[1]), Bind(n.In[2]), Bind(n.Out[0])],
+                    PcOfF([.. pc], p.Scale), (T + 255) / 256, N * H, name: "attn");
                 break;
             }
 

@@ -19,6 +19,9 @@ for %%f in ("%DIR%\*.comp") do (
         "%GLSLC%" %O% -DF16 "%%f" -o "%%~dpnf_h.spv" || exit /b 1
     )
 )
+rem attention: head sizes 33..64 (attn.comp itself keeps 32-float query / accumulator rows)
+"%GLSLC%" %O% -DDMAX=64 "%DIR%\attn.comp" -o "%DIR%\attn_d64.spv" || exit /b 1
+"%GLSLC%" %O% -DF16 -DDMAX=64 "%DIR%\attn.comp" -o "%DIR%\attn_d64_h.spv" || exit /b 1
 rem conv_tile specialization variants (constant kernel/stride -> fast index math)
 call :conv "" ""   || exit /b 1
 call :conv -DF16 _h || exit /b 1
