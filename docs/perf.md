@@ -80,13 +80,34 @@ PSNR goldens identical.
 1. **Paddle Vulkan native memory** +8% peak on small (+3% tiny / medium): unattributed native
    growth during the run (~16 MB + ~8 MB per worker).
 2. **Paddle CPU memory** ~+9–13% peak: allocation churn per run, per-shape caches.
-3. **Untested devices**: the RTX 3080 Ti / Radeon 880M / Adreno 750 / UHD 770 routings ported from the
-   old engine (small-K `pw_dot`, Adreno `pw_dot` / `conv_kdot`, vec4 memory-bound kernels on every
-   device for Paddle) are emulated on the B580 only; the 880M direct-load `sg32d` GEMM and Paddle's
-   fused attention / SE kernels are not ported.
+3. **Devices**: RTX 3080 Ti and Snapdragon 8 Gen 3 measured on the real hardware
+   (`docs/devices/`); Radeon 880M and UHD 770 pending. The 880M direct-load `sg32d` GEMM is not ported.
+   Squeeze-excitation, attention and nearest-upsample + add are engine fusions now (2026-10-17).
+   Open on the 3080 Ti: GcdrNet Vulkan e2e 1600x1152 8.9 → 9.8 ms (3200x2304 1.02x) although its
+   GPU kernel time is 34% lower (14.3 → 9.4 ms) — host-side cost (staging memory type, upload /
+   download path), to probe there with `SIMDONNX_VK_STAGE_WC=0`; Paddle medium Vulkan 1.03x.
 4. **Device re-creation after a loss** still fails with `ErrorIncompatibleDriver` on the B580
    (no longer triggered).
 5. **Metal performance** unmeasured against the old engines (correctness checked in CI).
+
+## Engine fusions for SE / attention / FPN merge (2026-10-17)
+
+Paddle, interleaved 3 rounds against the old engine, SimdOnnx with the fusions (consumers at
+`UseLocalSimdOnnx=true`):
+
+| case | old | new | ratio | det graph | rec graph | peak WS MB | exact |
+|---|---:|---:|---:|---|---|---|---|
+| tiny vulkan 4w | 21.7 | 21.0 | **0.97** | 6.09/3.98 | 6.38/5.83 | 584/605 | 740/743 |
+| small vulkan 4w | 33.1 | 32.2 | **0.97** | 7.60/5.88 | 15.97/14.66 | 665/715 | 950/956 |
+| medium vulkan 4w | 55.8 | 52.4 | **0.94** | 21.49/18.52 | 27.08/24.81 | 958/994 | 1003/1003 |
+| tiny cpu 4w | 64.5 | 58.5 | **0.91** | 29.3/26.6 | 79.6/76.5 | 518/556 | 742/742 |
+| small cpu 1w | 407.5 | 317.5 | **0.78** | 96.9/49.7 | 274.4/238.2 | 603/658 | 950/950 |
+| small cpu 4w | 202.4 | 136.5 | **0.67** | 96.9/46.2 | 320.4/276.4 | 652/735 | 950/950 |
+| medium cpu 4w | 546.0 | 529.0 | **0.97** | 230.2/207.8 | 1086.0/1085.7 | 1175/1282 | 1004/1004 |
+
+Graph-only on the B580 (det 960x736, fusions on / off): det 3.11 → 2.86 ms, small det 5.20 → 4.79,
+medium det 19.66 → 19.33; 162 → 112 dispatches. GcdrNet plans are unchanged (planhash) and its
+Vulkan e2e stays at 16.5 ms.
 
 ## What closed most of the Vulkan gap (2026-10-14)
 

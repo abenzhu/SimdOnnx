@@ -6,7 +6,7 @@
 //   O[b, px, n] = act(sum_{tap, ci} X[b, px(tap), ci] * W[tap*cin + ci, n] + bias[n] + R[b, px, n])
 // W is k-major [K][N] (ConstKind.ConvW). Requires cin % 4 == 0 and N % 4 == 0; zero padding.
 // Dispatch: x * y cover ceil(M/4) * N/4 invocations (256 per group), z = batch.
-// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish)
+// flags: bit0 bias, bit1 residual, bits4-6 act (1 relu, 2 gelu, 3 hardswish, 4 swish)
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer X { f16vec4 x[]; };
@@ -34,6 +34,7 @@ vec4 actf(vec4 v, uint act)
     if (act == 1u) return max(v, vec4(0.0));
     if (act == 2u) return 0.5 * v * (vec4(1.0) + vec4(ferf(v.x * 0.70710678), ferf(v.y * 0.70710678), ferf(v.z * 0.70710678), ferf(v.w * 0.70710678)));
     if (act == 3u) return v * clamp(v * (1.0 / 6.0) + 0.5, vec4(0.0), vec4(1.0));
+    if (act == 4u) return v / (vec4(1.0) + exp(-v));
     return v;
 }
 

@@ -30,6 +30,8 @@ public enum ExecOp
     HardSwish,       // x * clamp(x / 6 + 0.5, 0, 1) (CPU plans: HardSigmoid + Mul)
     Swish,           // x * sigmoid(x) (CPU plans: Sigmoid + Mul)
     Ext,             // consumer-registered operator (ExecNode.Ext)
+    ChannelGate,     // squeeze-excitation gate: GAP -> 1x1 conv (+act) -> 1x1 conv -> (hard) sigmoid, [N,C,1,1]
+    Attention,       // softmax(scale * q k^T) v over strided q / k / v views (GPU plans)
 }
 
 public enum ActivationKind { None, Relu, Sigmoid, Gelu, HardSwish, Swish }
@@ -109,6 +111,37 @@ public sealed class ConvTP
 public sealed class ResizeNearestP
 {
     public required float[] Scales;
+    // optional same-shape addend in In[1] (NHWC plans): out = resize(x) + [relu](In[1])
+    public bool AddRelu;
+}
+
+/// <summary>
+/// Squeeze-excitation gate (In = [x, W1, W2]; W1 [R,C,1,1], W2 [C,R,1,1]):
+/// s[n,c] = gate(b2[c] + Σ_r W2[c,r]·act1(b1[r] + Σ_k W1[r,k]·mean_hw(x[n,k]))) + Offset, out [N,C,1,1].
+/// </summary>
+public sealed class ChannelGateP
+{
+    public int B1 = -1, B2 = -1;    // [R] / [C] bias value ids, -1 none
+    public ActivationKind Act1;     // None / Relu
+    public bool Hard;               // clamp(Alpha·z + Beta, 0, 1), else sigmoid(z)
+    public float Alpha, Beta;
+    public float Offset;            // 1 when x·s + x folded into x·(s + 1)
+}
+
+/// <summary>
+/// Scaled dot-product attention, out[n,h,t,:] = Σ_s softmax_s(Scale · q[n,h,t,:]·k[n,h,s,:]) v[n,h,s,:]
+/// ([N,H,T,D] logical). In = [q, k, v] are views of earlier values: operand i reads In[i] at
+/// logical index Dims[i] = the axes holding (n, h, t|s, d) (-1: size 1), with axis FixAxis[i]
+/// (if >= 0) pinned to FixIndex[i]; any physical layout.
+/// </summary>
+public sealed class AttentionP
+{
+    public float Scale = 1f;
+    public required int[][] Dims;
+    public required int[] FixAxis;
+    public required int[] FixIndex;
+    /// <summary>Output logical->physical layout chosen at fusion (its consumer's transpose dissolves).</summary>
+    public int[]? OutLayout;
 }
 
 public sealed class PadP
@@ -192,6 +225,9 @@ public sealed class ExecNode
                 ConvP { AddValue: >= 0 } c => [c.AddValue],
                 GemmP { BiasValue: >= 0 } g => [g.BiasValue],
                 ConvTP { BiasValue: >= 0 } t => [t.BiasValue],
+                ChannelGateP { B1: >= 0, B2: >= 0 } s => [s.B1, s.B2],
+                ChannelGateP { B1: >= 0 } s => [s.B1],
+                ChannelGateP { B2: >= 0 } s => [s.B2],
                 _ => Array.Empty<int>(),
             };
         return ParamRefsWithExt();

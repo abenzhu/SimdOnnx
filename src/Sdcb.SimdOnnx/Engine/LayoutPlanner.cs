@@ -189,11 +189,20 @@ public sealed class LayoutPlanner
                     if (cp.AddValue >= 0) cp.AddValue = Need(cp.AddValue, Layout.Nhwc);
                 }
                 Need(n, 0, Layout.Nhwc);
-                if (n.Op == ExecOp.ResizeBilinear)
+                if (n.Op is ExecOp.ResizeBilinear or ExecOp.ResizeNearest)
                     for (int k = 1; k < n.In.Length; k++) Need(n, k, Layout.Nhwc);   // fused addend
                 SetOut(n, Layout.Nhwc);
                 break;
             }
+            case ExecOp.ChannelGate:
+                Need(n, 0, Layout.Nhwc);
+                SetOut(n, Layout.Nhwc);
+                break;
+            case ExecOp.Attention:
+                // q / k / v are read through their strides, whatever their layout
+                foreach (int v in n.In) L(v);
+                SetOut(n, ((AttentionP)n.P!).OutLayout ?? Layout.Identity(_values[n.Out[0]].Shape.Length));
+                break;
             case ExecOp.Ext:
                 n.Ext!.PlanLayout(this, n);
                 break;

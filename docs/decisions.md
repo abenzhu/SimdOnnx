@@ -176,3 +176,30 @@ const plus a byte[] per upload chunk — 200 MB of large-object garbage for Padd
 the GC kept committed (+130 MB working set). Core packings now write into a reused native scratch
 and the upload bytes live in native memory freed after the copy; extensions keep the
 `Func<CValue, float[]>` packing API. Medium peak 1195 → 976 MB (old engine 956).
+
+## 2026-10-17 — SE, attention and FPN merges are engine fusions, not Paddle extensions
+
+The old OCR engine had hand-fused Vulkan kernels for squeeze-excitation (`se_fused`), attention
+(`attn`) and the FPN top-down merge (`resize4add`, `catresize`). They are not OCR-specific — every
+MobileNetV3 / PP-LCNet / EfficientNet has SE blocks, every transformer has attention, every FPN /
+U-Net decoder has upsample + add — so they became structural fusions in `GraphCompiler` with
+kernels on every backend instead of SimdPaddleOCR extensions:
+
+- `ExecOp.ChannelGate`: GlobalAvgPool → 1x1 conv (+relu) → 1x1 conv → HardSigmoid / Sigmoid,
+  matched through the zero-copy reshapes paddle2onnx puts between the convs (reader counts are per
+  buffer, so a read through any view counts). `x + x·s` (RSE-FPN) folds into `x·(s + 1)`. Vulkan:
+  `gap_part` + `se_gate` (2 dispatches instead of 5–6), Metal `se_gate`, CPU a scalar FC.
+- `ExecOp.Attention`: `MatMul(Softmax([scale·] MatMul(q, kᵀ)), v)`, q / k / v followed back through
+  transposes, a packed-qkv single-index slice, squeeze views and scalar muls, read in place through
+  strides (`AttentionP`); the consumer's `[0,2,1,3]` transpose dissolves into the output layout. GPU
+  plans only (CPU keeps the MatMul / Softmax kernels, which are already cache-friendly there).
+  Head size up to 64; online softmax with k / v tiles in shared memory. On the B580 it is a wash
+  for SVTR (T = 40, 2 blocks): the win is 20 fewer dispatches and no relayout copies.
+- `ResizeNearest` takes an addend like bilinear (`FuseResizeAdd`): one pass per FPN level.
+- Swish (`x·sigmoid(x)`) fuses on GPU plans too. `pw_dot` / `conv_kdot` / `gemm_cm8` apply it in the
+  epilogue; `conv_cm` does not (an exp branch there cost GcdrNet's staged convs ~0.6%), so those
+  convs and the generic kernels run a trailing in-place pass.
+
+Not moved: GcdrNet's `UpHead` (resize → add → 1x1 conv, its full-resolution intermediate never
+stored) stays a GcdrNet extension until a second model needs it; its AVX-512 / NEON / WASM kernels
+are tuned to that network. Paddle's DB post-processing stays OCR code.

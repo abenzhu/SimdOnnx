@@ -3,7 +3,7 @@ using System.Text;
 namespace Sdcb.SimdOnnx.Tests;
 
 /// <summary>
-/// Minimal ONNX protobuf writer for single-node test graphs (fp32 tensors, int / ints / float
+/// Minimal ONNX protobuf writer for single-node test graphs (fp32 / int64 tensors, int / ints / float / string
 /// attributes). Only the fields the engine's reader consumes are emitted.
 /// </summary>
 internal sealed class OnnxBuilder
@@ -26,6 +26,19 @@ internal sealed class OnnxBuilder
         return this;
     }
 
+    public OnnxBuilder InitI64(string name, long[] data, params int[] dims)
+    {
+        var t = new Pb();
+        foreach (int d in dims) t.Varint(1, (ulong)d);
+        t.Varint(2, 7);                      // INT64
+        t.String(8, name);
+        byte[] raw = new byte[data.Length * 8];
+        Buffer.BlockCopy(data, 0, raw, 0, raw.Length);
+        t.Bytes(9, raw);
+        _inits.Add(t.ToArray());
+        return this;
+    }
+
     public OnnxBuilder Node(string op, string[] inputs, string[] outputs, params (string name, object value)[] attrs)
     {
         var n = new Pb();
@@ -42,6 +55,7 @@ internal sealed class OnnxBuilder
                 case float f: a.Fixed32(2, BitConverter.SingleToInt32Bits(f)); a.Varint(20, 1); break;
                 case int i: a.Varint(3, (ulong)(long)i); a.Varint(20, 2); break;
                 case int[] ints: foreach (int v in ints) a.Varint(8, (ulong)(long)v); a.Varint(20, 7); break;
+                case string str: a.String(4, str); a.Varint(20, 3); break;
                 default: throw new ArgumentException(name);
             }
             n.Message(5, a.ToArray());

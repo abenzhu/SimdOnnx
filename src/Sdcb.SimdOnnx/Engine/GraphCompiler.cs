@@ -277,7 +277,7 @@ internal static class GraphCompiler
             // Relu/Sigmoid/elementwise-tail fusions
             FuseBiasAdd(model, nodes, values, outputValue);
             FuseLayerNorm(nodes, values);
-            FuseGatedAct(nodes, values, outputValue, swish: !opt.Gpu);
+            FuseGatedAct(nodes, values, outputValue);
             for (int i = 0; i + 1 < nodes.Count; i++)
             {
                 ExecNode a = nodes[i], b = nodes[i + 1];
@@ -319,6 +319,282 @@ internal static class GraphCompiler
             FuseConvTBias(nodes, values);
             CommuteActBeforeTranspose(nodes, values);
             FuseLateAct(nodes, values);
+            if (Env.Flag("NOFUSE_SE") != "1") FuseChannelGate(nodes, values, outputValue);
+            if (opt.Gpu && Env.Flag("NOFUSE_ATTN") != "1" && FuseAttention(nodes, values, outputValue))
+                Prune(nodes, values, outputValue);   // the q / k / v slices and transposes it reads through
+        }
+
+        /// <summary>
+        /// Squeeze-excitation: GlobalAvgPool -> 1x1 Conv (+relu) -> 1x1 Conv -> HardSigmoid / Sigmoid becomes
+        /// one <see cref="ExecOp.ChannelGate"/> (every [N,*,1,1] intermediate read by the chain only), and
+        /// Add(x, Mul(x, s)) of such a gate folds into Mul(x, s + 1): one full-size pass less.
+        /// </summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+        private static void FuseChannelGate(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        {
+            var bx = new BufIndex(nodes, values, outputValue);
+            static bool Pointwise(ConvP c) => c.Group == 1 && c.Kernel is [1, 1] && c.Strides is [1, 1]
+                && c.Pads.All(q => q == 0) && c.Dilations.All(d => d == 1) && c.AddValue < 0 && c.Pool is null;
+            // the producer of a value read through any zero-copy view (paddle2onnx reshapes between the SE
+            // convs), when that read is the buffer's only one and the view keeps the dims
+            ExecNode? Feed(int v)
+            {
+                if (!bx.Single(v) || bx.Producer(v) is not { Out.Length: 1 } m) return null;
+                return Squeezed(values[m.Out[0]].Shape).SequenceEqual(Squeezed(values[v].Shape)) ? m : null;
+            }
+            bool any = false;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode gate = nodes[i];
+                if (gate.Op is not (ExecOp.HardSigmoid or ExecOp.Sigmoid) || gate.In.Length != 1) continue;
+                if (Feed(gate.In[0]) is not { P: ConvP c2 } conv2 || !Pointwise(c2) || c2.Act != ActivationKind.None) continue;
+                if (Feed(conv2.In[0]) is not { P: ConvP c1 } conv1 || !Pointwise(c1)
+                    || c1.Act is not (ActivationKind.None or ActivationKind.Relu)) continue;
+                if (Feed(conv1.In[0]) is not { Op: ExecOp.GlobalAvgPool } gap) continue;
+                int x = gap.In[0];
+                int[] w1 = values[conv1.In[1]].Shape, w2 = values[conv2.In[1]].Shape;
+                if (values[x].Shape.Length != 4 || w1.Length != 4 || w2.Length != 4
+                    || values[conv1.In[1]].Floats is null || values[conv2.In[1]].Floats is null) continue;
+                int c = values[x].Shape[1], r = w1[0];
+                // the GPU gate kernels keep the channel means and the hidden layer in shared memory
+                if (w1[1] != c || w2[0] != c || w2[1] != r || c > 2048 || r > 1024) continue;
+                var p = new ChannelGateP { B1 = c1.BiasValue, B2 = c2.BiasValue, Act1 = c1.Act };
+                if (gate.P is HardSigmoidP hp) { p.Hard = true; p.Alpha = hp.Alpha; p.Beta = hp.Beta; }
+                var fused = new ExecNode
+                {
+                    Op = ExecOp.ChannelGate, In = [x, conv1.In[1], conv2.In[1]], Out = gate.Out, P = p,
+                    SrcNode = gate.SrcNode, Name = gate.Name,
+                };
+                // x keeps one reader (gap -> gate); the intermediates' buffers are dead
+                nodes[nodes.IndexOf(gap)] = null!;
+                nodes[nodes.IndexOf(conv1)] = null!;
+                nodes[nodes.IndexOf(conv2)] = null!;
+                nodes[i] = fused;
+                bx.SetProducer(gate.Out[0], fused);
+                any = true;
+            }
+            if (!any) return;
+            nodes.RemoveAll(n => n is null);
+
+            // x + x·s == x·(s + 1): the residual Add of an RSE block folds into the gate
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode add = nodes[i];
+                if (add is null || add.Op != ExecOp.Elementwise || add.P is not EwP { Op: EwOp.Add, Act: ActivationKind.None }
+                    || add.In.Length != 2) continue;
+                for (int k = 0; k < 2; k++)
+                {
+                    int x = add.In[k], m = add.In[1 - k];
+                    if (!bx.Single(m) || bx.Producer(m) is not { Op: ExecOp.Elementwise, P: EwP { Op: EwOp.Mul, Act: ActivationKind.None } } mul
+                        || mul.In.Length != 2 || mul.Out[0] != m) continue;
+                    int s = mul.In[0] == x ? mul.In[1] : mul.In[1] == x ? mul.In[0] : -1;
+                    if (s < 0 || !bx.Single(s) || bx.Producer(s) is not { P: ChannelGateP { Offset: 0f } gp } g || g.In[0] != x) continue;
+                    if (!values[x].Shape.SequenceEqual(values[add.Out[0]].Shape)) continue;
+                    gp.Offset = 1f;
+                    mul.Out = add.Out;
+                    bx.SetProducer(add.Out[0], mul);
+                    bx.Unread(x);
+                    nodes[i] = null!;
+                    break;
+                }
+            }
+            nodes.RemoveAll(n => n is null);
+        }
+
+        private static int[] Squeezed(int[] shape) => shape.Where(d => d != 1).ToArray();
+
+        /// <summary>Producers and reader counts per activation buffer: zero-copy views share their source's
+        /// buffer, so a read through any view counts and dead views (folded shape math) do not.</summary>
+        private sealed class BufIndex
+        {
+            private readonly List<CValue> _values;
+            private readonly Dictionary<int, ExecNode> _prod = new();
+            private readonly Dictionary<int, int> _readers = new();
+            private readonly int _outBuf;
+            [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+            public BufIndex(List<ExecNode> nodes, List<CValue> values, int outputValue)
+            {
+                _values = values;
+                _outBuf = values[outputValue].Buf;
+                foreach (ExecNode m in nodes)
+                {
+                    if (m is null) continue;
+                    foreach (int o in m.Out) if (values[o].Buf >= 0) _prod[values[o].Buf] = m;
+                    foreach (int v in m.In) Read(v, 1);
+                    foreach (int v in m.ParamRefs()) Read(v, 1);
+                }
+            }
+            private void Read(int v, int d)
+            {
+                int b = _values[v].Buf;
+                if (b >= 0) _readers[b] = (_readers.TryGetValue(b, out int n) ? n : 0) + d;
+            }
+            public ExecNode? Producer(int v) => _values[v].Buf is int b and >= 0 && _prod.TryGetValue(b, out ExecNode? m) ? m : null;
+            /// <summary>One node reads the value's buffer, which is not the graph output's.</summary>
+            public bool Single(int v) => _values[v].Buf is int b and >= 0 && b != _outBuf && _readers.TryGetValue(b, out int n) && n == 1;
+            public void SetProducer(int v, ExecNode m) { if (_values[v].Buf >= 0) _prod[_values[v].Buf] = m; }
+            public void Unread(int v) => Read(v, -1);
+        }
+
+        /// <summary>
+        /// MatMul(Softmax([scale ·] MatMul(q, kᵀ)), v) becomes one <see cref="ExecOp.Attention"/> reading q / k / v
+        /// through the transposes, single-index slices (a packed qkv tensor) and scalar Muls that produce them, so
+        /// none of those copies runs (GPU plans: the transposes would be relayouts there). Rank 3 or 4, head
+        /// sizes up to 64 (the kernel keeps one query row and its accumulator in registers).
+        /// </summary>
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+        private static bool FuseAttention(List<ExecNode> nodes, List<CValue> values, int outputValue)
+        {
+            var ix = new UseIndex(nodes, values);   // exact producers: the walk below maps axes through views itself
+            var bx = new BufIndex(nodes, values, outputValue);
+            bool Single(int v) => bx.Single(v);
+            // producer of v through same-shape views (Identity / no-op reshapes)
+            ExecNode? Prod(int v)
+            {
+                while (ix.Producer(v) is null && values[v].AliasOf is int a and >= 0 && values[a].Buf == values[v].Buf
+                    && values[a].Shape.SequenceEqual(values[v].Shape)) v = a;
+                return ix.Producer(v);
+            }
+            float ScalarOf(int v) => values[v].Floats is { Length: 1 } f ? f[0] : float.NaN;
+            bool any = false;
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ExecNode pv = nodes[i];
+                if (pv is null || pv.Op != ExecOp.MatMul || pv.In.Length != 2) continue;
+                int rank = values[pv.Out[0]].Shape.Length;
+                if (rank is not (3 or 4)) continue;
+                if (Prod(pv.In[0]) is not { Op: ExecOp.Softmax } sm || !Single(pv.In[0])) continue;
+                float scale = 1f;
+                int sv = sm.In[0];
+                var dead = new List<ExecNode> { sm };
+                if (Prod(sv) is { Op: ExecOp.Elementwise, P: EwP { Act: ActivationKind.None } ep } scl
+                    && ep.Op is EwOp.Mul or EwOp.Div && Single(sv))
+                {
+                    int ci = !float.IsNaN(ScalarOf(scl.In[1])) ? 1 : ep.Op == EwOp.Mul && !float.IsNaN(ScalarOf(scl.In[0])) ? 0 : -1;
+                    if (ci >= 0)
+                    {
+                        float f = ScalarOf(scl.In[ci]);
+                        scale = ep.Op == EwOp.Mul ? f : 1f / f;
+                        sv = scl.In[1 - ci];
+                        dead.Add(scl);
+                    }
+                }
+                if (Prod(sv) is not { Op: ExecOp.MatMul } qk || qk.In.Length != 2 || !Single(sv)) continue;
+                dead.Add(qk);
+                int[] qs = values[qk.In[0]].Shape, ks = values[qk.In[1]].Shape, vs = values[pv.In[1]].Shape;
+                if (qs.Length != rank || ks.Length != rank || vs.Length != rank || values[sv].Shape.Length != rank) continue;
+                bool batchOk = true;
+                for (int d = 0; d < rank - 2; d++) batchOk &= qs[d] == ks[d] && qs[d] == vs[d];
+                if (!batchOk || ks[^2] != qs[^1] || vs[^2] != ks[^1] || qs[^1] > 64 || vs[^1] > 64) continue;
+                // canonical (n, h, t|s, d) axes of each MatMul operand; rank 3 has no n
+                int b = rank - 4;   // -1 for rank 3
+                int[] qDims = [b >= 0 ? 0 : -1, rank - 3, rank - 2, rank - 1];
+                int[] kDims = [b >= 0 ? 0 : -1, rank - 3, rank - 1, rank - 2];   // the operand is kᵀ
+                int[] vDims = [b >= 0 ? 0 : -1, rank - 3, rank - 2, rank - 1];
+                var q = Walk(qk.In[0], qDims, allowScale: true);
+                var k = Walk(qk.In[1], kDims, allowScale: true);
+                var v = Walk(pv.In[1], vDims, allowScale: false);
+                if (q.src < 0 || k.src < 0 || v.src < 0) continue;
+                scale *= q.scale * k.scale;
+                // the consumer's [0,2,1,3] transpose (heads back next to the head size) dissolves into our layout
+                int[]? outLayout = null;
+                int ov = pv.Out[0];
+                if (rank == 4 && bx.Single(ov) && nodes.Find(m => m is not null && m.In.Contains(ov)) is
+                    { Op: ExecOp.Transpose, P: TransposeP { Perm: [0, 2, 1, 3] } })
+                    outLayout = [0, 2, 1, 3];
+                var att = new ExecNode
+                {
+                    Op = ExecOp.Attention, In = [q.src, k.src, v.src], Out = pv.Out, SrcNode = pv.SrcNode, Name = pv.Name,
+                    P = new AttentionP
+                    {
+                        Scale = scale, Dims = [q.dims, k.dims, v.dims], FixAxis = [q.fix, k.fix, v.fix],
+                        FixIndex = [q.fixIndex, k.fixIndex, v.fixIndex], OutLayout = outLayout,
+                    },
+                };
+                foreach (ExecNode d in dead) { ix.Remove(d); nodes[nodes.IndexOf(d)] = null!; }
+                ix.Remove(pv);
+                nodes[i] = att;
+                ix.Add(att);
+                any = true;
+            }
+            if (any) nodes.RemoveAll(n => n is null);
+            return any;
+
+            // follows a MatMul operand back through transposes, squeeze / unsqueeze views, one single-index
+            // slice and (q / k) scalar Muls to the value the kernel reads
+            (int src, int[] dims, int fix, int fixIndex, float scale) Walk(int v, int[] dims, bool allowScale)
+            {
+                dims = (int[])dims.Clone();
+                int fix = -1, fixIndex = 0;
+                float scale = 1f;
+                for (int guard = 0; guard < 16; guard++)
+                {
+                    CValue cv = values[v];
+                    ExecNode? p = ix.Producer(v);
+                    if (p is { Op: ExecOp.Transpose, P: TransposeP tp } && p.In.Length == 1)
+                    {
+                        for (int j = 0; j < 4; j++) if (dims[j] >= 0) dims[j] = tp.Perm[dims[j]];
+                        if (fix >= 0) fix = tp.Perm[fix];
+                        v = p.In[0];
+                        continue;
+                    }
+                    if (p is { Op: ExecOp.Slice, P: SliceP sp } && p.In.Length == 1 && fix < 0)
+                    {
+                        int[] ss = values[p.In[0]].Shape;
+                        int axis = -1, start = 0;
+                        bool ok = true;
+                        for (int a = 0; a < sp.Axes.Length && ok; a++)
+                        {
+                            int ax = sp.Axes[a] < 0 ? sp.Axes[a] + ss.Length : sp.Axes[a];
+                            int st = sp.Starts[a] < 0 ? sp.Starts[a] + ss[ax] : Math.Min(sp.Starts[a], ss[ax]);
+                            int en = sp.Ends[a] < 0 ? sp.Ends[a] + ss[ax] : Math.Min(sp.Ends[a], ss[ax]);
+                            if (st == 0 && en == ss[ax] && sp.Steps[a] == 1) continue;   // full range
+                            if (en - st != 1 || sp.Steps[a] != 1 || axis >= 0 || dims.Contains(ax)) ok = false;
+                            axis = ax; start = st;
+                        }
+                        if (!ok || axis < 0) break;
+                        fix = axis; fixIndex = start;
+                        v = p.In[0];
+                        continue;
+                    }
+                    if (allowScale && p is { Op: ExecOp.Elementwise, P: EwP { Op: EwOp.Mul, Act: ActivationKind.None } }
+                        && p.In.Length == 2 && Single(v))
+                    {
+                        int ci = !float.IsNaN(ScalarOf(p.In[1])) ? 1 : !float.IsNaN(ScalarOf(p.In[0])) ? 0 : -1;
+                        if (ci < 0 || !values[p.In[1 - ci]].Shape.SequenceEqual(cv.Shape)) break;
+                        scale *= ScalarOf(p.In[ci]);
+                        v = p.In[1 - ci];
+                        continue;
+                    }
+                    // squeeze / unsqueeze view: the same non-1 dims in the same order
+                    if (p is null && cv.AliasOf >= 0 && values[cv.AliasOf].Buf == cv.Buf && fix < 0)
+                    {
+                        int[] from = cv.Shape, to = values[cv.AliasOf].Shape;
+                        int[] map = new int[from.Length];
+                        int t = 0;
+                        bool ok = true;
+                        for (int a = 0; a < from.Length && ok; a++)
+                        {
+                            if (from[a] == 1) { map[a] = -1; continue; }
+                            while (t < to.Length && to[t] == 1) t++;
+                            if (t >= to.Length || to[t] != from[a]) ok = false;
+                            else map[a] = t++;
+                        }
+                        while (ok && t < to.Length) if (to[t++] != 1) ok = false;
+                        if (!ok) break;
+                        for (int j = 0; j < 4; j++) if (dims[j] >= 0) dims[j] = map[dims[j]];
+                        v = cv.AliasOf;
+                        continue;
+                    }
+                    break;
+                }
+                // every axis the kernel does not index must be size 1 (or the pinned slice axis)
+                int[] sh = values[v].Shape;
+                for (int a = 0; a < sh.Length; a++)
+                    if (sh[a] != 1 && a != fix && Array.IndexOf(dims, a) < 0) return (-1, dims, -1, 0, 1f);
+                if (values[v].Buf < 0) return (-1, dims, -1, 0, 1f);
+                return (v, dims, fix, fixIndex, scale);
+            }
         }
 
         // act(T(x)) == T(act(x)) for elementwise unary act: move a sole-consumer
@@ -478,7 +754,7 @@ internal static class GraphCompiler
                 {
                     int u = add.In[k], o = add.In[1 - k];
                     int ri = ctx.Producer(u);
-                    if (ri < 0 || nodes[ri].Op != ExecOp.ResizeBilinear || nodes[ri].In.Length != 1) continue;
+                    if (ri < 0 || nodes[ri].Op is not (ExecOp.ResizeBilinear or ExecOp.ResizeNearest) || nodes[ri].In.Length != 1) continue;
                     if (ctx.Uses(u) != 1 || !ctx.SameShape(u, add.Out[0]) || !ctx.SameShape(o, add.Out[0]) || values[o].Buf < 0) continue;
                     rs = nodes[ri];
                     skip = o;
@@ -493,7 +769,8 @@ internal static class GraphCompiler
                 if (rs is null) continue;
                 int rIdx = nodes.IndexOf(rs);
                 rs.In = [rs.In[0], skip];
-                ((ResizeP)rs.P!).AddRelu = relu is not null;
+                if (rs.P is ResizeP rp) rp.AddRelu = relu is not null;
+                else ((ResizeNearestP)rs.P!).AddRelu = relu is not null;
                 rs.Out = [add.Out[0]];
                 nodes[ai] = rs;      // producer precedes consumer: rIdx < ai
                 nodes.RemoveAt(rIdx);
@@ -774,10 +1051,10 @@ internal static class GraphCompiler
             return false;
         }
 
-        /// <summary>Mul(x, HardSigmoid(x)) → HardSwish(x) and (CPU plans: no GPU conv has a swish epilogue)
-        /// Mul(x, Sigmoid(x)) → Swish(x); conv/gemm epilogues then absorb them (<see cref="FuseLateAct"/>).</summary>
+        /// <summary>Mul(x, HardSigmoid(x)) → HardSwish(x) and Mul(x, Sigmoid(x)) → Swish(x); conv/gemm epilogues
+        /// then absorb them (<see cref="FuseLateAct"/>; Vulkan kernels without one run a trailing in-place pass).</summary>
         [MethodImpl(MethodImplCompat.AggressiveOptimization)]
-        private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue, bool swish)
+        private static void FuseGatedAct(List<ExecNode> nodes, List<CValue> values, int outputValue)
         {
             for (int i = 0; i < nodes.Count; i++)
             {
@@ -792,7 +1069,7 @@ internal static class GraphCompiler
                     if (gi < 0) continue;
                     ExecNode gate = nodes[gi];
                     ExecOp op;
-                    if (gate.Op == ExecOp.Sigmoid && swish) op = ExecOp.Swish;
+                    if (gate.Op == ExecOp.Sigmoid) op = ExecOp.Swish;
                     else if (gate.Op == ExecOp.HardSigmoid && gate.P is HardSigmoidP hp
                         && MathF.Abs(hp.Alpha - 1f / 6f) < 1e-6f && hp.Beta == 0.5f) op = ExecOp.HardSwish;
                     else continue;

@@ -2,12 +2,14 @@
 #extension GL_GOOGLE_include_directive : require
 #include "et.glsl"
 // NHWC nearest resize, asymmetric coordinates, floor rounding: src = floor(dst / scale).
+// flags: bit1 add same-shape A, bit2 relu on A (FPN top-down merge: out = up(x) + [relu](a)).
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
-layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+layout(set = 0, binding = 1) readonly buffer A { ET a[]; };    // addend (dummy if none)
+layout(set = 0, binding = 2) writeonly buffer O { ET o[]; };
 
-layout(push_constant) uniform PC { uint c, ih, iw, oh, ow; float sy, sx; } p;
+layout(push_constant) uniform PC { uint c, ih, iw, oh, ow, flags; float sy, sx; } p;
 
 void main()
 {
@@ -17,5 +19,11 @@ void main()
     uint ox = px % p.ow, oy = px / p.ow;
     uint iy = min(uint(floor(float(oy) / p.sy)), p.ih - 1u);
     uint ix = min(uint(floor(float(ox) / p.sx)), p.iw - 1u);
-    o[id] = x[(iy * p.iw + ix) * p.c + ch];
+    float v = float(x[(iy * p.iw + ix) * p.c + ch]);
+    if ((p.flags & 2u) != 0u)
+    {
+        float s = float(a[id]);
+        v += (p.flags & 4u) != 0u ? max(s, 0.0) : s;
+    }
+    o[id] = ET(v);
 }

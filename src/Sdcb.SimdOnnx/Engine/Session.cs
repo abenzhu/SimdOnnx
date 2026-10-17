@@ -267,6 +267,18 @@ public sealed unsafe class InferenceSession : IDisposable
                 Nhwc.HardSigmoid(GetIn(n.In[0]), GetSpan(n.Out[0]), p.Alpha, p.Beta);
                 break;
             }
+            case ExecOp.ChannelGate:
+            {
+                var p = (ChannelGateP)n.P!;
+                int[] s = values[n.In[0]].Shape;   // [N,C,H,W]; NHWC storage in layout-planned plans
+                int nb = s[0], c = s[1], hw = s[2] * s[3], r = values[n.In[1]].Shape[0];
+                ReadOnlySpan<float> x = GetIn(n.In[0]), w1 = GetIn(n.In[1]), w2 = GetIn(n.In[2]);
+                ReadOnlySpan<float> b1 = GetIn(p.B1), b2 = GetIn(p.B2);
+                Span<float> o = GetSpan(n.Out[0]);
+                for (int b = 0; b < nb; b++)
+                    Nhwc.ChannelGate(x.Slice(b * c * hw, c * hw), hw, c, _plan.Nhwc, w1, b1, w2, b2, r, p, o.Slice(b * c, c));
+                break;
+            }
             default:
                 throw new NotSupportedException($"ExecOp {n.Op}");
         }
@@ -356,7 +368,8 @@ public sealed unsafe class InferenceSession : IDisposable
                 var p = (ResizeNearestP)n.P!;
                 int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
                 for (int b = 0; b < i[0]; b++)
-                    Nhwc.ResizeNearest(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.Scales[2], p.Scales[3]);
+                    Nhwc.ResizeNearest(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.Scales[2], p.Scales[3],
+                        n.In.Length > 1 ? Img(n.In[1], b, i[0]) : default, p.AddRelu);
                 return true;
             }
             default:

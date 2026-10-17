@@ -116,6 +116,10 @@ public sealed class VkGraphModel : IDisposable
                     Need(n.In[1], CK.ConvTW);
                     Need(tp.BiasValue, CK.F32);
                     break;
+                case ChannelGateP gp:
+                    Need(n.In[1], CK.F32); Need(n.In[2], CK.F32);
+                    Need(gp.B1, CK.F32); Need(gp.B2, CK.F32);
+                    break;
                 default:
                     foreach (int iv in n.In) Need(iv, CK.Raw);
                     break;
@@ -157,7 +161,8 @@ public sealed class VkGraphModel : IDisposable
         if (!dev.CoopMat16 || dev.ConvDot || !f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
         // SG16 direct devices never take the staged conv_cm build (see RouteM8Conv)
         if (M8Direct(dev, f16, plan)) return false;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
+        // swish: a trailing in-place pass (an exp epilogue in conv_cm costs the GcdrNet staged convs ~0.6%)
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish)) return false;
         if (cp.PadMode == PadMode.Constant && cp.PadValue != 0f) return false;
         int[] si = plan.Values[n.In[0]].PhysShape, so = plan.Values[n.Out[0]].PhysShape;   // [1,h,w,c]
         long m = (long)so[0] * so[1] * so[2];
@@ -207,7 +212,7 @@ public sealed class VkGraphModel : IDisposable
             return SmallDotConv(dev, f16, plan, n, cp) ? M8Route.Dot : WideDotConv(dev, f16, plan, n, cp) ? M8Route.KDot : M8Route.None;
         if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return M8Route.None;
         if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return M8Route.None;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return M8Route.None;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish)) return M8Route.None;
         CValue x = plan.Values[n.In[0]];
         if (x.Shape.Length != 4) return M8Route.None;
         int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0];
@@ -261,7 +266,7 @@ public sealed class VkGraphModel : IDisposable
     {
         if (!f16 || cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
         if (cp.Kernel[0] != 1 || cp.Kernel[1] != 1 || cp.Strides.Any(s => s != 1) || cp.Pads.Any(q => q != 0)) return false;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish)) return false;
         CValue x = plan.Values[n.In[0]];
         if (x.Shape.Length != 4) return false;
         int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0];
@@ -281,13 +286,13 @@ public sealed class VkGraphModel : IDisposable
         if (!dev.ConvDot || !f16 || plan.Options?.StagedCoopConv == true || Env.Flag("VK_SMALLDOT") == "0") return false;
         if (cp.Group != 1 || cp.Pool is not null || cp.Dilations.Any(d => d != 1)) return false;
         if (cp.PadMode != PadMode.Constant || cp.PadValue != 0f) return false;
-        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish)) return false;
+        if (cp.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish)) return false;
         CValue x = plan.Values[n.In[0]];
         if (x.Shape.Length != 4) return false;
         int ic = x.Shape[1], oc = plan.Values[n.In[1]].Shape[0], nb = plan.Values[n.Out[0]].Shape[0];
         if (ic % 4 != 0 || oc % 4 != 0) return false;
         bool k33 = cp.Kernel[0] == 3 && cp.Kernel[1] == 3 && cp.Strides[0] == cp.Strides[1] && cp.Strides[0] is 1 or 2;
-        return !(k33 && nb == 1 && cp.Act != ActivationKind.HardSwish);   // conv_dot's own case
+        return !(k33 && nb == 1 && cp.Act is not (ActivationKind.HardSwish or ActivationKind.Swish));   // conv_dot's own case
     }
 
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
@@ -378,6 +383,16 @@ public sealed class VkGraphModel : IDisposable
         return b;
     }
 
+    /// <summary>Elements between neighbours along logical axis <paramref name="axis"/> in the value's storage.</summary>
+    [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+    private static long LogicalStride(CValue v, int axis)
+    {
+        int[] l = v.Layout ?? Engine.Layout.Identity(v.Shape.Length), ps = v.PhysShape;
+        long s = 1;
+        for (int j = ps.Length - 1; j >= 0 && l[j] != axis; j--) s *= ps[j];
+        return s;
+    }
+
     /// <summary>Shaders without a batch index: the value must hold one image.</summary>
     [MethodImpl(MethodImplCompat.AggressiveOptimization)]
     private void RequireSingle(int valueId)
@@ -413,6 +428,15 @@ public sealed class VkGraphModel : IDisposable
 
     private string Sh(string name) => F16 ? name + "_h" : name;
 
+    /// <summary>Epilogue code of the 3-bit act field (pw_dot / conv_kdot / gemm_cm8).</summary>
+    private static uint EpiCode(ActivationKind a) => a switch
+    {
+        ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, ActivationKind.Swish => 4u, _ => 0u,
+    };
+
+    /// <summary>conv_cm's act field: no swish (the caller adds a trailing pass).</summary>
+    private static uint CmCode(ActivationKind a) => a == ActivationKind.Swish ? 0u : EpiCode(a);
+
     /// <summary>4-channel memory-bound kernels: the plan's choice, else the device default.</summary>
     private bool Vec4 => _plan.Options?.Vec4Eltwise ?? _dev.Vec4Eltwise;
 
@@ -430,6 +454,7 @@ public sealed class VkGraphModel : IDisposable
         int[] nhwcIn(int k) => nhwc(n.In[k]);
         int[] nhwcOut() => nhwc(n.Out[0]);
         int nOut() => checked((int)V[n.Out[0]].ElementCount);
+        bool swishDone = false;   // the conv / gemm kernel applied a swish / hardswish epilogue itself
 
         switch (n.Op)
         {
@@ -512,8 +537,8 @@ public sealed class VkGraphModel : IDisposable
                     | (p.AddValue >= 0 ? 8u : 0u)
                     | (p.Act == ActivationKind.Gelu ? 16u : 0u)
                     | (p.Act == ActivationKind.HardSwish ? 32u : 0u);
-                if (p.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish))
-                    throw new NotSupportedException($"Vulkan conv: {p.Act} epilogue");
+                if (p.Act is not (ActivationKind.None or ActivationKind.Relu or ActivationKind.Gelu or ActivationKind.HardSwish or ActivationKind.Swish))
+                    throw new NotSupportedException($"Vulkan conv: {p.Act} epilogue");   // swish: trailing pass below
                 if (p.Group > 1)
                 {
                     if (p.Group != ic || oc != ic) throw new NotSupportedException("grouped non-depthwise conv");
@@ -529,9 +554,10 @@ public sealed class VkGraphModel : IDisposable
                 M8Route m8 = RouteM8Conv(_dev, F16, _plan, n, p);
                 if (m8 != M8Route.None)
                 {
+                    swishDone = true;
                     uint m = nb * oh * ow, mImg = oh * ow;
                     uint m8flags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
-                        | ((p.Act switch { ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, _ => 0u }) << 4);
+                        | (EpiCode(p.Act) << 4);
                     if (m8 == M8Route.Dot)
                     {
                         (uint dx, uint dy) = G2((m + 3) / 4 * (oc / 4));
@@ -581,12 +607,13 @@ public sealed class VkGraphModel : IDisposable
                     // SG16 (Intel Xe2): the BN=32 build on 1x1 convs hangs the device intermittently (B580,
                     // driver 32.0.101.8135) — those take the BN=64 build with masked tail columns
                     bool no32 = _dev.CoopM8 && p.Kernel[0] == 1 && p.Kernel[1] == 1;
+                    swishDone = p.Act != ActivationKind.Swish;
                     (string cm, uint bn) = ic % 8 != 0 ? ("conv_cm_n32s", 32u)
                         : oc % 128 == 0 ? ("conv_cm", 128u) : oc % 64 == 0 || no32 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
                     uint m = nb * oh * ow, kr = (uint)(p.Kernel[0] * p.Kernel[1]) * ic, kd = (kr + 7u) & ~7u;
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (p.AddValue >= 0 ? 2u : 0u)
                         | (p.PadMode == PadMode.Reflect ? 4u : 0u)
-                        | ((p.Act switch { ActivationKind.Relu => 1u, ActivationKind.Gelu => 2u, ActivationKind.HardSwish => 3u, _ => 0u }) << 4);
+                        | (CmCode(p.Act) << 4);
                     output.Add(ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.ConvWT), B(p.BiasValue, CK.F32), B(p.AddValue), Bind(n.Out[0])],
                         PcOf(m, oc, kd, cflags, ow, iw, ih, ic, (uint)p.Kernel[1],
@@ -651,7 +678,8 @@ public sealed class VkGraphModel : IDisposable
             case ExecOp.Gemm:
             {
                 var p = (GemmP)n.P!;
-                // hardswish / swish run as a separate in-place pass after the switch (no gemm epilogue has them)
+                // hardswish / swish: the direct and tensor-core kernels apply them, the generic ones run a
+                // separate in-place pass after the switch
                 ActivationKind act = p.Act is ActivationKind.HardSwish or ActivationKind.Swish ? ActivationKind.None : p.Act;
                 uint k = (uint)V[n.In[0]].Shape[^1];
                 if ((uint)shapeIn(0)[^1] != k) throw new NotSupportedException("Vulkan Gemm: K not innermost");
@@ -660,8 +688,8 @@ public sealed class VkGraphModel : IDisposable
                 M8Route gm8 = RouteM8Gemm(_dev, F16, _plan, n, p);
                 if (gm8 != M8Route.None)
                 {
-                    uint gf = (p.BiasValue >= 0 ? 1u : 0u)
-                        | ((act == ActivationKind.Relu ? 1u : act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                    swishDone = true;
+                    uint gf = (p.BiasValue >= 0 ? 1u : 0u) | (EpiCode(p.Act) << 4);
                     if (gm8 == M8Route.Dot)
                     {
                         (uint dx, uint dy) = G2((m + 3) / 4 * (nn / 4));
@@ -679,8 +707,8 @@ public sealed class VkGraphModel : IDisposable
                 if (UseCoopGemm(_dev, F16, _plan, n, p))
                 {
                     (string cm, uint bn) = nn % 128 == 0 ? ("conv_cm", 128u) : nn % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
-                    uint cflags = (p.BiasValue >= 0 ? 1u : 0u)
-                        | ((act == ActivationKind.Relu ? 1u : act == ActivationKind.Gelu ? 2u : 0u) << 4);
+                    swishDone = p.Act != ActivationKind.Swish;
+                    uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (CmCode(p.Act) << 4);
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
                     output.Add(ND(cm,
                         [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
@@ -851,10 +879,59 @@ public sealed class VkGraphModel : IDisposable
                 var p = (ResizeNearestP)n.P!;
                 RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]);
                 RequireSingle(n.In[0]);
+                bool hasAdd = n.In.Length > 1;
+                if (hasAdd) RequireNhwc(n.In[1]);
                 int[] si = nhwcIn(0), so = nhwcOut();
-                output.Add(ND("nearest", [Bind(n.In[0]), Bind(n.Out[0])],
-                    PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2]], p.Scales[2], p.Scales[3]),
-                    G((uint)nOut())));
+                bool v4 = Vec4 && si[3] % 4 == 0;
+                output.Add(ND(v4 ? "nearest4" : "nearest", [Bind(n.In[0]), hasAdd ? Bind(n.In[1]) : B(-1), Bind(n.Out[0])],
+                    PcOfF([(uint)si[3], (uint)si[1], (uint)si[2], (uint)so[1], (uint)so[2],
+                        (hasAdd ? 2u : 0u) | (p.AddRelu ? 4u : 0u)], p.Scales[2], p.Scales[3]),
+                    G((uint)nOut() / (v4 ? 4u : 1u)), name: "nearest"));
+                break;
+            }
+
+            case ExecOp.ChannelGate:
+            {
+                // pass 1: gap_part's per-chunk channel sums; pass 2: means + both FC layers + gate, one workgroup per image
+                var p = (ChannelGateP)n.P!;
+                RequireNhwc(n.In[0]);
+                int[] si = nhwcIn(0);
+                uint hw = (uint)si[1] * (uint)si[2], c = (uint)si[3], r = (uint)V[n.In[1]].Shape[0];
+                uint chunks = Math.Min((hw + 255) / 256, 1024u), per = (hw + chunks - 1) / chunks;
+                chunks = (hw + per - 1) / per;
+                VkBind part = Scratch((ulong)si[0] * chunks * c * 4);
+                output.Add(ND("gap_part", [Bind(n.In[0]), part], PcOf(c, hw, per), (c + 63) / 64, chunks, (uint)si[0]));
+                uint gflags = (p.B1 >= 0 ? 1u : 0u) | (p.B2 >= 0 ? 2u : 0u) | (p.Act1 == ActivationKind.Relu ? 4u : 0u) | (p.Hard ? 8u : 0u);
+                output.Add(ND("se_gate",
+                    [part, Bind(n.In[1], CK.F32), B(p.B1, CK.F32), Bind(n.In[2], CK.F32), B(p.B2, CK.F32), Bind(n.Out[0])],
+                    PcOfF([c, r, chunks, gflags], 1f / hw, p.Alpha, p.Beta, p.Offset), (uint)si[0], name: "se_gate"));
+                break;
+            }
+
+            case ExecOp.Attention:
+            {
+                var p = (AttentionP)n.P!;
+                CValue o = V[n.Out[0]];
+                int rank = o.Shape.Length;
+                int[] oDims = rank == 4 ? [0, 1, 2, 3] : [-1, 0, 1, 2];
+                uint[] View(int v, int[] dims, int fix, int fixIndex)
+                {
+                    uint[] r = new uint[5];
+                    for (int j = 0; j < 4; j++) r[1 + j] = dims[j] < 0 ? 0u : (uint)LogicalStride(V[v], dims[j]);
+                    r[0] = fix < 0 ? 0u : (uint)(fixIndex * LogicalStride(V[v], fix));
+                    return r;
+                }
+                uint[] qv = View(n.In[0], p.Dims[0], p.FixAxis[0], p.FixIndex[0]);
+                uint[] kv = View(n.In[1], p.Dims[1], p.FixAxis[1], p.FixIndex[1]);
+                uint[] vv = View(n.In[2], p.Dims[2], p.FixAxis[2], p.FixIndex[2]);
+                uint[] ov = View(n.Out[0], oDims, -1, 0);
+                uint T = (uint)o.Shape[^2], DV = (uint)o.Shape[^1], H = (uint)o.Shape[^3], N = rank == 4 ? (uint)o.Shape[0] : 1u;
+                uint S = (uint)V[n.In[1]].Shape[p.Dims[1][2]], D = (uint)V[n.In[0]].Shape[p.Dims[0][3]];
+                var pc = new List<uint> { T, S, D, DV, H };
+                pc.AddRange(qv); pc.AddRange(kv); pc.AddRange(vv); pc.AddRange(ov);
+                output.Add(ND(D <= 32 && DV <= 32 ? "attn" : "attn_d64",
+                    [Bind(n.In[0]), Bind(n.In[1]), Bind(n.In[2]), Bind(n.Out[0])],
+                    PcOfF([.. pc], p.Scale), (T + 63) / 64, N * H, name: "attn"));
                 break;
             }
 
@@ -914,9 +991,16 @@ public sealed class VkGraphModel : IDisposable
             default:
                 throw new NotSupportedException($"Vulkan: ExecOp {n.Op} not implemented");
         }
-        if (n.P is GemmP { Act: ActivationKind.HardSwish or ActivationKind.Swish } tail)
+        // epilogues the chosen kernel lacks run in place on the output
+        ActivationKind tailAct = n.P switch
+        {
+            GemmP { Act: ActivationKind.HardSwish or ActivationKind.Swish } g => g.Act,
+            ConvP { Act: ActivationKind.Swish } => ActivationKind.Swish,
+            _ => ActivationKind.None,
+        };
+        if (tailAct != ActivationKind.None && !swishDone)
             output.Add(ND("unary", [Bind(n.Out[0]), Bind(n.Out[0])],
-                PcOf((uint)nOut(), tail.Act == ActivationKind.HardSwish ? 5u : 6u), G((uint)nOut())));
+                PcOf((uint)nOut(), tailAct == ActivationKind.HardSwish ? 5u : 6u), G((uint)nOut())));
 
         VkDispatch ND(string shader, VkBind[] binds, byte[] pc, uint gx, uint gy = 1, uint gz = 1, string? name = null) =>
             shader.StartsWith("conv_cm", StringComparison.Ordinal)

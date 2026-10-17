@@ -375,3 +375,77 @@ kernel void layernorm(device const half* x [[buffer(0)]],
     for (uint i = lane; i < p.len; i += 32u)
         o[base + i] = half((float(x[base + i]) - mean) * inv * w[i] + b[i]);
 }
+
+// ---- attention: o[n,h,t,:] = sum_s softmax_s(scale * q[n,h,t,:] . k[n,h,s,:]) v[n,h,s,:] ----
+// q / k / v / o are strided views (element strides, any layout); one thread per query row (online
+// softmax, fp32), 256 queries of one (n, h) per threadgroup, k / v rows staged in threadgroup tiles.
+struct PcAttn {
+    uint T, S, D, DV, H;
+    uint qb, qn, qh, qt, qd;
+    uint kb, kn, kh, ks, kd;
+    uint vb, vn, vh, vs, vd;
+    uint ob, on, oh, ot, od;
+    float scale;
+};
+template <uint DMAX, uint TILE>
+static inline void attn_body(device const half* q, device const half* k, device const half* v, device half* o,
+                             constant PcAttn& p, uint2 wg, uint tid, threadgroup float* kt, threadgroup float* vt)
+{
+    uint t = wg.x * 256u + tid;
+    uint n = wg.y / p.H, h = wg.y % p.H;
+    bool valid = t < p.T;
+    float qr[DMAX], acc[DMAX];
+    uint qo = p.qb + n * p.qn + h * p.qh + (valid ? t : 0u) * p.qt;
+    for (uint d = 0u; d < DMAX; d++)
+    {
+        qr[d] = valid && d < p.D ? float(q[qo + d * p.qd]) * p.scale : 0.0f;
+        acc[d] = 0.0f;
+    }
+    uint ko = p.kb + n * p.kn + h * p.kh, vo = p.vb + n * p.vn + h * p.vh;
+    float m = -3.402823e38f, l = 0.0f;
+    for (uint s0 = 0u; s0 < p.S; s0 += TILE)
+    {
+        uint cnt = min(TILE, p.S - s0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = tid; e < TILE * DMAX; e += 256u)
+        {
+            uint j = e / DMAX, d = e % DMAX;
+            bool in_ = j < cnt;
+            kt[e] = in_ && d < p.D ? float(k[ko + (s0 + j) * p.ks + d * p.kd]) : 0.0f;
+            vt[e] = in_ && d < p.DV ? float(v[vo + (s0 + j) * p.vs + d * p.vd]) : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < cnt; j++)
+        {
+            float sc = 0.0f;
+            for (uint d = 0u; d < DMAX; d++) sc += qr[d] * kt[j * DMAX + d];
+            float mn = max(m, sc);
+            float corr = exp(m - mn), e = exp(sc - mn);
+            l = l * corr + e;
+            for (uint d = 0u; d < DMAX; d++) acc[d] = acc[d] * corr + e * vt[j * DMAX + d];
+            m = mn;
+        }
+    }
+    if (!valid) return;
+    float il = 1.0f / l;
+    uint oo = p.ob + n * p.on + h * p.oh + t * p.ot;
+    for (uint d = 0u; d < DMAX; d++) if (d < p.DV) o[oo + d * p.od] = half(acc[d] * il);
+}
+kernel void attn(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                 device const half* v [[buffer(2)]], device half* o [[buffer(3)]],
+                 constant PcAttn& p [[buffer(4)]],
+                 uint2 wg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{
+    threadgroup float kt[64 * 32], vt[64 * 32];
+    uint tid = lid.x;
+    attn_body<32, 64>(q, k, v, o, p, wg, tid, kt, vt);
+}
+kernel void attn_d64(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                     device const half* v [[buffer(2)]], device half* o [[buffer(3)]],
+                     constant PcAttn& p [[buffer(4)]],
+                     uint2 wg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
+{
+    threadgroup float kt[32 * 64], vt[32 * 64];
+    uint tid = lid.x;
+    attn_body<64, 32>(q, k, v, o, p, wg, tid, kt, vt);
+}
