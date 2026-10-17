@@ -83,6 +83,9 @@ PSNR goldens identical.
 3. **Devices**: RTX 3080 Ti and Snapdragon 8 Gen 3 measured on the real hardware
    (`docs/devices/`); Radeon 880M and UHD 770 pending. The 880M direct-load `sg32d` GEMM is not ported.
    Squeeze-excitation, attention and nearest-upsample + add are engine fusions now (2026-10-17).
+   Open on the 3080 Ti: GcdrNet Vulkan e2e 1600x1152 8.9 → 9.8 ms (3200x2304 1.02x) although its
+   GPU kernel time is 34% lower (14.3 → 9.4 ms) — host-side cost (staging memory type, upload /
+   download path), to probe there with `SIMDONNX_VK_STAGE_WC=0`; Paddle medium Vulkan 1.03x.
 4. **Device re-creation after a loss** still fails with `ErrorIncompatibleDriver` on the B580
    (no longer triggered).
 5. **Metal performance** unmeasured against the old engines (correctness checked in CI).
