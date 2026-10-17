@@ -704,7 +704,7 @@ public sealed class VkGraphModel : IDisposable
                         PcOf(m, nn, k, gf), rowsPad / bm, (nn + bn - 1) / bn, name: "gemm_cm8"));
                     break;
                 }
-                if (UseCoopGemm(_dev, F16, _plan, n, p))
+                if (UseCoopGemm(_dev, F16, _plan, n, p) && p.TransB)
                 {
                     (string cm, uint bn) = nn % 128 == 0 ? ("conv_cm", 128u) : nn % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
                     swishDone = p.Act != ActivationKind.Swish;
@@ -942,6 +942,37 @@ public sealed class VkGraphModel : IDisposable
                 output.Add(ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
                     PcOf((uint)nOut(), n.Op == ExecOp.HardSwish ? 5u : 6u), G((uint)nOut())));
                 break;
+
+            case ExecOp.LeakyRelu:
+                output.Add(ND("leaky", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOfF([(uint)nOut()], ((LeakyReluP)n.P!).Alpha), G((uint)nOut())));
+                break;
+
+            case ExecOp.Tanh:
+                output.Add(ND("unary", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf((uint)nOut(), 8u), G((uint)nOut())));
+                break;
+
+            case ExecOp.Clip:
+            {
+                var p = (ClipP)n.P!;
+                output.Add(ND("clip", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOfF([(uint)nOut()], p.Min, p.Max), G((uint)nOut())));
+                break;
+            }
+
+            case ExecOp.DepthToSpace:
+            {
+                var p = (DepthToSpaceP)n.P!;
+                if (p.BlockSize != 2)
+                    throw new NotSupportedException($"Vulkan DepthToSpace: blocksize {p.BlockSize} not supported (2 only).");
+                RequireNhwc(n.In[0]); RequireNhwc(n.Out[0]); RequireSingle(n.In[0]);
+                int[] si = nhwcIn(0), so = nhwcOut();   // [1,h,w,c]
+                output.Add(ND("d2s", [Bind(n.In[0]), Bind(n.Out[0])],
+                    PcOf(U(so[1] * so[2] * so[3], so[2], so[3], si[2], si[3])),
+                    G((uint)(so[1] * so[2] * so[3]))));
+                break;
+            }
 
             case ExecOp.Softmax:
             {

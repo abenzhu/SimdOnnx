@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "et.glsl"
+// NHWC DepthToSpace CRD, blocksize 2 (pixel-shuffle).
+// x [ih, iw, cin = cout*4] -> y [ih*2, iw*2, cout]
+// y[(iy*2 + r), (ix*2 + d), c] = x[iy, ix, (c*2 + r)*2 + d]
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
+layout(set = 0, binding = 1) writeonly buffer O { ET o[]; };
+
+layout(push_constant) uniform PC { uint total, ow2, cout, iw, cin; } p;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.total) return;
+    uint c = i % p.cout, px = i / p.cout;
+    uint ox = px % p.ow2, oy = px / p.ow2;
+    uint ix = ox >> 1, dx = ox & 1u;
+    uint iy = oy >> 1, dy = oy & 1u;
+    uint ci = ((c << 1) + dy) << 1 | dx;
+    o[i] = x[(iy * p.iw + ix) * p.cin + ci];
+}

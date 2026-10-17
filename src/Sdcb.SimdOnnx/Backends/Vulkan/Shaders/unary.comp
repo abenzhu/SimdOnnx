@@ -1,7 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "et.glsl"
-// Elementwise unary: mode 0 relu, 1 sigmoid, 2 erf, 3 gelu, 4 copy, 5 hardswish, 6 swish
+// Elementwise unary: mode 0 relu, 1 sigmoid, 2 erf, 3 gelu, 4 copy, 5 hardswish, 6 swish, 8 tanh
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer X { ET x[]; };
@@ -41,6 +41,7 @@ void main()
     else if (p.mode == 3u) r = 0.5 * v * (1.0 + ferf(v * 0.7071067811865475));
     else if (p.mode == 5u) r = v * clamp(v * (1.0 / 6.0) + 0.5, 0.0, 1.0);
     else if (p.mode == 6u) r = v / (1.0 + fexp(-v));
+    else if (p.mode == 8u) r = tanh(v);
     else r = v;
     o[i] = ET(r);
 }

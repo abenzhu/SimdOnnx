@@ -1391,6 +1391,13 @@ internal static class GraphCompiler
                 case "Softmax": EmitSoftmax(n); break;
                 case "Sqrt": EmitUnary(n, ExecOp.Sqrt); break;
                 case "Pow": EmitPow(n); break;
+                case "LeakyRelu":
+                    Emit(ExecOp.LeakyRelu, [Input(0, n)], ActivationValue(n.Outputs[0], V(Input(0, n)).Shape),
+                        new LeakyReluP { Alpha = n.FloatAttr("alpha", 0.01f) }, n);
+                    break;
+                case "Tanh": EmitUnary(n, ExecOp.Tanh); break;
+                case "Clip": EmitClip(n); break;
+                case "DepthToSpace": EmitDepthToSpace(n); break;
                 default:
                     throw new NotSupportedException($"Op '{op}' not supported (node '{n.Name}').");
             }
@@ -1768,6 +1775,42 @@ internal static class GraphCompiler
         {
             CValue x = V(Input(0, n));
             Emit(op, [Input(0, n)], ActivationValue(n.Outputs[0], x.Shape), null, n);
+        }
+
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+        private void EmitClip(OnnxNodeData n)
+        {
+            float lo = n.FloatAttr("min", float.NegativeInfinity);
+            float hi = n.FloatAttr("max", float.PositiveInfinity);
+            if (n.Inputs.Count > 1 && n.Inputs[1].Length > 0)
+                lo = V(Input(1, n)).Floats is { Length: 1 } f1 ? f1[0]
+                    : throw new NotSupportedException($"Clip '{n.Name}': min must be a float scalar const.");
+            if (n.Inputs.Count > 2 && n.Inputs[2].Length > 0)
+                hi = V(Input(2, n)).Floats is { Length: 1 } f2 ? f2[0]
+                    : throw new NotSupportedException($"Clip '{n.Name}': max must be a float scalar const.");
+            if (!(lo <= hi))
+                throw new NotSupportedException($"Clip '{n.Name}': min > max.");
+            CValue x = V(Input(0, n));
+            Emit(ExecOp.Clip, [Input(0, n)], ActivationValue(n.Outputs[0], x.Shape),
+                new ClipP { Min = lo, Max = hi }, n);
+        }
+
+        [MethodImpl(MethodImplCompat.AggressiveOptimization)]
+        private void EmitDepthToSpace(OnnxNodeData n)
+        {
+            string mode = n.StringAttr("mode", "DCR");
+            if (mode != "CRD")
+                throw new NotSupportedException($"DepthToSpace '{n.Name}': only CRD mode is supported.");
+            int bs = (int)n.IntAttr("blocksize");
+            if (bs < 2 || bs > 4)
+                throw new NotSupportedException($"DepthToSpace '{n.Name}': blocksize {bs} not supported.");
+            CValue x = V(Input(0, n));
+            if (x.Shape is not [var nn, var cin, var h, var w] || cin % (bs * bs) != 0)
+                throw new NotSupportedException($"DepthToSpace '{n.Name}': expects NCHW [N,C*bs*bs,H,W].");
+            int c = cin / (bs * bs);
+            Emit(ExecOp.DepthToSpace, [Input(0, n)],
+                ActivationValue(n.Outputs[0], [nn, c, h * bs, w * bs]),
+                new DepthToSpaceP { BlockSize = bs }, n);
         }
 
         [MethodImpl(MethodImplCompat.AggressiveOptimization)]

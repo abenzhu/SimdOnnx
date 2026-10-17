@@ -236,6 +236,35 @@ internal static unsafe partial class Nhwc
         }
     }
 
+    /// <summary>NHWC DepthToSpace CRD (pixel-shuffle): x [ih, iw, cin=oc*bs*bs] -> y [ih*bs, iw*bs, oc].
+    /// y[(ih*bs + r), (ix*bs + d), c] = x[ih, ix, (c*bs + r)*bs + d].</summary>
+    public static void DepthToSpace(ReadOnlySpan<float> src, int ih, int iw, int cin,
+        Span<float> dst, int oh, int ow, int bs)
+    {
+        int oc = cin / (bs * bs);
+        fixed (float* sp0 = src, dp0 = dst)
+        {
+            float* sp = sp0, dp = dp0;
+            For(ih, (long)oh * ow * oc, y =>
+            {
+                for (int x = 0; x < iw; x++)
+                {
+                    float* srow = sp + ((long)y * iw + x) * cin;
+                    for (int r = 0; r < bs; r++)
+                    {
+                        float* drow = dp + ((long)(y * bs + r) * ow) * oc;
+                        for (int c = 0; c < oc; c++)
+                        {
+                            float* s0 = srow + (long)c * bs * bs;
+                            for (int d = 0; d < bs; d++)
+                                drow[(long)(x * bs + d) * oc + c] = s0[(long)r * bs + d];
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     /// <summary>dst[r, :] = full[r, :] op vec[:] (or vec op full when <paramref name="rev"/>) — NHWC per-channel broadcast.</summary>
     public static void ChannelBroadcast(ReadOnlySpan<float> full, ReadOnlySpan<float> vec, Span<float> dst,
         int c, EwOp op, bool rev, ActivationKind act)

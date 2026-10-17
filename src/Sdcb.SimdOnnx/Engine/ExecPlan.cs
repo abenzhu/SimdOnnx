@@ -29,6 +29,10 @@ public enum ExecOp
     AvgPool,         // NCHW average pooling (PoolP; count_include_pad = 0)
     HardSwish,       // x * clamp(x / 6 + 0.5, 0, 1) (CPU plans: HardSigmoid + Mul)
     Swish,           // x * sigmoid(x) (CPU plans: Sigmoid + Mul)
+    LeakyRelu,       // x >= 0 ? x : alpha * x (elementwise; docgainnet alpha=0.2)
+    Tanh,            // elementwise tanh
+    Clip,            // elementwise clamp to [min, max] (constant bounds)
+    DepthToSpace,    // CRD pixel-shuffle (blocksize 2/3/4), rank-4
     Ext,             // consumer-registered operator (ExecNode.Ext)
     ChannelGate,     // squeeze-excitation gate: GAP -> 1x1 conv (+act) -> 1x1 conv -> (hard) sigmoid, [N,C,1,1]
     Attention,       // softmax(scale * q k^T) v over strided q / k / v views (GPU plans)
@@ -142,6 +146,21 @@ public sealed class AttentionP
     public required int[] FixIndex;
     /// <summary>Output logical->physical layout chosen at fusion (its consumer's transpose dissolves).</summary>
     public int[]? OutLayout;
+}
+
+public sealed class LeakyReluP
+{
+    public float Alpha;
+}
+
+public sealed class ClipP
+{
+    public float Min, Max;
+}
+
+public sealed class DepthToSpaceP
+{
+    public int BlockSize;        // CRD mode only
 }
 
 public sealed class PadP

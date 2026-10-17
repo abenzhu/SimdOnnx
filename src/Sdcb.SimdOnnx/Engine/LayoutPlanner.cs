@@ -241,9 +241,17 @@ public sealed class LayoutPlanner
                 break;
             }
             case ExecOp.Relu or ExecOp.Sigmoid or ExecOp.Erf or ExecOp.Gelu or ExecOp.Copy or ExecOp.HardSigmoid or ExecOp.Sqrt
-                or ExecOp.HardSwish or ExecOp.Swish:
+                or ExecOp.HardSwish or ExecOp.Swish or ExecOp.LeakyRelu or ExecOp.Tanh or ExecOp.Clip:
                 SetOut(n, L(n.In[0]));
                 break;
+            case ExecOp.DepthToSpace:
+            {
+                if (_values[n.In[0]].Shape.Length != 4 || _values[n.Out[0]].Shape.Length != 4)
+                    throw new NotSupportedException($"layout: DepthToSpace '{n.Name}' is not rank-4.");
+                Need(n, 0, Layout.Nhwc);
+                SetOut(n, Layout.Nhwc);
+                break;
+            }
             case ExecOp.Slice:
             {
                 int[] lx = L(n.In[0]);

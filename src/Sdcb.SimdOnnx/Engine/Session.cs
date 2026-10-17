@@ -279,6 +279,26 @@ public sealed unsafe class InferenceSession : IDisposable
                     Nhwc.ChannelGate(x.Slice(b * c * hw, c * hw), hw, c, _plan.Nhwc, w1, b1, w2, b2, r, p, o.Slice(b * c, c));
                 break;
             }
+            case ExecOp.LeakyRelu:
+            {
+                var p = (LeakyReluP)n.P!;
+                Ops.LeakyRelu(GetIn(n.In[0]), GetSpan(n.Out[0]), p.Alpha);
+                break;
+            }
+            case ExecOp.Tanh: Ops.Tanh(GetIn(n.In[0]), GetSpan(n.Out[0])); break;
+            case ExecOp.Clip:
+            {
+                var p = (ClipP)n.P!;
+                Ops.Clip(GetIn(n.In[0]), GetSpan(n.Out[0]), p.Min, p.Max);
+                break;
+            }
+            case ExecOp.DepthToSpace:
+            {
+                var p = (DepthToSpaceP)n.P!;
+                Ops.DepthToSpace(GetIn(n.In[0]), values[n.In[0]].PhysShape,
+                    GetSpan(n.Out[0]), values[n.Out[0]].PhysShape, p.BlockSize);
+                break;
+            }
             default:
                 throw new NotSupportedException($"ExecOp {n.Op}");
         }
@@ -370,6 +390,14 @@ public sealed unsafe class InferenceSession : IDisposable
                 for (int b = 0; b < i[0]; b++)
                     Nhwc.ResizeNearest(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.Scales[2], p.Scales[3],
                         n.In.Length > 1 ? Img(n.In[1], b, i[0]) : default, p.AddRelu);
+                return true;
+            }
+            case ExecOp.DepthToSpace:
+            {
+                var p = (DepthToSpaceP)n.P!;
+                int[] i = Nhwc4(values[n.In[0]]), o = Nhwc4(values[n.Out[0]]);
+                for (int b = 0; b < i[0]; b++)
+                    Nhwc.DepthToSpace(Img(n.In[0], b, i[0]), i[1], i[2], i[3], ImgOut(n.Out[0], b, i[0]), o[1], o[2], p.BlockSize);
                 return true;
             }
             default:

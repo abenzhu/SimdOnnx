@@ -554,6 +554,48 @@ internal static unsafe partial class Ops
         fixed (float* s = src, d = dst) Act.ApplyErf(s, d, src.Length);
     }
 
+    public static void Tanh(ReadOnlySpan<float> src, Span<float> dst)
+    {
+        fixed (float* s = src, d = dst) Act.ApplyTanh(s, d, src.Length);
+    }
+
+    public static void LeakyRelu(ReadOnlySpan<float> src, Span<float> dst, float alpha)
+    {
+        fixed (float* s = src, d = dst) Act.ApplyLeaky(s, d, src.Length, alpha);
+    }
+
+    public static void Clip(ReadOnlySpan<float> src, Span<float> dst, float min, float max)
+    {
+        fixed (float* s = src, d = dst) Act.ApplyClamp(s, d, src.Length, min, max);
+    }
+
+    // ======================== DepthToSpace (CRD / pixel-shuffle) ========================
+    // NCHW generic path: x [N, C*bs*bs, H, W] -> y [N, C, H*bs, W*bs]
+    // y[n, c, h*bs + r, w*bs + d] = x[n, (c*bs + r)*bs + d, h, w]
+    public static void DepthToSpace(ReadOnlySpan<float> src, int[] ish, Span<float> dst, int[] osh, int bs)
+    {
+        int n = ish[0], cin = ish[1], h = ish[2], w = ish[3];
+        int c = cin / (bs * bs), ow = w * bs;
+        int plane = h * w;
+        for (int b = 0; b < n; b++)
+        {
+            int srcBase = b * cin * plane;
+            int dstBase = b * c * h * bs * ow;
+            for (int cc = 0; cc < c; cc++)
+            {
+                for (int j = 0; j < h * bs; j++)
+                {
+                    int r = j % bs, hh = j / bs;
+                    int dstRow = dstBase + (cc * h * bs + j) * ow;
+                    int srcCH = srcBase + ((cc * bs + r) * bs) * plane + hh * w;
+                    for (int ww = 0; ww < w; ww++)
+                        for (int d = 0; d < bs; d++)
+                            dst[dstRow + ww * bs + d] = src[srcCH + d * plane + ww];
+                }
+            }
+        }
+    }
+
     private static void Unary(ReadOnlySpan<float> src, Span<float> dst, ActivationKind act)
     {
         fixed (float* s = src, d = dst) Act.Apply(s, d, src.Length, act);
