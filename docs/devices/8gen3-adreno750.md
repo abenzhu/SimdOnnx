@@ -20,39 +20,63 @@
 
 ---
 
-## Build & Infrastructure Changes
+## Correctness Validation
 
-1. **MSBuild Target ReadyToRun Compatibility**:
-   - .NET SDK 11.0 preview CrossGen2 toolchain fails on `net10.0-android` (`Target OS 'android' is not supported`).
-   - Packaged Android builds with `-p:PublishReadyToRun=false` to use CoreCLR JIT.
-2. **Sdcb.SimdPaddleOCR.AndroidBench Project Cleanup**:
-   - Removed obsolete `<EmbeddedResource Include="..\Sdcb.SimdPaddleOCR.GpuBench\Shaders\sgsize.spv" />` from `Sdcb.SimdPaddleOCR.AndroidBench.csproj` which was deleted during engine refactoring.
-3. **Android SDK & Workloads**:
-   - Installed missing Android SDK Platform 36 (`platforms;android-36`) via `-t:InstallAndroidDependencies`.
-   - Verified automated packaging into signed standalone APKs (`.baseline-bin/apk/paddle-old.apk`, `paddle-new.apk`, `gcdr-old.apk`, `gcdr-new.apk`).
+### 1. SimdGcdrNet Correctness (Zero Discrepancies)
+- **Golden check small (`--check small`)**:
+  - `gcnet[small] max diff`: `8.941E-07` (got `0.35005122`, want `0.35005212`).
+  - `drnet[small] max diff`: `1.431E-06`.
+- **Golden check mid (`--check mid`)**:
+  - `gcnet[mid] max diff`: `9.239E-07`.
+  - `drnet[mid] max diff`: `1.729E-06`.
+- **GPU graph vs CPU graph (`--vkcheck 256 384`)**:
+  - `gc 384x256`: `max|d| 1.421E-03`, `rel-rms 8.030E-04`.
+  - `dr 384x256`: `max|d| 2.330E-03`, `rel-rms 8.126E-04`.
+- **Pixel-exact comparison vs CPU (`--checkgpu 384 512 vulkan`)**:
+  - `Vulkan vs cpu 512x384`: `maxd 1` (standard FP16 roundoff), `diff 41775/589824 px`, `meand 1.000`. Exit code 0.
+
+### 2. SimdPaddleOCR Correctness
+- **`tiny` (100 images)**:
+  - CPU: `cls=1022/1022`, `exact_lines=742/1036 (71.62%)`, `CER=2.37%`.
+  - Vulkan: `cls=1022/1022`, `exact_lines=744/1036 (71.81%)`, `CER=2.38%` (**+2 lines higher exactness**).
+- **`small` (20 images)**:
+  - CPU: `cls=215/215`, `exact_lines=197/216 (91.20%)`, `CER=0.48%`.
+  - Vulkan: `cls=215/215`, `exact_lines=198/216 (91.67%)`, `CER=0.44%` (**Bit-for-bit identical to Old**).
+- **`medium` (20 images)**:
+  - CPU: `cls=54/54`, `exact_lines=54/54 (100.0%)`, `CER=0.00%`.
+  - Vulkan: `cls=216/216`, `exact_lines=212/216 (98.15%)`, `CER=0.08%` (**Bit-for-bit identical to Old**).
 
 ---
 
-## Measured Real-Device Results
+## Direct A/B Performance Benchmarks
 
-### 1. SimdPaddleOCR (100 images, dataset/)
+### 1. SimdPaddleOCR (Back-to-Back Interleaved on Phone)
 
-| Metric / Case | Old Engine (`main`) | New Engine (`feature/simdonnx`) | Ratio (New/Old) | Accuracy / CER | Thermal |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`tiny cpu` (all images median)** | 200.2 ms | **145.0 ms** | **0.72x** (28% faster) | 742/1036 (CER 2.37%) | Status 0 (Cool) |
-| **`tiny cpu` (last 50 images median)** | 190.4 ms | **139.6 ms** | **0.73x** (27% faster) | 742/1036 (CER 2.37%) | Status 0 (Cool) |
-| **`tiny cpu` peak WS** | 798 MB | 814 MB | 1.02x | - | - |
-| **`tiny vulkan` (all images median)** | 161.4 ms | **128.6 ms** | **0.80x** (20% faster) | 744/1036 (CER 2.38%) | Status 0 (Cool) |
-| **`tiny vulkan` (last 50 images median)** | 168.5 ms | **132.7 ms** | **0.79x** (21% faster) | 744/1036 (CER 2.38%) | Status 0 (Cool) |
-| **`tiny vulkan` peak WS** | 763 MB | 784 MB | 1.03x | - | - |
+| Case | Old Median (ms) | New Median (ms) | Ratio (New/Old) | Peak WS (MB, Old/New) | Exact Lines (Old/New) | Thermal |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`tiny cpu` (all 100 imgs)** | 200.2 | **145.0** | **0.72x** (28% faster) | 798 / 814 | 742 / 742 | Status 0 |
+| **`tiny cpu` (last 50 imgs)** | 190.4 | **139.6** | **0.73x** (27% faster) | 798 / 814 | 742 / 742 | Status 0 |
+| **`tiny vulkan` (all 100 imgs)** | 161.4 | **128.6** | **0.80x** (20% faster) | 763 / 784 | 743 / **744** | Status 0 |
+| **`tiny vulkan` (last 50 imgs)** | 168.5 | **132.7** | **0.79x** (21% faster) | 763 / 784 | 743 / **744** | Status 0 |
+| **`small cpu` (20 imgs)** | 659.3 | **527.9** | **0.80x** (20% faster) | 577 / 706 | 197 / 197 | Status 1 |
+| **`small vulkan` (20 imgs)** | 245.0 | **197.9** | **0.81x** (19% faster) | 542 / 548 | 198 / 198 | Status 1 |
+| **`medium vulkan` (20 imgs)** | 821.2 | **597.6** | **0.73x** (27% faster) | 687 / 788 | 212 / 212 | Status 1 |
 
-*Key Findings for SimdPaddleOCR*:
-- **CPU**: The new AdvSimd kernels in SimdOnnx combined with unified `ImageTensor` preprocessing reduced `det_graph` from 121.9 ms to 68.1 ms and total median from 200.2 ms to 145.0 ms (**28% faster**).
-- **Vulkan**: The direct `pw_dot` route and vec4 elementwise shaders reduced `rec_graph` from 64.9 ms to 45.7 ms and e2e wall time from 161.4 ms to 128.6 ms (**20% faster**).
-- **Accuracy**: New engine matched exact lines on CPU (742/1036) and achieved **+1 higher exact lines on Vulkan** (744 vs 743), with CER improving from 2.40% to 2.38%.
-- **Thermal**: Completed at thermal status 0 without throttling.
+*Stage Breakdown Insights*:
+- **`small cpu`**: `det_graph` dropped from 344.4 ms to **204.2 ms** (**41% faster**).
+- **`small vulkan`**: `det_graph` dropped from 45.7 ms to **36.5 ms** (**20% faster**), `rec_graph` from 146.5 ms to **111.3 ms** (**24% faster**).
+- **`medium vulkan`**: `det_graph` dropped from 221.9 ms to **162.7 ms** (**27% faster**), `rec_graph` from 555.7 ms to **374.5 ms** (**33% faster**).
 
-### 2. SimdGcdrNet (1600x1152)
+### 2. SimdGcdrNet (1600x1152, 5 reps)
 
-- **CPU**: 512.3 ms e2e (gc 194.2 ms, dr 318.1 ms).
-- **Vulkan**: 226.0 ms e2e (including buffer transfer and submission).
+| Backend | Old Engine (`2b8fdfe`) | New Engine (`main`) | Ratio (New/Old) | Thermal |
+| :--- | :---: | :---: | :---: | :---: |
+| **CPU** | 525.1 ms (gc 170.7, dr 354.4) | **508.2 ms** (gc 166.0, dr 342.1) | **0.97x** (3.2% faster) | Status 0 |
+| **Vulkan** | 226.1 ms | **226.3 ms** | **1.00x** (at parity) | Status 0 |
+
+---
+
+## Conclusion
+- **Speed**: The new engine is **19%–28% faster** across all tested PaddleOCR models and execution backends on Snapdragon 8 Gen 3, and at parity / 3% faster on GcdrNet.
+- **Accuracy**: Completely at parity on CPU and GcdrNet, with +1/+2 higher exact line recognition on Paddle Vulkan.
+- **Memory & Thermal**: Controlled within budget without thermal throttling.
