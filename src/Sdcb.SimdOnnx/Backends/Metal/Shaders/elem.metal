@@ -434,16 +434,18 @@ static inline void attn_body(device const half* q, device const half* k, device 
 kernel void attn(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                  device const half* v [[buffer(2)]], device half* o [[buffer(3)]],
                  constant PcAttn& p [[buffer(4)]],
-                 uint2 wg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+                 uint2 wg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
 {
     threadgroup float kt[64 * 32], vt[64 * 32];
+    uint tid = lid.x;
     attn_body<32, 64>(q, k, v, o, p, wg, tid, kt, vt);
 }
 kernel void attn_d64(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
                      device const half* v [[buffer(2)]], device half* o [[buffer(3)]],
                      constant PcAttn& p [[buffer(4)]],
-                     uint2 wg [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]])
+                     uint2 wg [[threadgroup_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]])
 {
     threadgroup float kt[32 * 64], vt[32 * 64];
+    uint tid = lid.x;
     attn_body<64, 32>(q, k, v, o, p, wg, tid, kt, vt);
 }
