@@ -709,9 +709,12 @@ public sealed class VkGraphModel : IDisposable
                     (string cm, uint bn) = nn % 128 == 0 ? ("conv_cm", 128u) : nn % 64 == 0 ? ("conv_cm_n64", 64u) : ("conv_cm_n32", 32u);
                     swishDone = p.Act != ActivationKind.Swish;
                     uint cflags = (p.BiasValue >= 0 ? 1u : 0u) | (CmCode(p.Act) << 4);
-                    // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
+                    // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image.
+                    // transB=1: B is already [N,K] row-major — bind it raw (GemmNK's pack
+                    // assumes a [K,N] source and would transpose it the wrong way);
+                    // transB=0: pack [K,N] into the [N,K] panel the shader expects.
                     output.Add(ND(cm,
-                        [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
+                        [Bind(n.In[0]), p.TransB ? Bind(n.In[1]) : Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
                         PcOf(m, nn, k, cflags, m, m, 1u, k, 1u, 1u, 1u, 0u, 0u, k, 1u),
                         (m + 127) / 128, (nn + bn - 1) / bn, name: "gemm_cm"));
                     break;

@@ -607,7 +607,7 @@ public sealed class MtlGraphModel : IDisposable
                         | (MmAct(p.Act) << 4);
                     // [M,K] x [N,K]^T as a 1x1 conv over a 1 x M image
                     yield return ND(cm,
-                        [Bind(n.In[0]), Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
+                        [Bind(n.In[0]), p.TransB ? Bind(n.In[1]) : Bind(n.In[1], CK.GemmNK), B(p.BiasValue, CK.F32), B(-1), Bind(n.Out[0])],
                         PcOf(m, nn, k, cflags, m, m, 1u, k, 1u, 1u, 1u, 0u, 0u, k),
                         (m + 63) / 64, (nn + bn - 1) / bn, name: "gemm_mm");
                     break;

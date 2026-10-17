@@ -1357,18 +1357,6 @@ internal static class GraphCompiler
                 EvalInt(n);
                 return;
             }
-            // Cast on int → still int
-            if (op == "Cast" && V(Input(0, n)).IsInt)
-            {
-                int to = (int)n.IntAttr("to");
-                CValue x = V(Input(0, n));
-                if (to == 1)
-                    AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 1, Floats = _m.Intern(n.Outputs[0] + "__cast", x.Ints!.Select(v => (float)v).ToArray()) });
-                else
-                    AddValue(new CValue { Name = n.Outputs[0], Shape = x.Shape, DType = 7, Ints = x.Ints });
-                return;
-            }
-
             // ---- float ops ----
             switch (op)
             {

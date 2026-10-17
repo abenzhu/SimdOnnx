@@ -221,6 +221,23 @@ public class GpuOpTests
         Check(backend, m, [2, t, c], "attention rank 3");
     }
 
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void GemmTransB_MatchesCpu(string backend)
+    {
+        // B stored [N,K] (transB = 1) on the tensor-core paths binds raw (issue #1); a Cast chain in
+        // the shape math folds (issue #2)
+        var rng = new Random(21);
+        int m = 256, k = 128, n = 64;
+        byte[] model = new OnnxBuilder().Input("x", m, k)
+            .Init("B", Rand(rng, n * k, 0.3f), n, k).Init("C", Rand(rng, n, 0.5f), n)
+            .Node("Shape", ["x"], ["s"]).Node("Cast", ["s"], ["s32"], ("to", 6)).Node("Cast", ["s32"], ["s64"], ("to", 7))
+            .Node("Reshape", ["x", "s64"], ["xr"])
+            .Node("Gemm", ["xr", "B", "C"], ["y"], ("transB", 1))
+            .Output("y").Build();
+        Check(backend, OnnxModel.Load(model), [m, k], "gemm transB=1");
+    }
+
     /// <summary>CPU fused plan against the unfused one (fusions must not change the math beyond rounding).</summary>
     private static void CheckCpuFusion(OnnxModel m, int[] shape, string what)
     {
