@@ -1532,6 +1532,21 @@ internal static class GraphCompiler
                     Out(r, In(0).Shape);
                     return;
                 }
+                case "Cast":
+                {
+                    // int→int casts are identity (dtype only tracked loosely); int→float becomes a float const
+                    CValue x = In(0);
+                    int to = (int)n.IntAttr("to");
+                    if (to == 1)
+                        AddValue(new CValue
+                        {
+                            Name = n.Outputs[0], Shape = x.Shape, DType = 1,
+                            Floats = _m.Intern(n.Outputs[0] + "__cast", x.Ints!.Select(v => (float)v).ToArray()),
+                        });
+                    else
+                        Out(x.Ints!, x.Shape);
+                    return;
+                }
                 default:
                     throw new NotSupportedException($"Int eval for '{op}' not implemented (node '{n.Name}').");
             }
