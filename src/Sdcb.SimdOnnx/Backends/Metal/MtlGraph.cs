@@ -243,7 +243,17 @@ public sealed class MtlGraphModel : IDisposable
         for (int i = 0; i < plan.Nodes.Length; i++)
         {
             int start = disps.Count;
-            disps.AddRange(Emit(plan.Nodes[i]));
+            ExecNode n = plan.Nodes[i];
+            // single-image kernels: one dispatch per image of a batch, binds offset to that image
+            int nb = n.Op is ExecOp.Conv or ExecOp.MaxPool or ExecOp.ResizeBilinear or ExecOp.ResizeNearest
+                or ExecOp.ConvTranspose or ExecOp.GlobalAvgPool && plan.Values[n.Out[0]].Shape is [var b, _, _, _] ? b : 1;
+            if (nb > 1)
+            {
+                _images = nb;
+                for (_image = 0; _image < nb; _image++) disps.AddRange(Emit(n));
+                _images = 1;
+            }
+            else disps.AddRange(Emit(n));
             NodeRanges[i] = (start, disps.Count - start);
         }
         Dispatches = disps.ToArray();
@@ -293,10 +303,18 @@ public sealed class MtlGraphModel : IDisposable
     internal readonly (int start, int count)[] NodeRanges;
 
     // ---- value → bind resolution (byte offsets/sizes: all long math) ----
+    private int _image, _images = 1;
+
     public MtlBind Bind(int valueId, CK? kind = null)
     {
         kind ??= CK.Raw;
         CValue v = _plan.Values[valueId];
+        if (v.Buf >= 0 && _images > 1 && v.Shape is [var nb, _, _, _] && nb == _images)
+        {
+            // per-image emission (see the constructor): image _image of the batch
+            ulong per = (ulong)(v.ElementCount / nb) * (ulong)Es;
+            return new MtlBind(MtlSlot.Arena, (ulong)_plan.BufOffset[v.Buf] * (ulong)Es + (ulong)_image * per, per);
+        }
         if (v.Buf >= 0)
             return new MtlBind(MtlSlot.Arena, (ulong)_plan.BufOffset[v.Buf] * (ulong)Es,
                 (ulong)Math.Max(v.ElementCount, 1) * (ulong)Es);
