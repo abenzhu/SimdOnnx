@@ -13,3 +13,6 @@ build/nuget.exe
 
 # raw A/B benchmark JSON (summaries live in docs/ab/*.txt)
 docs/ab/paddle/
+docs/ab/paddle-*/
+docs/ab/gcdr-r*.txt
+docs/ab/android-paddle/

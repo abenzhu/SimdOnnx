@@ -170,14 +170,14 @@ public unsafe class VkKernelTests
                 for (int t = 0; t < 9; t++) wt[o * kd + t * ic + c] = w[(o * ic + c) * 9 + t];
         uint flags = 1u | (residual ? 2u : 0u) | (reflect ? 4u : 0u) | ((uint)act << 4);
         uint m = (uint)(oh * ow);
-        byte[] pc = new byte[56];
+        byte[] pc = new byte[60];
         Buffer.BlockCopy(new uint[] { m, (uint)oc, (uint)kd, flags, (uint)ow, (uint)iw, (uint)ih, (uint)ic, 3u,
-            (uint)stride, (uint)stride, 1u, 1u, (uint)kr }, 0, pc, 0, 56);
+            (uint)stride, (uint)stride, 1u, 1u, (uint)kr, (uint)oh }, 0, pc, 0, 60);
         uint bn = shader == "conv_cm" ? 128u : shader == "conv_cm_n64" ? 64u : 32u;
         var bufs = new List<VkBuffer> { Half16(dev, x), Half16(dev, wt), F32(dev, b), Half16(dev, residual ? res : new float[8]) };
         VkBuffer ob = dev.NewStorageBuffer((ulong)cpu.Length * 2 + 16, true, preferHost: true);
         bufs.Add(ob);
-        VkPipeline pipe = dev.GetCoopPipeline(shader, 5, 56, lite ? true : null);
+        VkPipeline pipe = dev.GetCoopPipeline(shader, 5, 60, lite ? true : null);
         IntPtr cmd = dev.NewCommandBuffer();
         IntPtr fence = dev.NewFence();
         var begin = new Vk.VkCommandBufferBeginInfo { SType = VkConst.StCommandBufferBeginInfo };
