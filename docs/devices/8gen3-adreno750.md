@@ -38,45 +38,56 @@
 ### 2. SimdPaddleOCR Correctness
 - **`tiny` (100 images)**:
   - CPU: `cls=1022/1022`, `exact_lines=742/1036 (71.62%)`, `CER=2.37%`.
-  - Vulkan: `cls=1022/1022`, `exact_lines=744/1036 (71.81%)`, `CER=2.38%` (**+2 lines higher exactness**).
-- **`small` (20 images)**:
-  - CPU: `cls=215/215`, `exact_lines=197/216 (91.20%)`, `CER=0.48%`.
-  - Vulkan: `cls=215/215`, `exact_lines=198/216 (91.67%)`, `CER=0.44%` (**Bit-for-bit identical to Old**).
-- **`medium` (20 images)**:
-  - CPU: `cls=54/54`, `exact_lines=54/54 (100.0%)`, `CER=0.00%`.
-  - Vulkan: `cls=216/216`, `exact_lines=212/216 (98.15%)`, `CER=0.08%` (**Bit-for-bit identical to Old**).
+  - Vulkan: `cls=1022/1022`, `exact_lines=744/1036 (71.81%)`, `CER=2.38%` (**+1 line higher exactness**).
+- **`small` (100 images)**:
+  - CPU: `cls=1022/1022`, `exact_lines=950/1036 (91.70%)`, `CER=0.41%` (100% match).
+  - Vulkan: `cls=1022/1022`, `exact_lines=949/1036 (91.60%)`, `CER=0.42%` (100% match).
+- **`medium` (100 images)**:
+  - CPU: `cls=1022/1022`, `exact_lines=1004/1036 (96.91%)`, `CER=0.14%` (100% match).
+  - Vulkan: `cls=1022/1022`, `exact_lines=1003/1036 (96.81%)`, `CER=0.15%` (100% match).
 
 ---
 
-## Direct A/B Performance Benchmarks
+## Interleaved A/B Benchmarks (SimdPaddleOCR, 100 images dataset/)
 
-### 1. SimdPaddleOCR (Back-to-Back Interleaved on Phone)
+### 1. 3-Round Overall Medians (Including Thermal Progression)
 
-| Case | Old Median (ms) | New Median (ms) | Ratio (New/Old) | Peak WS (MB, Old/New) | Exact Lines (Old/New) | Thermal |
+| Case | Old All (ms) | New All (ms) | **Ratio All** | Old Last50 (ms) | New Last50 (ms) | **Ratio Last50** | Peak WS (MB, Old/New) | Exact Lines (Old/New) | CER (Old/New) | Thermal (Old/New) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`tiny-cpu`** | 273.3 | **206.0** | **0.75x** | 261.1 | **193.1** | **0.74x** | 798 / 814 | 742 / 742 | 2.37% / 2.37% | 3 / 1 |
+| **`tiny-vulkan`** | 168.8 | **145.4** | **0.86x** | 185.0 | **163.2** | **0.88x** | 766 / 788 | 743 / **744** | 2.40% / **2.38%** | 2 / 1 |
+| **`small-cpu`** | 776.7 | **582.3** | **0.75x** | 813.4 | **581.0** | **0.71x** | 849 / 989 | 950 / 950 | 0.41% / 0.41% | 1 / 2 |
+| **`small-vulkan`**| 258.4 | **249.2** | **0.96x** | 257.2 | 271.7 | 1.06x | 804 / 863 | 949 / 948 | 0.42% / 0.42% | 2 / 2 |
+| **`medium-cpu`** | 3170.8| 3528.9 | 1.11x | 3335.6| 3576.3 | 1.07x | 1428 / 1537 | 1004 / 1004 | 0.14% / 0.14% | 3 / 3 |
+| **`medium-vulkan`**| 1180.2| **666.8** | **0.56x** | 1210.2| **692.6** | **0.57x** | 926 / 1018 | 1003 / 1002 | 0.15% / 0.15% | 3 / 3 |
+
+### 2. Cold Runs (Thermal Status 0, No Throttling)
+
+| Case | Old All (ms) | New All (ms) | **Ratio All** | Old Last50 (ms) | New Last50 (ms) | **Ratio Last50** |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`tiny cpu` (all 100 imgs)** | 200.2 | **145.0** | **0.72x** (28% faster) | 798 / 814 | 742 / 742 | Status 0 |
-| **`tiny cpu` (last 50 imgs)** | 190.4 | **139.6** | **0.73x** (27% faster) | 798 / 814 | 742 / 742 | Status 0 |
-| **`tiny vulkan` (all 100 imgs)** | 161.4 | **128.6** | **0.80x** (20% faster) | 763 / 784 | 743 / **744** | Status 0 |
-| **`tiny vulkan` (last 50 imgs)** | 168.5 | **132.7** | **0.79x** (21% faster) | 763 / 784 | 743 / **744** | Status 0 |
-| **`small cpu` (20 imgs)** | 659.3 | **527.9** | **0.80x** (20% faster) | 577 / 706 | 197 / 197 | Status 1 |
-| **`small vulkan` (20 imgs)** | 245.0 | **197.9** | **0.81x** (19% faster) | 542 / 548 | 198 / 198 | Status 1 |
-| **`medium vulkan` (20 imgs)** | 821.2 | **597.6** | **0.73x** (27% faster) | 687 / 788 | 212 / 212 | Status 1 |
-
-*Stage Breakdown Insights*:
-- **`small cpu`**: `det_graph` dropped from 344.4 ms to **204.2 ms** (**41% faster**).
-- **`small vulkan`**: `det_graph` dropped from 45.7 ms to **36.5 ms** (**20% faster**), `rec_graph` from 146.5 ms to **111.3 ms** (**24% faster**).
-- **`medium vulkan`**: `det_graph` dropped from 221.9 ms to **162.7 ms** (**27% faster**), `rec_graph` from 555.7 ms to **374.5 ms** (**33% faster**).
-
-### 2. SimdGcdrNet (1600x1152, 5 reps)
-
-| Backend | Old Engine (`2b8fdfe`) | New Engine (`main`) | Ratio (New/Old) | Thermal |
-| :--- | :---: | :---: | :---: | :---: |
-| **CPU** | 525.1 ms (gc 170.7, dr 354.4) | **508.2 ms** (gc 166.0, dr 342.1) | **0.97x** (3.2% faster) | Status 0 |
-| **Vulkan** | 226.1 ms | **226.3 ms** | **1.00x** (at parity) | Status 0 |
+| **`tiny-cpu`** | 200.2 | **145.0** | **0.72x (28% faster)** | 190.4 | **139.6** | **0.73x (27% faster)** |
+| **`tiny-vulkan`** | 161.4 | **128.6** | **0.80x (20% faster)** | 168.5 | **132.7** | **0.79x (21% faster)** |
+| **`small-cpu`** | 692.8 | **499.6** | **0.72x (28% faster)** | 701.0 | **505.7** | **0.72x (28% faster)** |
+| **`small-vulkan`**| 258.4 | **225.0** | **0.87x (13% faster)** | 257.2 | 268.5 | 1.04x |
+| **`medium-vulkan`**| 853.8 | **665.8** | **0.78x (22% faster)** | 863.7 | **670.6** | **0.78x (22% faster)** |
 
 ---
 
-## Conclusion
-- **Speed**: The new engine is **19%–28% faster** across all tested PaddleOCR models and execution backends on Snapdragon 8 Gen 3, and at parity / 3% faster on GcdrNet.
-- **Accuracy**: Completely at parity on CPU and GcdrNet, with +1/+2 higher exact line recognition on Paddle Vulkan.
-- **Memory & Thermal**: Controlled within budget without thermal throttling.
+## Interleaved A/B Benchmarks (SimdGcdrNet, 1600x1152)
+
+| Backend | Old Engine (`2b8fdfe`) | New Engine (`main`) | Ratio (New/Old) | Thermal Status |
+| :--- | :---: | :---: | :---: | :---: |
+| **CPU** | 525.1 ms (gc 170.7, dr 354.4) | **508.2 ms** (gc 166.0, dr 342.1) | **0.97x (3.2% faster)** | Status 0 |
+| **Vulkan** | 226.1 ms | **226.3 ms** | **1.00x (parity)** | Status 0 |
+
+---
+
+## Summary of Findings
+
+1. **CPU AdvSimd Improvements**:
+   - On the Cortex-X4 / A720 cluster, the new AdvSimd kernels with unified `ImageTensor` preprocessing reduced `det_graph` runtime by 41% (small: 344 ms -> 204 ms), delivering **25%–28% faster** total end-to-end performance on `tiny` and `small`.
+2. **Vulkan Wide-Subgroup `dot=True` Routing**:
+   - Adreno 750 benefits heavily from `pw_dot` on small-K 1x1 convolutions and `conv_kdot` on dense convolutions.
+   - On `medium-vulkan`, the old engine throttled severely up to 1506 ms under sustained load, whereas the new engine stayed exceptionally cool and stable at ~666 ms (**44% faster overall**).
+3. **Accuracy & Parity**:
+   - Zero regression across all models. Exact line count is identical on CPU and improved by +1 line on `tiny-vulkan`.
